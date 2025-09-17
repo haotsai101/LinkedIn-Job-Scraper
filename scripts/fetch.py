@@ -20,7 +20,7 @@ def create_session(email, password):
     time.sleep(1)
     driver.find_element(By.ID, 'username').send_keys(email)
     driver.find_element(By.ID, 'password').send_keys(password)
-    driver.find_element(By.XPATH, '//*[@id="organic-div"]/form/div[3]/button').click()
+    driver.find_element(By.CSS_SELECTOR, 'button.btn__primary--large[type="submit"]').click()
     time.sleep(1)
     input('Press ENTER after a successful login for "{}": '.format(email))
     driver.get('https://www.linkedin.com/jobs/search/?')
@@ -40,8 +40,9 @@ def get_logins(method):
     return emails, passwords
 
 class JobSearchRetriever:
-    def __init__(self):
-        self.job_search_link = 'https://www.linkedin.com/voyager/api/voyagerJobsDashJobCards?decorationId=com.linkedin.voyager.dash.deco.jobs.search.JobSearchCardsCollection-187&count=100&q=jobSearch&query=(origin:JOB_SEARCH_PAGE_OTHER_ENTRY,selectedFilters:(sortBy:List(DD)),spellCorrectionEnabled:true)&start=0'
+    def __init__(self, keywords="data"):
+        query = f"keywords:{keywords},origin:JOB_SEARCH_PAGE_OTHER_ENTRY,selectedFilters:(sortBy:List(DD)),spellCorrectionEnabled:true"
+        self.job_search_link = f'https://www.linkedin.com/voyager/api/voyagerJobsDashJobCards?decorationId=com.linkedin.voyager.dash.deco.jobs.search.JobSearchCardsCollection-187&count=100&q=jobSearch&query=({query})&start=0'
         emails, passwords = get_logins('search')
         self.sessions = [create_session(email, password) for email, password in zip(emails, passwords)]
         self.session_index = 0

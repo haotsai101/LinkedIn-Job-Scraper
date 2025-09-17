@@ -17,7 +17,8 @@ cursor = conn.cursor()
 create_tables(conn, cursor)
 
 
-job_searcher = JobSearchRetriever()
+KEYWORDS = "software data"  # Change this to any keyword you want to search for
+job_searcher = JobSearchRetriever(keywords=KEYWORDS)
 
 while True:
     all_results = job_searcher.get_jobs()
