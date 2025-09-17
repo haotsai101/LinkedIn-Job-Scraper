@@ -22,7 +22,7 @@
 
 This program consists of 2 main scripts, running in parallel.
 
-```python search_retriever.py``` - discovers new job postings and insert the most recent IDs and minimal attributes into the database
+```python search_retriever.py``` - discovers new job postings and insert the most recent IDs and minimal attributes into the database with `KEYWORDS = "software data"  # Change this to any keyword you want to search for`
 
 ```python details_retriever.py``` - populates tables with complete job attributes
 
