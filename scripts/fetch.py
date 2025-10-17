@@ -40,16 +40,23 @@ def get_logins(method):
     return emails, passwords
 
 class JobSearchRetriever:
-    def __init__(self, keywords="data"):
+    def __init__(self, keywords="data", count: int = 100):
+        """Create a search retriever.
+
+        keywords: search keywords
+        count: number of results per page (used to compute start offset)
+        """
+        self.count = count
         query = f"keywords:{keywords},origin:JOB_SEARCH_PAGE_OTHER_ENTRY,selectedFilters:(sortBy:List(DD)),spellCorrectionEnabled:true"
-        self.job_search_link = f'https://www.linkedin.com/voyager/api/voyagerJobsDashJobCards?decorationId=com.linkedin.voyager.dash.deco.jobs.search.JobSearchCardsCollection-187&count=100&q=jobSearch&query=({query})&start=0'
+        # template with a {start} placeholder; get_jobs will replace start based on page
+        self.job_search_link_template = f'https://www.linkedin.com/voyager/api/voyagerJobsDashJobCards?decorationId=com.linkedin.voyager.dash.deco.jobs.search.JobSearchCardsCollection-187&count={self.count}&q=jobSearch&query=({query})&start={{start}}'
         emails, passwords = get_logins('search')
         self.sessions = [create_session(email, password) for email, password in zip(emails, passwords)]
         self.session_index = 0
         self.headers = [{
             'Authority': 'www.linkedin.com',
             'Method': 'GET',
-            'Path': 'voyager/api/voyagerJobsDashJobCards?decorationId=com.linkedin.voyager.dash.deco.jobs.search.JobSearchCardsCollection-187&count=25&q=jobSearch&query=(origin:JOB_SEARCH_PAGE_OTHER_ENTRY,selectedFilters:(sortBy:List(DD)),spellCorrectionEnabled:true)&start=0',
+            # Note: 'Path' header is intentionally left out or will be overridden per-request to avoid stale start offsets
             'Scheme': 'https',
             'Accept': 'application/vnd.linkedin.normalized+json+2.1',
             'Accept-Encoding': 'gzip, deflate, br',
@@ -62,8 +69,20 @@ class JobSearchRetriever:
             'X-Li-Track': '{"clientVersion":"1.13.5589","mpVersion":"1.13.5589","osName":"web","timezoneOffset":-7,"timezone":"America/Los_Angeles","deviceFormFactor":"DESKTOP","mpName":"voyager-web","displayDensity":1,"displayWidth":360,"displayHeight":800}'
         } for session in self.sessions]
 
-    def get_jobs(self):
-        results = self.sessions[self.session_index].get(self.job_search_link, headers=self.headers[self.session_index])
+    def get_jobs(self, page: int = 0):
+        """Fetch job cards for the given page (0-based). Page 0 == start=0.
+
+        page: zero-based page index. start offset = page * count.
+        """
+        start = page * self.count
+        link = self.job_search_link_template.format(start=start)
+
+        # copy headers for this session and remove or override Path to avoid stale start params
+        headers = dict(self.headers[self.session_index])
+        if 'Path' in headers:
+            headers.pop('Path')
+
+        results = self.sessions[self.session_index].get(link, headers=headers)
         self.session_index = (self.session_index + 1) % len(self.sessions)
 
         if results.status_code != 200:
