@@ -1,0 +1,9 @@
+# Dagster instance configuration for LinkedIn Job Scraper
+# This file configures storage and runtime settings
+
+storage:
+  sqlite:
+    base_dir: /Users/zhihao/personal_projects/LinkedIn-Job-Scraper/.dagster_home
+
+code_servers:
+  local_startup_timeout: 30

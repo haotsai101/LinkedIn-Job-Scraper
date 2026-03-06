@@ -2,6 +2,7 @@
 /__pycache__/
 /scripts/__pycache__/
 /.venv/
+.DS_Store
 # Prevent accidental upload of login info
 /logins.csv
 # Ignore backups and other versions of the db
@@ -10,4 +11,11 @@
 /linkedin_jobs.db.*
 /csv_files/
 linkedin_jobs.*
-# analysis.ipynb
+R-project/
+.Rproj.user
+*.html
+linkedin-job-scraper/
+analysis/
+.vscode/
+.tmp_*
+.dagster_home/

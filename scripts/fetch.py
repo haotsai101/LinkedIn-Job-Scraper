@@ -22,7 +22,7 @@ def create_session(email, password):
     driver.find_element(By.ID, 'password').send_keys(password)
     driver.find_element(By.CSS_SELECTOR, 'button.btn__primary--large[type="submit"]').click()
     time.sleep(1)
-    input('Press ENTER after a successful login for "{}": '.format(email))
+    # input('Press ENTER after a successful login for "{}": '.format(email))
     driver.get('https://www.linkedin.com/jobs/search/?')
     time.sleep(1)
     cookies = driver.get_cookies()
