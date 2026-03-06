@@ -33,6 +33,37 @@ It's important to note that while ```search_retriever.py``` typically runs smoot
 - Experiment with different time delays to find the optimal settings.
 - Run details_retriever.py during periods of lower online activity, such as late-night hours and weekends, to catch up with the progress of search_retriever.py. This will ensure that both processes remain synchronized and up to date.
 
+## 🚀 Using Dagster (Recommended)
+
+**Dagster provides automated, scheduled job execution and asset management:**
+
+```bash
+# Quick start (one command)
+DAGSTER_HOME=./.dagster_home dagster dev
+
+# Then visit: http://localhost:3000
+```
+
+**Features:**
+- ✅ Automated job scheduling (every 4-6 hours)
+- ✅ Auto-refresh of all 21 assets
+- ✅ Visual pipeline monitoring
+- ✅ Run history & lineage tracking
+- ✅ Zero snapshot disk overhead
+- ✅ SQLite as single source of truth
+
+**For complete details, see:** [DAGSTER_COMPLETE_GUIDE.md](DAGSTER_COMPLETE_GUIDE.md)
+
+### Quick Reference
+```bash
+./run_jobs.sh search                    # Search for new jobs
+./run_jobs.sh details                   # Fetch job details
+./run_jobs.sh both "software"           # Both together
+dagster asset materialize               # Refresh all assets
+```
+
+---
+
 ## Converting Database to CSV
 
 ```python to_csv.py --folder <destination folder> --database <linkedin_jobs.db>```
