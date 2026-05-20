@@ -26,7 +26,8 @@ def create_tables(conn, cursor):
           listed_time TEXT,
           degree TEXT,
           posting_domain TEXT,
-          sponsored INTEGER
+          sponsored INTEGER,
+          applied INTEGER DEFAULT NULL
         );
     ''')
 

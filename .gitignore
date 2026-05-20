@@ -5,6 +5,9 @@
 .DS_Store
 # Prevent accidental upload of login info
 /logins.csv
+# LLM credentials and user profile (sensitive)
+/.env
+/user_profile.json
 # Ignore backups and other versions of the db
 # E.g. linkedin_jobs.db.bak, linkedin_jobs_uk.db
 /linkedin_jobs_*.db
