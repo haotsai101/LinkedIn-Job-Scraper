@@ -864,10 +864,9 @@ Rules:
         )
         agent_run = asyncio.create_task(browser_agent.run(max_steps=60))
         _agent_task.append(agent_run)
-        await asyncio.wait_for(asyncio.shield(agent_run), timeout=_JOB_TIMEOUT_SECS)
+        await asyncio.wait_for(agent_run, timeout=_JOB_TIMEOUT_SECS)
     except asyncio.TimeoutError:
-        for t in _agent_task:
-            t.cancel()
+        # agent_run is already cancelled by wait_for; just report
         print(f"\n  [!] Auto-apply timed out after {_JOB_TIMEOUT_SECS}s")
     except asyncio.CancelledError:
         pass  # expected when mark_no_longer_accepting / mark_already_applied cancels the task
