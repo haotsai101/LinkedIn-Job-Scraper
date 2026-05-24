@@ -636,6 +636,7 @@ async def auto_apply(
     browser_api_key: str = "",
     browser_url: str = "",
     browser_model: str = "",
+    application_type: str = "",
 ) -> str:
     """
     Use browser-use to apply to a job.
@@ -797,19 +798,34 @@ async def auto_apply(
         base_url=browser_url or base_url,
     )
 
+    is_offsite = application_type == "OffsiteApply"
+
+    if is_offsite:
+        apply_instructions = """3. Find and click the "Apply" button on the job listing. It will open the company's career site.
+   - If a new browser tab opens automatically, switch to it using the switch action.
+   - If the posting says "No longer accepting applications" or there is no Apply button, call mark_no_longer_accepting and stop.
+   - If you see a message like "You applied X hours/days ago" or "Application submitted", call mark_already_applied and stop.
+4. On the company career site, fill every visible form field using the user profile below.
+   - For multi-step forms, click "Next" or "Continue" after completing each page.
+   - Upload a resume only if there is a pre-filled resume option; skip file uploads otherwise.
+   - If the career site requires creating an account or logging in and there is no guest/continue-without-account option, call mark_auto_failed."""
+        new_tab_rule = "- If clicking Apply opens a new tab, switch to it immediately using the switch action, then fill the form there."
+    else:
+        apply_instructions = """3. Find and click the "Easy Apply" button on the job listing.
+   - If the posting says "No longer accepting applications", the position is closed, or there is no Easy Apply button, call mark_no_longer_accepting and stop.
+   - If you see a message like "You applied X hours/days ago" or "Application submitted", call mark_already_applied and stop.
+4. Fill every visible form field using the user profile below.
+   - For multi-step forms, click "Next" or "Continue" after completing each page.
+   - Upload a resume only if there is a pre-filled resume option; skip file uploads otherwise."""
+        new_tab_rule = "- Do not open new tabs. All navigation must stay in the current tab (never use new_tab=True)."
+
     task = f"""You are applying to a job on behalf of the user.
 
 Follow these steps exactly:
 
 1. Navigate to: {job_url}
 2. If you see a LinkedIn login form with visible username and password fields (URL contains /login or /checkpoint), call handle_linkedin_login — do NOT type credentials yourself. Only call this for an actual login form, not for any other issue.
-3. Find and click the "Easy Apply" or "Apply" button on the job listing.
-   - If the posting says "No longer accepting applications", the position is closed, or there is no Apply button, call mark_no_longer_accepting and stop.
-   - If you see a message like "You applied X hours/days ago" or "Application submitted", call mark_already_applied and stop.
-4. Fill every visible form field using the user profile below.
-   - For multi-step forms, click "Next" or "Continue" after completing each page.
-   - For external application sites (Greenhouse, Lever, Workday, etc.), continue filling on those pages.
-   - Upload a resume only if there is a pre-filled resume option; skip file uploads otherwise.
+{apply_instructions}
 5. When ALL fields are filled and you are on the final review / confirmation page,
    call the ready_to_submit action with a plain-English summary of what you filled.
    CRITICAL: You are FORBIDDEN from clicking Submit / Send Application before calling ready_to_submit.
@@ -826,12 +842,11 @@ Rules:
 - Never invent or guess information that is not in the profile.
 - Leave fields blank if the profile does not contain the required information.
 - Do not attach files unless a pre-populated option is already present.
-- NEVER open a new tab. All navigation must stay in the current tab (never use new_tab=True).
+{new_tab_rule}
 - If a form step is confusing, scroll down to see all fields before taking any action.
 - Sponsorship questions: if asked "Will you now or in the future require sponsorship?", answer YES if work_authorization is OPT, H1B, F1, or TN; answer NO if work_authorization is "US Citizen" or "Green Card".
 - Authorization questions: if asked "Are you legally authorized to work in the US?", answer YES (OPT is authorized to work).
 - If you have attempted the same action (clicking a button, navigating to a URL) 3 or more times without a different result, call mark_auto_failed — you are stuck in a loop.
-- If the Apply button redirects to an external company website and you cannot reach the actual form after 2 attempts, call mark_auto_failed — external sites cannot be automated.
 """
 
     _JOB_TIMEOUT_SECS = 300  # 5 minutes max per job regardless of steps
@@ -976,14 +991,6 @@ async def run_session(
             print(f"  [{idx}/{total}]  {title or 'Unknown'}  |  {company_name or 'Unknown company'}")
             print(f"  Location : {location or 'N/A'}   Level: {exp_level or 'N/A'}")
 
-            # Skip jobs that require an external application site — the agent cannot
-            # reliably fill external forms and enters infinite loops trying.
-            if application_type == "OffsiteApply":
-                mark_job(conn, cursor, job_id, -1)
-                skipped_count += 1
-                print("  [~] External application site (OffsiteApply) — skipped.")
-                continue
-
             print("  Classifying…", end="", flush=True)
 
             relevant, reason = agent.classify(title or "", description or "")
@@ -1013,6 +1020,7 @@ async def run_session(
                 browser_api_key=browser_api_key,
                 browser_url=browser_url,
                 browser_model=browser_model,
+                application_type=application_type or "",
             )
 
             # Close any tabs opened for this posting before moving to the next one
