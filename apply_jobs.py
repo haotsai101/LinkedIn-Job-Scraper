@@ -36,8 +36,10 @@ import asyncio
 import csv
 import json
 import os
+import secrets
 import smtplib
 import sqlite3
+import string
 import sys
 import time
 from datetime import datetime, timezone
@@ -59,6 +61,7 @@ from browser_use.llm.openai.chat import ChatOpenAI as BrowserChatOpenAI
 DB_PATH = "linkedin_jobs.db"
 PROFILE_PATH = "user_profile.json"
 LOG_PATH = "application_log.json"
+ACCOUNTS_PATH = "created_accounts.json"
 BROWSER = "edge"  # matches BROWSER in scripts/fetch.py; change to "chrome" if needed
 
 PROFILE_QUESTIONS = [
@@ -306,6 +309,50 @@ def send_session_email(gmail_user: str, app_password: str, report: dict):
         print(f"  Email summary sent to {gmail_user}")
     except Exception as exc:
         print(f"  [!] Failed to send email: {exc}")
+
+
+# ── Career-site account management ─────────────────────────────────────────────
+
+def _generate_password(length: int = 16) -> str:
+    alphabet = string.ascii_letters + string.digits + "!@#$%^&*"
+    # Guarantee at least one of each required character class
+    pwd = [
+        secrets.choice(string.ascii_uppercase),
+        secrets.choice(string.ascii_lowercase),
+        secrets.choice(string.digits),
+        secrets.choice("!@#$%^&*"),
+    ]
+    pwd += [secrets.choice(alphabet) for _ in range(length - 4)]
+    secrets.SystemRandom().shuffle(pwd)
+    return "".join(pwd)
+
+
+def save_account_to_file(record: dict):
+    """Append a created account record to created_accounts.json."""
+    path = Path(ACCOUNTS_PATH)
+    if path.exists():
+        try:
+            data = json.loads(path.read_text())
+        except Exception:
+            data = {"accounts": []}
+    else:
+        data = {"accounts": []}
+
+    data["accounts"].append(record)
+    path.write_text(json.dumps(data, indent=2))
+
+
+def search_accounts(query: str) -> list[dict]:
+    """Return accounts whose company or website_url contains query (case-insensitive)."""
+    path = Path(ACCOUNTS_PATH)
+    if not path.exists():
+        return []
+    data = json.loads(path.read_text())
+    q = query.lower()
+    return [
+        a for a in data.get("accounts", [])
+        if q in a.get("company", "").lower() or q in a.get("website_url", "").lower()
+    ]
 
 
 # ── LLM Agent ──────────────────────────────────────────────────────────────────
@@ -741,6 +788,31 @@ async def auto_apply(
         return f"Job marked as auto-failed: {reason}. Stopping now."
 
     @controller.action(
+        "Save credentials for a career-site account you just created — call immediately "
+        "after successfully registering on an external company career website"
+    )
+    def save_account_credentials(company: str, website_url: str, password_used: str, notes: str = "") -> str:
+        """
+        Call this right after creating a new account on a company career site.
+        company: name of the company (e.g. 'Pinterest')
+        website_url: the career site URL where the account was created
+        password_used: the password you used when registering
+        notes: any extra context (e.g. 'used Google SSO', 'confirmed email required')
+        """
+        record = {
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "company": company,
+            "website_url": website_url,
+            "email": profile.get("email", ""),
+            "password": password_used,
+            "job_title": job_title,
+            "notes": notes,
+        }
+        save_account_to_file(record)
+        print(f"\n  [account] Saved credentials for {company} → {ACCOUNTS_PATH}")
+        return f"Account credentials saved for {company}. Continue filling the application form."
+
+    @controller.action(
         "Signal that the task is complete — only call after ready_to_submit has been called "
         "and the application has been submitted or explicitly stopped"
     )
@@ -799,16 +871,21 @@ async def auto_apply(
     )
 
     is_offsite = application_type == "OffsiteApply"
+    # Generate a fresh password for this job in case account creation is needed
+    offsite_password = _generate_password() if is_offsite else ""
 
     if is_offsite:
-        apply_instructions = """3. Find and click the "Apply" button on the job listing. It will open the company's career site.
+        apply_instructions = f"""3. Find and click the "Apply" button on the job listing. It will open the company's career site.
    - If a new browser tab opens automatically, switch to it using the switch action.
    - If the posting says "No longer accepting applications" or there is no Apply button, call mark_no_longer_accepting and stop.
    - If you see a message like "You applied X hours/days ago" or "Application submitted", call mark_already_applied and stop.
 4. On the company career site, fill every visible form field using the user profile below.
    - For multi-step forms, click "Next" or "Continue" after completing each page.
    - Upload a resume only if there is a pre-filled resume option; skip file uploads otherwise.
-   - If the career site requires creating an account or logging in and there is no guest/continue-without-account option, call mark_auto_failed."""
+   - If the site offers a "Continue as guest" or "Apply without account" option, prefer that.
+   - If account creation is required: register using email={profile['email']} and password={offsite_password}
+     After the account is created, call save_account_credentials with the company name, site URL, and the password used.
+   - If already logged in to the career site, proceed to fill the application form directly."""
         new_tab_rule = "- If clicking Apply opens a new tab, switch to it immediately using the switch action, then fill the form there."
     else:
         apply_instructions = """3. Find and click the "Easy Apply" button on the job listing.
@@ -885,6 +962,7 @@ def main():
     parser.add_argument("--limit",     type=int, default=None, help="Max jobs to review this session.")
     parser.add_argument("--stats",     action="store_true", help="Print stats and exit.")
     parser.add_argument("--setup",     action="store_true", help="Re-run profile setup interview.")
+    parser.add_argument("--accounts",  metavar="QUERY",     help="Search saved career-site accounts and exit.")
     args = parser.parse_args()
 
     api_key, base_url, model, gmail_user, gmail_pass, max_auto_env, browser_api_key, browser_url, browser_model = load_env()
@@ -896,6 +974,23 @@ def main():
 
     if args.stats:
         print_stats(cursor)
+        conn.close()
+        return
+
+    if args.accounts:
+        results = search_accounts(args.accounts)
+        if not results:
+            print(f"No accounts found matching '{args.accounts}'.")
+        else:
+            for r in results:
+                print(f"\n  Company  : {r['company']}")
+                print(f"  Site     : {r['website_url']}")
+                print(f"  Email    : {r['email']}")
+                print(f"  Password : {r['password']}")
+                print(f"  Job      : {r['job_title']}")
+                print(f"  Created  : {r['created_at']}")
+                if r.get('notes'):
+                    print(f"  Notes    : {r['notes']}")
         conn.close()
         return
 
