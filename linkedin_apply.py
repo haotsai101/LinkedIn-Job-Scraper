@@ -346,6 +346,14 @@ class EasyApplyFlow:
 
     async def _click_easy_apply(self) -> bool:
         try:
+            # Wait for the apply button to appear
+            try:
+                await self.page.wait_for_selector(
+                    '[aria-label*="Easy Apply"], [aria-label*="Apply"]',
+                    timeout=8000,
+                )
+            except Exception:
+                pass
             btn = self.page.locator('[aria-label*="Easy Apply"]').first
             if await btn.count() == 0:
                 return False
@@ -519,18 +527,35 @@ class OffsiteApplyFlow:
             pass
 
     async def _click_apply_and_get_page(self) -> Page | None:
+        # Wait for job actions to render
+        try:
+            await self.page.wait_for_selector(
+                '.jobs-apply-button, [data-control-name*="apply"], [aria-label*="Apply"]',
+                timeout=8000,
+            )
+        except Exception:
+            pass
+
         selectors = [
+            '.jobs-apply-button--top-card',
+            '.jobs-apply-button',
             '[aria-label*="Apply on company site"]',
             'button:has-text("Apply on company site")',
             'a:has-text("Apply on company site")',
-            '[aria-label="Apply"]:not([aria-label*="Easy"])',
+            '[aria-label^="Apply to"]',
+            'button[aria-label*="Apply"]:not([aria-label*="Easy"])',
+            'a[aria-label*="Apply"]:not([aria-label*="Easy"])',
+            'button:has-text("Apply"):not(:has-text("Easy"))',
         ]
         btn = None
         for sel in selectors:
-            candidate = self.page.locator(sel).first
-            if await candidate.count() > 0:
-                btn = candidate
-                break
+            try:
+                candidate = self.page.locator(sel).first
+                if await candidate.count() > 0:
+                    btn = candidate
+                    break
+            except Exception:
+                continue
 
         if btn is None:
             return None
