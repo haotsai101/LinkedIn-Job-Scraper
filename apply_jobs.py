@@ -69,6 +69,7 @@ BLOCKED_COMPANIES = {
 BLOCKED_DOMAINS = {
     "theladders.com",
     "ed.crossover.com",  # Apply with Google/LinkedIn only — no form
+    "rex.zone",
 }
 PROFILE_PATH = "user_profile.json"
 LOG_PATH     = "application_log.json"
