@@ -31,7 +31,7 @@ There is no test suite and no linter configured.
 
 ## Git workflow
 
-After every code change, commit the changes with a descriptive message before moving on. Never leave modified source files uncommitted at the end of a task.
+After every code change, commit with a descriptive message and push to origin before moving on. Never leave modified source files uncommitted or unpushed at the end of a task.
 
 ## Architecture
 
