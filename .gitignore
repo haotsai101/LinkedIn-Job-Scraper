@@ -22,3 +22,14 @@ analysis/
 .vscode/
 .tmp_*
 .dagster_home/
+# Generated / runtime output
+jobs.db
+application_log.json
+created_accounts.json
+llm_debug.jsonl
+debug_screenshots/
+graphify-out/
+media/
+# Claude Code local settings (may contain machine-specific paths)
+.claude/settings.local.json
+.claude/agent-memory/

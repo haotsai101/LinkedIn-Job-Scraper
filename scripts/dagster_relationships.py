@@ -4,6 +4,8 @@ This module includes assets that show data relationships and create linked datas
 These depend on the database assets defined in dagster_db_assets.py.
 """
 
+import json
+
 import pandas as pd
 from pathlib import Path
 
@@ -216,3 +218,48 @@ def industry_job_summary(
     summary = summary.sort_values('job_count', ascending=False)
     logger.info(f"Top industries: {summary.head(5).to_dict('records')}")
     return summary
+
+
+@asset
+def application_summary() -> pd.DataFrame:
+    """
+    Load the full application history from application_log.json.
+
+    Populated by apply_jobs.py after each session. Each row is one
+    submitted application. Visible in the Dagster UI asset catalog.
+    """
+    log_path = Path("application_log.json")
+    empty = pd.DataFrame(columns=[
+        "date", "job_id", "title", "company", "url", "applied_at", "cover_letter_generated",
+    ])
+
+    if not log_path.exists():
+        logger.info("application_log.json not found — no applications recorded yet.")
+        return empty
+
+    try:
+        data = json.loads(log_path.read_text())
+    except Exception as exc:
+        logger.warning(f"Could not parse application_log.json: {exc}")
+        return empty
+
+    rows = []
+    for session in data.get("sessions", []):
+        date = session.get("date", "")
+        for app in session.get("applications", []):
+            rows.append({
+                "date":                   date,
+                "job_id":                 app.get("job_id"),
+                "title":                  app.get("title", ""),
+                "company":                app.get("company", ""),
+                "url":                    app.get("url", ""),
+                "applied_at":             app.get("applied_at", ""),
+                "cover_letter_generated": app.get("cover_letter_generated", False),
+            })
+
+    if not rows:
+        return empty
+
+    df = pd.DataFrame(rows)
+    logger.info(f"Loaded {len(df)} application records across {len(data.get('sessions', []))} session(s)")
+    return df

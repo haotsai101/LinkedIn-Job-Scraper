@@ -9,5 +9,3 @@ dagster>=1.12.18
 dagster-webserver>=1.12.18
 openai>=1.0.0
 playwright>=1.44.0
-# browser-use>=0.1.0  # replaced by linkedin_apply.py
-anthropic>=0.40.0

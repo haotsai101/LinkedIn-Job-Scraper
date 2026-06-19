@@ -23,10 +23,14 @@ while True:
     result = cursor.fetchall()
     result = [r[0] for r in result]
 
+    if not result:
+        print('All jobs scraped. Done.')
+        break
+
     details = job_detail_retriever.get_job_details(random.sample(result, min(MAX_UPDATES, len(result))))
     details = clean_job_postings(details)
     insert_data(details, conn, cursor)
-    print('UPDATED {} VALUES IN DB'.format(len(details)))
+    print('UPDATED {} VALUES IN DB — {} remaining'.format(len(details), len(result) - len(details)))
 
     print('Sleeping For {} Seconds...'.format(SLEEP_TIME))
     time.sleep(SLEEP_TIME)

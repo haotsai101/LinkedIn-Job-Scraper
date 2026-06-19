@@ -3,7 +3,9 @@ Dagster ops and jobs for LinkedIn data retrieval and enrichment.
 Converts search_retriever.py and details_retriever.py into schedulable tasks.
 """
 
+import json
 import sqlite3
+import subprocess
 import random
 from collections import deque
 from pathlib import Path
@@ -21,6 +23,9 @@ from dagster import (
     RunRequest,
     SkipReason,
     get_dagster_logger,
+    Field,
+    Int,
+    MetadataValue,
 )
 
 from scripts.create_db import create_tables
@@ -239,6 +244,79 @@ details_schedule = ScheduleDefinition(
 # ============================================================================
 # SENSOR - Trigger based on new jobs without details
 # ============================================================================
+
+
+@op(
+    config_schema={
+        "max_apply": Field(Int, default_value=10, description="Max applications to submit per session."),
+        "limit":     Field(Int, default_value=100, description="Max jobs to classify per session."),
+    }
+)
+def apply_jobs_op(context) -> dict:
+    """
+    Run apply_jobs.py --auto as a subprocess.
+
+    Opens a real browser window (requires a display — works natively on macOS).
+    Reads application_log.json afterward and exposes counts as asset metadata.
+    """
+    max_apply = context.op_config["max_apply"]
+    limit     = context.op_config["limit"]
+
+    project_root = Path(__file__).parent.parent
+    cmd = [
+        "python", "apply_jobs.py",
+        "--auto",
+        "--max-apply", str(max_apply),
+        "--limit",     str(limit),
+    ]
+
+    logger.info(f"Starting apply_jobs.py --auto --max-apply {max_apply} --limit {limit}")
+    result = subprocess.run(cmd, capture_output=True, text=True, cwd=str(project_root))
+
+    if result.stdout:
+        logger.info(result.stdout)
+    if result.returncode != 0 and result.stderr:
+        logger.error(result.stderr)
+
+    log_path = project_root / "application_log.json"
+    report: dict = {}
+    if log_path.exists():
+        try:
+            data = json.loads(log_path.read_text())
+            sessions = data.get("sessions", [])
+            if sessions:
+                report = sessions[-1]  # most recent session
+        except Exception as exc:
+            logger.warning(f"Could not parse application_log.json: {exc}")
+
+    context.add_output_metadata({
+        "applied": MetadataValue.int(report.get("applied_count", 0)),
+        "skipped": MetadataValue.int(report.get("skipped_count", 0)),
+        "errors":  MetadataValue.int(report.get("error_count", 0)),
+        "date":    MetadataValue.text(report.get("date", "")),
+    })
+
+    logger.info(
+        f"Session complete — applied: {report.get('applied_count', 0)}, "
+        f"skipped: {report.get('skipped_count', 0)}, errors: {report.get('error_count', 0)}"
+    )
+    return report
+
+
+@job
+def apply_jobs_job():
+    """Autonomous job application: classify, generate cover letters, and submit."""
+    apply_jobs_op()
+
+
+# Daily schedule: runs apply_jobs.py at 10 AM Mountain every day
+apply_schedule = ScheduleDefinition(
+    job=apply_jobs_job,
+    cron_schedule="0 10 * * *",
+    execution_timezone="America/Denver",
+    default_status=DefaultScheduleStatus.STOPPED,  # Enable manually when ready
+    name="daily_apply_schedule",
+)
 
 
 @sensor(job=fetch_details_only)

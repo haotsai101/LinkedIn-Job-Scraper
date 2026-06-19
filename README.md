@@ -1,76 +1,89 @@
-# LinkedIn Job Scraper
+# LinkedIn Job Scraper & Auto-Apply Agent
 
 <img src="media/logo.jpg" width="530" height="267">
 
-**Program to scrape and store a constant stream of LinkedIn job postings and dozens of their respective attributes**
+Scrapes a continuous stream of LinkedIn job postings, stores them in SQLite, and autonomously applies to matching jobs using a Playwright browser agent backed by any OpenAI-compatible LLM.
 
-**Download the polished dataset and view insights at - https://www.kaggle.com/datasets/arshkon/linkedin-job-postings**
-
-## User Configurations
-
-### Required
-- **```logins.csv```**
-  - Populate with multiple LinkedIn logins
-  - Specify the purpose of the login (search or detail retreiever)
-  - I recommend 1-3 logins for search and the remaining for more expensive attribute retrieval
-## Optional
-- **```details_retriever.py```**
-  - **MAX_UPDATES**: - Number of job postings to look up before sleeping. Increase with more accounts/proxies (default = 25)
-  - **SLEEP_TIME**: - Seconds to sleep between every iteration (default = 60)
-
-## Running
-
-This program consists of 2 main scripts, running in parallel.
-
-```python search_retriever.py``` - discovers new job postings and insert the most recent IDs and minimal attributes into the database with `KEYWORDS = "software data"  # Change this to any keyword you want to search for`
-
-```python details_retriever.py``` - populates tables with complete job attributes
-
-
-It's important to note that while ```search_retriever.py``` typically runs smoothly, even through your personal IP and a singular account, ```details_retriever.py``` can be a bit finicky. Each search generates approximately 25-50 results, all of which must be individually queried to obtain their attributes. To enhance its performance, I recommend the following strategies:
-
-- Utilize multiple proxies and accounts when running details_retriever.py.
-- Experiment with different time delays to find the optimal settings.
-- Run details_retriever.py during periods of lower online activity, such as late-night hours and weekends, to catch up with the progress of search_retriever.py. This will ensure that both processes remain synchronized and up to date.
-
-## 🚀 Using Dagster (Recommended)
-
-**Dagster provides automated, scheduled job execution and asset management:**
+## Setup
 
 ```bash
-# Quick start (one command)
-DAGSTER_HOME=./.dagster_home dagster dev
+pip install -r requirements.txt
+playwright install chromium
 
+# Copy and fill in credentials
+cp .env.template .env
+cp logins.csv.template logins.csv
+```
+
+**`logins.csv`** — LinkedIn account credentials. Columns: `emails`, `passwords`, `method`. Set `method` to `search`, `details`, or `apply`.
+
+**`.env`** — LLM API key, endpoint URL, model name, and optional Gmail credentials (see `.env.template`).
+
+**`user_profile.json`** — Applicant profile used to fill forms. Generate interactively:
+```bash
+python apply_jobs.py --setup
+```
+
+## Scraping Pipeline
+
+Two-phase pipeline, orchestrated by [Dagster](https://dagster.io/) or run standalone.
+
+**Phase 1 — Discovery** (`search_retriever.py`): Queries LinkedIn's Voyager API for new job IDs and inserts them with `scraped=0`.
+
+**Phase 2 — Enrichment** (`details_retriever.py`): Fetches full attributes for every `scraped=0` job and sets `scraped=1`. Rate-limit-sensitive — use multiple accounts/proxies.
+
+### Dagster (recommended)
+
+```bash
+DAGSTER_HOME=./.dagster_home dagster dev
 # Then visit: http://localhost:3000
 ```
 
-**Features:**
-- ✅ Automated job scheduling (every 4-6 hours)
-- ✅ Auto-refresh of all 21 assets
-- ✅ Visual pipeline monitoring
-- ✅ Run history & lineage tracking
-- ✅ Zero snapshot disk overhead
-- ✅ SQLite as single source of truth
+Schedules discovery every ~4 hours and enrichment every ~6 hours. A sensor triggers enrichment whenever new unenriched jobs appear.
 
-**For complete details, see:** [DAGSTER_COMPLETE_GUIDE.md](DAGSTER_COMPLETE_GUIDE.md)
+### Standalone
 
-### Quick Reference
 ```bash
-./run_jobs.sh search                    # Search for new jobs
-./run_jobs.sh details                   # Fetch job details
-./run_jobs.sh both "software"           # Both together
-dagster asset materialize               # Refresh all assets
+python search_retriever.py   # Discover new job IDs
+python details_retriever.py  # Enrich scraped=0 jobs
 ```
 
----
+## Auto-Apply Agent
 
-## Converting Database to CSV
+Reads pending jobs (`applied IS NULL`), classifies them with an LLM, and applies via Playwright.
 
-```python to_csv.py --folder <destination folder> --database <linkedin_jobs.db>```
+```bash
+python apply_jobs.py                              # Semi-auto: confirm before each submit
+python apply_jobs.py --auto                       # Fully autonomous
+python apply_jobs.py --stats                      # Print pending/applied/skipped/failed counts
+python apply_jobs.py --verbose                    # Save debug screenshots on failures
+python apply_jobs.py --limit 5                    # Review at most 5 jobs this session
+python apply_jobs.py --max-apply 10              # Cap submissions this session
+python apply_jobs.py --type OffsiteApply          # Filter by application type
+python apply_jobs.py --type SimpleOnsiteApply,ComplexOnsiteApply  # LinkedIn Easy Apply only
+python apply_jobs.py --reset-failed               # Reset auto-failed jobs back to pending
+```
 
-Creates a CSV file for each database, along with minimal preprocessing
+**Application types:**
+- `SimpleOnsiteApply` / `ComplexOnsiteApply` — LinkedIn Easy Apply (in-modal multi-step form)
+- `OffsiteApply` — External company career sites (LLM fills arbitrary HTML forms)
 
+Results are written to `application_log.json` and emailed if Gmail credentials are set.
 
-## Database Structure
+## Database
 
-[You can find the structure of the database here](DatabaseStructure.md)
+Single SQLite file: `linkedin_jobs.db`. Key `jobs` columns:
+
+| Column | Values |
+|---|---|
+| `scraped` | `0` = discovered only, `>0` = fully enriched |
+| `applied` | `NULL` = pending, `1` = applied, `-1` = skipped, `-2` = auto-failed |
+| `application_type` | `SimpleOnsiteApply`, `ComplexOnsiteApply`, `OffsiteApply` |
+| `remote_allowed` | Used to filter candidates for apply |
+
+```bash
+# Export to CSV
+python to_csv.py --folder <dest> --database linkedin_jobs.db
+```
+
+[Full database structure](DatabaseStructure.md)

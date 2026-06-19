@@ -21,8 +21,8 @@ def create_session(email, password):
     driver.find_element(By.ID, 'username').send_keys(email)
     driver.find_element(By.ID, 'password').send_keys(password)
     driver.find_element(By.CSS_SELECTOR, 'button.btn__primary--large[type="submit"]').click()
-    time.sleep(1)
-    # input('Press ENTER after a successful login for "{}": '.format(email))
+    time.sleep(2)
+    input('Complete any CAPTCHA in the browser, then press ENTER to continue for "{}": '.format(email))
     driver.get('https://www.linkedin.com/jobs/search/?')
     time.sleep(1)
     cookies = driver.get_cookies()
@@ -40,14 +40,17 @@ def get_logins(method):
     return emails, passwords
 
 class JobSearchRetriever:
-    def __init__(self, keywords="data", count: int = 100):
+    def __init__(self, keywords="data", count: int = 100, filters: str = "sortBy:List(DD)", geo_id: str = ""):
         """Create a search retriever.
 
         keywords: search keywords
         count: number of results per page (used to compute start offset)
+        filters: LinkedIn selectedFilters string, e.g. "sortBy:List(DD),workplaceType:List(2)"
+        geo_id: LinkedIn geoId for location (e.g. "102095887" for Utah); placed at top-level query
         """
         self.count = count
-        query = f"keywords:{keywords},origin:JOB_SEARCH_PAGE_OTHER_ENTRY,selectedFilters:(sortBy:List(DD)),spellCorrectionEnabled:true"
+        geo_part = f",geoId:{geo_id}" if geo_id else ""
+        query = f"keywords:{keywords}{geo_part},origin:JOB_SEARCH_PAGE_OTHER_ENTRY,selectedFilters:({filters}),spellCorrectionEnabled:true"
         # template with a {start} placeholder; get_jobs will replace start based on page
         self.job_search_link_template = f'https://www.linkedin.com/voyager/api/voyagerJobsDashJobCards?decorationId=com.linkedin.voyager.dash.deco.jobs.search.JobSearchCardsCollection-187&count={self.count}&q=jobSearch&query=({query})&start={{start}}'
         emails, passwords = get_logins('search')
