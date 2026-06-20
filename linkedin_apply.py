@@ -958,6 +958,11 @@ async def _fill_field(page: Page, field: dict, value: str):
                         }""",
                         handle,
                     )
+                # React processes setState() on the next microtask tick, so is_checked()
+                # called immediately after dispatching synthetic events races the
+                # controlled-component reconciliation: the DOM may still read the optimistic
+                # checked=true before React resets it to false. Settle first, then read.
+                await asyncio.sleep(0.35)  # wait for React reconciliation
                 # Verify the selection registered; retry forcefully and re-dispatch if not.
                 if not await radio_loc.is_checked():
                     await radio_loc.click(force=True)
@@ -966,6 +971,7 @@ async def _fill_field(page: Page, field: dict, value: str):
                             "el => el.dispatchEvent(new Event('change', {bubbles:true}))",
                             handle,
                         )
+                    await asyncio.sleep(0.35)  # wait again before re-read
                 # Report whether the click was confirmed so callers can decide on a retry.
                 return await radio_loc.is_checked()
 
@@ -1415,7 +1421,15 @@ class EasyApplyFlow:
             # Prevents infinite loops on tag-input fields (e.g. "I'm looking for…") whose
             # text input clears itself after Enter, making current_value stay '' forever.
             if label and label in filled_labels:
-                continue
+                # Radios/checkboxes are safe to retry — re-clicking a correctly-checked
+                # control is a no-op. If is_checked() returned a false positive (React
+                # reconciliation race) the label got added despite the fill failing, which
+                # would permanently deadlock the stuck-Review re-fill loop. Allow a re-attempt
+                # whenever the value still reads empty.
+                if kind in ("radio", "checkbox") and not current_val:
+                    pass  # fall through to re-fill
+                else:
+                    continue
             value = _get_profile_value(self.profile, label, kind)
             if value is None:
                 value = await _ask_llm(self.classifier_client, self.classifier_model, self.profile, field)
