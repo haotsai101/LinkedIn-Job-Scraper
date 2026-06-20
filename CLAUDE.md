@@ -33,6 +33,23 @@ There is no test suite and no linter configured.
 
 After every code change, commit with a descriptive message and push to origin before moving on. Never leave modified source files uncommitted or unpushed at the end of a task.
 
+## Development workflow
+
+When tickets are created (e.g. by the log-bug-detector agent after a run), follow this pipeline:
+
+1. **Triage & dependencies** — Before assigning any ticket, determine dependencies between tickets. Block a ticket on its prerequisites and order work accordingly. State the dependency graph explicitly before dispatching agents.
+
+2. **Implementation — `senior-swe` agent** — Assign each ready (unblocked) ticket to the `senior-swe` agent. The SWE implements the fix end-to-end and opens a GitHub pull request. Brief the agent with: ticket title, root cause, affected files, and any blocking tickets that were already merged.
+
+3. **Code review — `pr-code-reviewer` agent** — Once a PR is open, assign it to the `pr-code-reviewer` agent with the PR number. The reviewer reads the diff, leaves inline comments, and returns an **approve** or **request changes** verdict.
+
+4. **Iterate** — If the reviewer requests changes, send the feedback back to the `senior-swe` agent (use `SendMessage` with the same agent ID to resume context). Repeat until approved, then merge.
+
+**Rules:**
+- Never merge a PR without a reviewer approval.
+- Dispatch the SWE and reviewer as separate agents — the SWE must not review its own work.
+- When multiple tickets are independent, dispatch their SWE agents in parallel (one `Agent` call per ticket in the same message).
+
 ## Architecture
 
 ### Two-phase scraping pipeline
