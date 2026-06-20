@@ -586,21 +586,18 @@ def _get_profile_value(profile: dict, label: str, kind: str = "text") -> str | N
             and kind in ("select", "select-one", "radio"):
         return p.get("willing_to_travel", "No")
     # Notice period / start timeline — runs BEFORE the generic "start date -> Immediately"
-    # rule below so dropdowns get a realistic option (e.g. "2 weeks") instead of "Immediately".
+    # rule below. Default to "Immediately": it's present in virtually all LinkedIn
+    # dropdowns, whereas a literal "2 weeks" may not match range-based options
+    # (e.g. "2-4 weeks"). A real notice_period from the profile still wins.
     if any(k in l for k in ("how quickly", "how soon", "when can you start",
                              "notice period", "earliest start", "available to start")) \
             and kind in ("select", "select-one", "radio"):
-        return p.get("notice_period", "2 weeks")
+        return p.get("notice_period", "Immediately")
     # Geographic commute / in-office proximity — user is in Utah; these appear on non-remote
-    # roles, so answer "No". Runs before the generic "comfortable commuting -> Yes" rule.
-    if any(k in l for k in ("commutable", "commute to", "in-office attendance",
-                             "commuting distance", "work onsite", "in commutable")) \
-            and kind in ("select", "select-one", "radio"):
-        return "No"
-    # Prior employment at this company
-    if any(k in l for k in ("previously employed by", "worked for us before",
-                             "former employee", "prior employment at",
-                             "previously worked at", "previously worked for")) \
+    # roles, so answer "No". Only matches distance/eligibility questions, NOT commute-
+    # willingness ("willing to commute") which is handled by the "-> Yes" rule below.
+    if any(k in l for k in ("commutable", "in-office attendance",
+                             "commuting distance", "in commutable")) \
             and kind in ("select", "select-one", "radio"):
         return "No"
     if any(k in l for k in ("earliest available", "start date", "when can you start", "available to start", "date available", "earliest start")):
@@ -611,7 +608,7 @@ def _get_profile_value(profile: dict, label: str, kind: str = "text") -> str | N
         return "No"
     if any(k in l for k in ("applied here before", "applied to us before", "applied with us", "previously applied", "filed an application", "application with")):
         return "No"
-    if any(k in l for k in ("worked here before", "worked for us", "worked for this company", "previously worked", "prior employment here", "former employee")):
+    if any(k in l for k in ("worked here before", "worked for us", "worked for this company", "previously worked", "prior employment here", "former employee", "previously employed by", "prior employment at")):
         return "No"
     if any(k in l for k in ("under 18", "proof of eligibility", "proof of age", "work permit")):
         return "N/A"
