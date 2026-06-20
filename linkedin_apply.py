@@ -389,11 +389,13 @@ def _degree_rank(deg: str) -> int:
     not contain "master"), so callers must compare ranks rather than substrings.
     0 = none, 1 = associate, 2 = bachelor, 3 = master, 4 = doctorate."""
     d = deg.lower()
-    if any(t in d for t in ("ph.d", "phd", "doctor", "d.sc", "dsc", "edd")):
+    if any(t in d for t in ("ph.d", "phd", "doctor", "d.sc", "dsc", "edd", "ed.d")):
         return 4
-    if any(t in d for t in ("master", "m.s.", "m.s ", "ms ", " ms", "mba", "m.eng", "meng", "m.a.", " ma")):
+    if any(t in d for t in ("master", "m.s.", "mba", "m.eng", "meng", "m.a.")) \
+            or re.search(r'\b(ms|ma)\b', d):
         return 3
-    if any(t in d for t in ("bachelor", "b.s.", "b.s ", "bs ", " bs", "b.a.", "b.a ", "ba ", " ba", "b.eng")):
+    if any(t in d for t in ("bachelor", "b.s.", "b.a.", "b.eng")) \
+            or re.search(r'\b(bs|ba)\b', d):
         return 2
     if any(t in d for t in ("associate", "a.s.", "a.a.")):
         return 1
