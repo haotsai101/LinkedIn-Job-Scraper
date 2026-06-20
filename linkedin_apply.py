@@ -39,11 +39,30 @@ def _write_llm_log(entry: dict):
 
 
 async def _human_type(el, value: str):
-    """Type text character-by-character with random delays to mimic human input."""
+    """Type text character-by-character with random delays to mimic human input.
+
+    Falls back to direct el.fill() if press_sequentially times out (e.g. Ashby
+    long-answer textareas whose JS character-count handlers stall the event loop).
+    """
     await el.click()
     await asyncio.sleep(random.uniform(0.1, 0.3))
     await el.clear()
-    await el.press_sequentially(str(value), delay=random.randint(40, 120))
+    _delay = random.randint(40, 120)
+    try:
+        await el.press_sequentially(str(value), delay=_delay)
+    except Exception as _ps_exc:
+        if "Timeout" in str(_ps_exc) or "timeout" in str(_ps_exc):
+            # Rapid keydown events can stall browser JS handlers on fields with
+            # character-count / autosave listeners.  el.fill() bypasses keyboard
+            # events entirely (JS property set + dispatched input event) and
+            # succeeds where press_sequentially stalls.
+            print(f"  [fill] press_sequentially timed out — falling back to direct fill()")
+            try:
+                await el.fill(str(value))
+            except Exception as _fb_exc:
+                print(f"  [fill] fill() fallback also failed: {_fb_exc}")
+        else:
+            raise
     await asyncio.sleep(random.uniform(0.05, 0.2))
 
 _AUTH_HOSTPATHS = ("/login", "/checkpoint", "/uas/")
