@@ -2893,7 +2893,7 @@ class OffsiteApplyFlow:
             if action_type in ("fill", "select") and (selector or text):
                 _sel_key = selector or text
                 _selector_attempts[_sel_key] = _selector_attempts.get(_sel_key, 0) + 1
-                if _selector_attempts[_sel_key] > 3:
+                if _selector_attempts[_sel_key] >= 3:
                     print(f"  [LLM] Selector {_sel_key!r} attempted 3+ times with no change — skipping this field")
                     # Add to forced_filled so LLM sees it as FILLED and moves on
                     _fid = _sel_key.lstrip("#")
@@ -3710,6 +3710,14 @@ class OffsiteApplyFlow:
                                             print(f"  [LLM] React Select: dropdown closed, cannot select")
                             except Exception as _cb_exc:
                                 print(f"  [LLM] React Select combobox fallback failed: {_cb_exc}")
+                                # Mark the field as filled so the LLM doesn't re-propose the same
+                                # select action on the next step, creating an infinite retry loop.
+                                try:
+                                    _fail_id = (await el.get_attribute("id") or selector).lstrip("#")
+                                    if _fail_id:
+                                        _forced_filled[_fail_id] = "(failed)"
+                                except Exception:
+                                    pass
                         await asyncio.sleep(0.5)
                 except Exception as exc:
                     print(f"  [LLM] Select failed: {exc}")
