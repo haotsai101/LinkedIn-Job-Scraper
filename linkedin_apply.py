@@ -445,13 +445,13 @@ def _get_profile_value(profile: dict, label: str, kind: str = "text") -> str | N
                              "currently residing in the us", "located in the us",
                              "located in the united states")):
         return "Yes"
-    # Geographic residency exclusion questions — user resides in Utah, USA
-    if any(k in l for k in (
-        "reside in mexico", "reside in latin", "reside in south america",
-        "reside in central america", "based in mexico", "located in mexico",
-        "located in south america", "live in mexico", "live in south america",
-        "live in central america", "live in latin",
-    )) and kind in ("select", "select-one", "radio"):
+    # Geographic residency exclusion questions — user resides in Utah, USA.
+    # Combinatorial match so every verb/region pairing is covered symmetrically
+    # (e.g. "based in South America", "located in Central America", "located in Latin").
+    _RESIDE_VERBS = ("reside in", "based in", "located in", "live in")
+    _EXCL_REGIONS = ("mexico", "latin", "south america", "central america")
+    if any(f"{v} {r}" in l for v in _RESIDE_VERBS for r in _EXCL_REGIONS) \
+            and kind in ("select", "select-one", "radio"):
         return "No"
     # Relocation yes/no questions — user targets remote roles, not willing to relocate
     if any(k in l for k in ("open to relocat", "willing to relocat", "able to relocat",
@@ -591,7 +591,7 @@ def _get_profile_value(profile: dict, label: str, kind: str = "text") -> str | N
     # Regex first: catches "do you have <product> development experience?" where an
     # interrupting product name (e.g. "twilio development") breaks the contiguous
     # "do you have experience" substring the keyword list below relies on.
-    if re.search(r'do you have .{0,50}(experience|background|expertise)', l) \
+    if re.search(r'do you have .{0,50}(experience|expertise)', l) \
             and kind in ("select", "select-one", "radio"):
         return "Yes"
     if any(k in l for k in (
