@@ -77,8 +77,11 @@ LLM_LOG_PATH = "llm_debug.jsonl"
 ACCOUNTS_PATH = "created_accounts.json"
 
 def _write_llm_log(entry: dict):
-    with open(LLM_LOG_PATH, "a") as f:
-        f.write(json.dumps(entry) + "\n")
+    try:
+        with open(LLM_LOG_PATH, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception:
+        pass
 
 
 async def _llm_fill_focused(page, llm_client: AsyncOpenAI, llm_model: str, profile: dict):

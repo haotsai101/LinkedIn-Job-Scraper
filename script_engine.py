@@ -24,8 +24,11 @@ _LLM_LOG_PATH = "llm_debug.jsonl"
 
 
 def _write_llm_log(entry: dict):
-    with open(_LLM_LOG_PATH, "a") as f:
-        f.write(json.dumps(entry) + "\n")
+    try:
+        with open(_LLM_LOG_PATH, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
