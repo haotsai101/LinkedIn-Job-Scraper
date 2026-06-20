@@ -33,8 +33,12 @@ Usage:
 import argparse
 import asyncio
 import csv
+import email
+import email.message
+import imaplib
 import json
 import os
+import re
 import secrets
 import smtplib
 import sqlite3
@@ -345,6 +349,81 @@ def send_session_email(gmail_user: str, app_password: str, report: dict):
         print(f"  Email summary sent to {gmail_user}")
     except Exception as exc:
         print(f"  [!] Failed to send email: {exc}")
+
+
+# ── Gmail IMAP inbox reader ────────────────────────────────────────────────────
+
+class EmailInbox:
+    """Reads Gmail via IMAP to retrieve verification links and codes sent to the applicant email."""
+
+    def __init__(self, user: str, password: str):
+        self.user = user
+        self.password = password
+
+    def _connect(self):
+        M = imaplib.IMAP4_SSL("imap.gmail.com")
+        M.login(self.user, self.password)
+        M.select("INBOX")
+        return M
+
+    @staticmethod
+    def _body(msg) -> str:
+        body = ""
+        if msg.is_multipart():
+            for part in msg.walk():
+                ct = part.get_content_type()
+                if ct == "text/plain":
+                    body += part.get_payload(decode=True).decode(errors="replace")
+                elif ct == "text/html" and not body:
+                    body += part.get_payload(decode=True).decode(errors="replace")
+        else:
+            body = msg.get_payload(decode=True).decode(errors="replace")
+        return body
+
+    def wait_for_link(self, from_domain: str, timeout: int = 90,
+                      keywords: tuple = ("verify", "confirm", "activate")) -> "str | None":
+        """Poll INBOX for an unseen email from from_domain; return first URL containing a keyword."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                M = self._connect()
+                _, data = M.search(None, f'(UNSEEN FROM "{from_domain}")')
+                for num in (data[0].split() or []):
+                    _, msg_data = M.fetch(num, "(RFC822)")
+                    msg = email.message_from_bytes(msg_data[0][1])
+                    body = self._body(msg)
+                    for url in re.findall(r'https?://[^\s<>"\']+', body):
+                        if any(k in url.lower() for k in keywords):
+                            M.store(num, "+FLAGS", "\\Seen")
+                            M.logout()
+                            return url
+                M.logout()
+            except Exception:
+                pass
+            time.sleep(5)
+        return None
+
+    def wait_for_code(self, from_domain: str, timeout: int = 90) -> "str | None":
+        """Poll INBOX for an unseen email from from_domain; return first 4-8 digit code found."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                M = self._connect()
+                _, data = M.search(None, f'(UNSEEN FROM "{from_domain}")')
+                for num in (data[0].split() or []):
+                    _, msg_data = M.fetch(num, "(RFC822)")
+                    msg = email.message_from_bytes(msg_data[0][1])
+                    body = self._body(msg)
+                    codes = re.findall(r'\b(\d{4,8})\b', body)
+                    if codes:
+                        M.store(num, "+FLAGS", "\\Seen")
+                        M.logout()
+                        return codes[0]
+                M.logout()
+            except Exception:
+                pass
+            time.sleep(5)
+        return None
 
 
 # ── Career-site account management ─────────────────────────────────────────────
@@ -705,6 +784,8 @@ async def run_session(
     _classifier_model = classifier_model or model
     agent = JobAgent(classifier_client, _classifier_model, profile)
 
+    inbox = EmailInbox(gmail_user, gmail_pass) if gmail_user and gmail_pass else None
+
     started_at   = datetime.now(timezone.utc).isoformat()
     session_date = datetime.now().strftime("%Y-%m-%d")
     applications: list[dict] = []
@@ -870,6 +951,7 @@ async def run_session(
                         classifier_client=classifier_client,
                         classifier_model=_classifier_model,
                         verbose=verbose,
+                        inbox=inbox,
                     )
                 else:
                     flow = EasyApplyFlow(
@@ -912,6 +994,7 @@ async def run_session(
                         job_description=description or "",
                         classifier_client=classifier_client,
                         classifier_model=_classifier_model,
+                        inbox=inbox,
                     )
                     try:
                         status = await asyncio.wait_for(flow.run(url), timeout=600)
