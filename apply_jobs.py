@@ -367,6 +367,12 @@ class EmailInbox:
         return M
 
     @staticmethod
+    def _root_domain(netloc: str) -> str:
+        """Extract registrable domain: jobs.company.com → company.com."""
+        parts = netloc.split(".")
+        return ".".join(parts[-2:]) if len(parts) >= 2 else netloc
+
+    @staticmethod
     def _body(msg) -> str:
         body = ""
         if msg.is_multipart():
@@ -380,50 +386,75 @@ class EmailInbox:
             body = msg.get_payload(decode=True).decode(errors="replace")
         return body
 
+    def _fetch_first_unseen(self, root_domain: str, timeout: int = 90) -> "str | None":
+        """Hold one IMAP connection open and poll until an unseen email from root_domain arrives."""
+        deadline = time.time() + timeout
+        M = None
+        try:
+            M = self._connect()
+        except Exception as exc:
+            print(f"  [Inbox] IMAP connect error: {exc}")
+            return None
+        try:
+            first_error = True
+            while time.time() < deadline:
+                try:
+                    M.check()
+                except Exception:
+                    try:
+                        M.logout()
+                    except Exception:
+                        pass
+                    try:
+                        M = self._connect()
+                    except Exception as exc:
+                        print(f"  [Inbox] IMAP reconnect error: {exc}")
+                        return None
+                try:
+                    _, data = M.search(None, f'(UNSEEN FROM "{root_domain}")')
+                    for num in (data[0].split() or []):
+                        _, msg_data = M.fetch(num, "(RFC822)")
+                        msg = email.message_from_bytes(msg_data[0][1])
+                        body = self._body(msg)
+                        M.store(num, "+FLAGS", "\\Seen")
+                        return body
+                except Exception as exc:
+                    if first_error:
+                        print(f"  [Inbox] IMAP search error: {exc}")
+                        first_error = False
+                time.sleep(5)
+        finally:
+            try:
+                M.logout()
+            except Exception:
+                pass
+        return None
+
+    def fetch_verification(self, from_domain: str, timeout: int = 90,
+                           keywords: tuple = ("verify", "confirm", "activate")) -> "tuple[str|None, str|None]":
+        """Fetch one unseen email from from_domain; return (code, link) — whichever is present."""
+        root = self._root_domain(from_domain)
+        body = self._fetch_first_unseen(root, timeout)
+        if not body:
+            return None, None
+        codes = re.findall(r'\b(\d{4,8})\b', body)
+        urls = [
+            u.rstrip(".,;:!?)")
+            for u in re.findall(r'https?://[^\s<>"\']+', body)
+            if any(k in u.lower() for k in keywords)
+        ]
+        return (codes[0] if codes else None), (urls[0] if urls else None)
+
     def wait_for_link(self, from_domain: str, timeout: int = 90,
                       keywords: tuple = ("verify", "confirm", "activate")) -> "str | None":
         """Poll INBOX for an unseen email from from_domain; return first URL containing a keyword."""
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            try:
-                M = self._connect()
-                _, data = M.search(None, f'(UNSEEN FROM "{from_domain}")')
-                for num in (data[0].split() or []):
-                    _, msg_data = M.fetch(num, "(RFC822)")
-                    msg = email.message_from_bytes(msg_data[0][1])
-                    body = self._body(msg)
-                    for url in re.findall(r'https?://[^\s<>"\']+', body):
-                        if any(k in url.lower() for k in keywords):
-                            M.store(num, "+FLAGS", "\\Seen")
-                            M.logout()
-                            return url
-                M.logout()
-            except Exception:
-                pass
-            time.sleep(5)
-        return None
+        _, link = self.fetch_verification(from_domain, timeout, keywords)
+        return link
 
     def wait_for_code(self, from_domain: str, timeout: int = 90) -> "str | None":
         """Poll INBOX for an unseen email from from_domain; return first 4-8 digit code found."""
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            try:
-                M = self._connect()
-                _, data = M.search(None, f'(UNSEEN FROM "{from_domain}")')
-                for num in (data[0].split() or []):
-                    _, msg_data = M.fetch(num, "(RFC822)")
-                    msg = email.message_from_bytes(msg_data[0][1])
-                    body = self._body(msg)
-                    codes = re.findall(r'\b(\d{4,8})\b', body)
-                    if codes:
-                        M.store(num, "+FLAGS", "\\Seen")
-                        M.logout()
-                        return codes[0]
-                M.logout()
-            except Exception:
-                pass
-            time.sleep(5)
-        return None
+        code, _ = self.fetch_verification(from_domain, timeout)
+        return code
 
 
 # ── Career-site account management ─────────────────────────────────────────────

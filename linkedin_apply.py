@@ -2613,9 +2613,11 @@ class OffsiteApplyFlow:
                                       "enter your code", "check your email", "we sent a code",
                                       "sent you a code", "email verification", "sent to your email")
                     if any(s in _pg_text for s in _email_signals):
-                        _ev_domain = urlparse(page.url).netloc
-                        print(f"  [LLM] Email verification detected — checking inbox for code…")
-                        _ev_code = await asyncio.to_thread(self.inbox.wait_for_code, _ev_domain, 60)
+                        _ev_domain = urlparse(page.url).netloc.lower()
+                        print(f"  [LLM] Email verification detected — checking inbox…")
+                        _ev_code, _ev_link = await asyncio.to_thread(
+                            self.inbox.fetch_verification, _ev_domain, 60
+                        )
                         if _ev_code:
                             print(f"  [LLM] Email code: {_ev_code}")
                             _code_inp = page.locator(
@@ -2625,15 +2627,16 @@ class OffsiteApplyFlow:
                             ).first
                             if await _code_inp.count() > 0 and await _code_inp.is_visible():
                                 await _code_inp.fill(_ev_code)
-                                await asyncio.sleep(0.5)
+                                await _code_inp.press("Enter")
+                                await asyncio.sleep(1)
+                        elif _ev_link:
+                            print(f"  [LLM] Email verification link found — navigating…")
+                            await page.goto(_ev_link, wait_until="domcontentloaded", timeout=20000)
+                            await asyncio.sleep(2)
                         else:
-                            _ev_link = await asyncio.to_thread(self.inbox.wait_for_link, _ev_domain, 60)
-                            if _ev_link:
-                                print(f"  [LLM] Email verification link found — navigating…")
-                                await page.goto(_ev_link, wait_until="domcontentloaded", timeout=20000)
-                                await asyncio.sleep(2)
-                except Exception:
-                    pass
+                            print(f"  [LLM] No verification email received in time")
+                except Exception as _exc:
+                    print(f"  [LLM] Email verification check error: {_exc}")
 
             current_url = page.url
             _elapsed = int((datetime.now(timezone.utc) - _session_start).total_seconds())
