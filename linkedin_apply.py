@@ -383,6 +383,23 @@ _OFFSITE_FIELDS_JS = """
 
 # ── Deterministic profile → field mapping ──────────────────────────────────────
 
+def _degree_rank(deg: str) -> int:
+    """Map a degree string (full name or abbreviation) to a numeric rank for hierarchy
+    comparisons. Substring matching on raw text fails for abbreviations like "M.S." (does
+    not contain "master"), so callers must compare ranks rather than substrings.
+    0 = none, 1 = associate, 2 = bachelor, 3 = master, 4 = doctorate."""
+    d = deg.lower()
+    if any(t in d for t in ("ph.d", "phd", "doctor", "d.sc", "dsc", "edd")):
+        return 4
+    if any(t in d for t in ("master", "m.s.", "m.s ", "ms ", " ms", "mba", "m.eng", "meng", "m.a.", " ma")):
+        return 3
+    if any(t in d for t in ("bachelor", "b.s.", "b.s ", "bs ", " bs", "b.a.", "b.a ", "ba ", " ba", "b.eng")):
+        return 2
+    if any(t in d for t in ("associate", "a.s.", "a.a.")):
+        return 1
+    return 0
+
+
 def _get_profile_value(profile: dict, label: str, kind: str = "text") -> str | None:
     """Map a form field label to a profile value. Returns None if no confident match."""
     # Collapse all whitespace (including embedded newlines from DOM textContent),
@@ -524,16 +541,19 @@ def _get_profile_value(profile: dict, label: str, kind: str = "text") -> str | N
     # Must run BEFORE the generic education branch, which would otherwise answer
     # "Yes" for any degree the user holds (e.g. claiming a PhD when they have a B.S.).
     _deg_label = l  # l is the lowercased label
-    if re.search(r'have you completed.{0,60}(doctor|ph\.?d|phd|master|bachelor)', _deg_label) \
+    if re.search(r'have you completed.{0,60}(doctor|ph\.?d|phd|master|bachelor|associate)', _deg_label) \
             and kind in ("select", "select-one", "radio"):
-        edu = p.get("education", {})
-        user_deg = ((edu.get("degree") or "") if isinstance(edu, dict) else "").lower()
+        edu = p.get("education", {}) if isinstance(p.get("education"), dict) else {}
+        user_rank = _degree_rank(edu.get("degree") or "")
         if any(t in _deg_label for t in ("doctor", "ph.d", "phd")):
-            return "Yes" if any(t in user_deg for t in ("ph.d", "phd", "doctor")) else "No"
-        if "master" in _deg_label:
-            return "Yes" if any(t in user_deg for t in ("master", "ph.d", "phd", "doctor")) else "No"
-        # bachelor or associate — always "Yes" if user has any degree
-        return "Yes" if (isinstance(edu, dict) and edu.get("degree")) else "No"
+            required_rank = 4
+        elif "master" in _deg_label:
+            required_rank = 3
+        elif "bachelor" in _deg_label:
+            required_rank = 2
+        else:
+            required_rank = 1  # associate
+        return "Yes" if user_rank >= required_rank else "No"
     if any(k in l for k in ("highest level of education", "highest education", "education level", "level of education")):
         edu = p.get("education", {})
         # "Have you completed the following level of education: X?" is a Yes/No radio, not a degree picker
