@@ -3495,16 +3495,29 @@ class OffsiteApplyFlow:
                     el = page.locator(selector).first
                     if await el.count() > 0:
                         _sel_done = False
-                        # Try native select_option first
-                        try:
-                            await el.select_option(label=value)
+                        # Guard: radio/checkbox must be .check()ed — select_option raises and
+                        # the combobox fallback's `_tag == "input"` check would match, then
+                        # el.fill() on a radio throws "Input of type 'radio' cannot be filled".
+                        _input_type = (await el.get_attribute("type") or "").lower()
+                        if _input_type in ("radio", "checkbox"):
+                            if _input_type != "checkbox" or not await el.is_checked():
+                                await el.check()
                             _sel_done = True
-                        except Exception:
+                            _field_id = await el.get_attribute("id") or ""
+                            if _field_id:
+                                _forced_filled[_field_id] = value
+                            print(f"  [LLM] Auto-redirected select→check for {_input_type}")
+                        # Try native select_option first
+                        if not _sel_done:
                             try:
-                                await el.select_option(value=value)
+                                await el.select_option(label=value)
                                 _sel_done = True
                             except Exception:
-                                pass
+                                try:
+                                    await el.select_option(value=value)
+                                    _sel_done = True
+                                except Exception:
+                                    pass
                         # Fallback: React Select / combobox (input[role="combobox"] or aria-haspopup)
                         if not _sel_done:
                             try:
