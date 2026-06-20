@@ -31,7 +31,15 @@ There is no test suite and no linter configured.
 
 ## Git workflow
 
-After every code change, commit with a descriptive message and push to origin before moving on. Never leave modified source files uncommitted or unpushed at the end of a task.
+**All changes must go through a feature branch and PR — never commit directly to `master`.**
+
+Workflow for every code change:
+1. Create a feature branch: `git checkout -b feature/<short-description>`
+2. Implement and commit on the feature branch with a descriptive message.
+3. Push the branch: `git push origin feature/<short-description>`
+4. Open a PR targeting `master` and follow the development workflow below (review → approve → merge).
+
+Never push commits directly to `master`. If a change accidentally lands on `master`, move it to a feature branch immediately (`git checkout -b feature/...`, then revert the commit on `master`).
 
 ## Development workflow
 

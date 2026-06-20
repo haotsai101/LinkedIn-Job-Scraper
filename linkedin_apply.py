@@ -1765,6 +1765,7 @@ class OffsiteApplyFlow:
         classifier_client: OpenAI | None = None,
         classifier_model: str = "",
         verbose: bool = False,
+        inbox=None,
     ):
         self.page = page
         self.context = context
@@ -1780,6 +1781,7 @@ class OffsiteApplyFlow:
         self.classifier_client = classifier_client or llm_client
         self.classifier_model = classifier_model or model
         self.verbose = verbose
+        self.inbox = inbox
         self.unanswered_fields: list[str] = []
 
     _EXPIRED_PHRASES = [
@@ -2475,6 +2477,7 @@ class OffsiteApplyFlow:
         last_action_type = None  # used to not penalize fill/select/upload for not changing URL
         consecutive_duplicates = 0  # consecutive duplicate-fill guard firings without URL change
         _selector_attempts: dict[str, int] = {}  # per-selector retry count; skip after 3 failures
+        _email_verified = False  # prevents re-triggering inbox poll after verification is handled
         # Fields whose values are committed to hidden DOM state (e.g. jQuery UI autocomplete) but
         # whose visible input is cleared by site JS. Tracked here so the LLM sees them as FILLED.
         _forced_filled: dict[str, str] = {}
@@ -2602,6 +2605,41 @@ class OffsiteApplyFlow:
             except Exception:
                 pass
             await asyncio.sleep(2)
+
+            # Email verification: code or link sent to inbox
+            if self.inbox and not _email_verified:
+                try:
+                    _pg_text = (await page.evaluate("() => (document.body.innerText || '').slice(0, 600)")).lower()
+                    _email_signals = ("enter the code", "enter code", "verification code",
+                                      "enter your code", "check your email", "we sent a code",
+                                      "sent you a code", "email verification", "sent to your email")
+                    if any(s in _pg_text for s in _email_signals):
+                        _ev_domain = urlparse(page.url).netloc.lower()
+                        print(f"  [LLM] Email verification detected — checking inbox…")
+                        _ev_code, _ev_link = await asyncio.to_thread(
+                            self.inbox.fetch_verification, _ev_domain, 60
+                        )
+                        if _ev_code:
+                            print(f"  [LLM] Email code: {_ev_code}")
+                            _code_inp = page.locator(
+                                'input[type="text"], input[type="number"], '
+                                'input[name*="code" i], input[placeholder*="code" i], '
+                                'input[aria-label*="code" i]'
+                            ).first
+                            if await _code_inp.count() > 0 and await _code_inp.is_visible():
+                                await _code_inp.fill(_ev_code)
+                                await _code_inp.press("Enter")
+                                await asyncio.sleep(1)
+                            _email_verified = True
+                        elif _ev_link:
+                            print(f"  [LLM] Email verification link found — navigating…")
+                            await page.goto(_ev_link, wait_until="domcontentloaded", timeout=20000)
+                            await asyncio.sleep(2)
+                            _email_verified = True
+                        else:
+                            print(f"  [LLM] No verification email received in time")
+                except Exception as _exc:
+                    print(f"  [LLM] Email verification check error: {_exc}")
 
             current_url = page.url
             _elapsed = int((datetime.now(timezone.utc) - _session_start).total_seconds())
@@ -4206,6 +4244,20 @@ class OffsiteApplyFlow:
             if not confirmed or has_error:
                 print(f"  [Auth] Registration appears to have failed — not saving credentials")
                 return False
+
+            # If the site requires email verification, fetch the link and follow it
+            if self.inbox and any(p in body for p in ("verify your email", "check your email")):
+                print(f"  [Auth] Email verification required — checking inbox…")
+                _vlink = await asyncio.to_thread(self.inbox.wait_for_link, domain)
+                if _vlink:
+                    print(f"  [Auth] Verification link found — navigating…")
+                    try:
+                        await page.goto(_vlink, wait_until="domcontentloaded", timeout=20000)
+                        await asyncio.sleep(2)
+                    except Exception:
+                        pass
+                else:
+                    print(f"  [Auth] No verification email received in time — proceeding")
 
             record = {
                 "created_at": datetime.now(timezone.utc).isoformat(),
