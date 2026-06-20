@@ -61,6 +61,7 @@ async def _human_type(el, value: str):
                 await el.fill(str(value))
             except Exception as _fb_exc:
                 print(f"  [fill] fill() fallback also failed: {_fb_exc}")
+                raise
         else:
             raise
     await asyncio.sleep(random.uniform(0.05, 0.2))
@@ -2625,7 +2626,7 @@ class OffsiteApplyFlow:
             ).count()
             if _recaptcha_els > 0:
                 print(f"  [LLM] reCAPTCHA detected on landing form — cannot submit without CAPTCHA solver, skipping")
-                return "failed"
+                return "skipped"
         except Exception as _rc_e:
             print(f"  [LLM] Warning: reCAPTCHA pre-check failed ({_rc_e}) — continuing")
 
@@ -2924,7 +2925,7 @@ class OffsiteApplyFlow:
             # rather than waiting for a Playwright timeout on a selector that can never match.
             if "recaptcha" in (selector or "").lower() or "g-recaptcha" in (selector or "").lower():
                 print(f"  [LLM] reCAPTCHA selector in proposed action — cannot proceed without CAPTCHA solver, skipping")
-                return "failed"
+                return "skipped"
 
             # Per-selector retry cap: if the same selector has been attempted 3+ times
             # without a URL change, mark it as permanently stuck and skip it.
