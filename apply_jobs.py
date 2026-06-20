@@ -369,8 +369,9 @@ class EmailInbox:
     @staticmethod
     def _root_domain(netloc: str) -> str:
         """Extract registrable domain: jobs.company.com → company.com."""
-        parts = netloc.split(".")
-        return ".".join(parts[-2:]) if len(parts) >= 2 else netloc
+        host = netloc.split(":")[0]  # drop port if present
+        parts = host.split(".")
+        return ".".join(parts[-2:]) if len(parts) >= 2 else host
 
     @staticmethod
     def _body(msg) -> str:

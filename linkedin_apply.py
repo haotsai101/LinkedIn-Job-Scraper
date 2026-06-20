@@ -2477,6 +2477,7 @@ class OffsiteApplyFlow:
         last_action_type = None  # used to not penalize fill/select/upload for not changing URL
         consecutive_duplicates = 0  # consecutive duplicate-fill guard firings without URL change
         _selector_attempts: dict[str, int] = {}  # per-selector retry count; skip after 3 failures
+        _email_verified = False  # prevents re-triggering inbox poll after verification is handled
         # Fields whose values are committed to hidden DOM state (e.g. jQuery UI autocomplete) but
         # whose visible input is cleared by site JS. Tracked here so the LLM sees them as FILLED.
         _forced_filled: dict[str, str] = {}
@@ -2606,7 +2607,7 @@ class OffsiteApplyFlow:
             await asyncio.sleep(2)
 
             # Email verification: code or link sent to inbox
-            if self.inbox:
+            if self.inbox and not _email_verified:
                 try:
                     _pg_text = (await page.evaluate("() => (document.body.innerText || '').slice(0, 600)")).lower()
                     _email_signals = ("enter the code", "enter code", "verification code",
@@ -2629,10 +2630,12 @@ class OffsiteApplyFlow:
                                 await _code_inp.fill(_ev_code)
                                 await _code_inp.press("Enter")
                                 await asyncio.sleep(1)
+                            _email_verified = True
                         elif _ev_link:
                             print(f"  [LLM] Email verification link found — navigating…")
                             await page.goto(_ev_link, wait_until="domcontentloaded", timeout=20000)
                             await asyncio.sleep(2)
+                            _email_verified = True
                         else:
                             print(f"  [LLM] No verification email received in time")
                 except Exception as _exc:
