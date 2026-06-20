@@ -445,6 +445,14 @@ def _get_profile_value(profile: dict, label: str, kind: str = "text") -> str | N
                              "currently residing in the us", "located in the us",
                              "located in the united states")):
         return "Yes"
+    # Geographic residency exclusion questions — user resides in Utah, USA
+    if any(k in l for k in (
+        "reside in mexico", "reside in latin", "reside in south america",
+        "reside in central america", "based in mexico", "located in mexico",
+        "located in south america", "live in mexico", "live in south america",
+        "live in central america", "live in latin",
+    )) and kind in ("select", "select-one", "radio"):
+        return "No"
     # Relocation yes/no questions — user targets remote roles, not willing to relocate
     if any(k in l for k in ("open to relocat", "willing to relocat", "able to relocat",
                              "relocation assistance", "relocate to")) and kind in ("select", "select-one", "radio"):
@@ -579,7 +587,13 @@ def _get_profile_value(profile: dict, label: str, kind: str = "text") -> str | N
         "healthcare domain", "financial domain", "legal domain", "manufacturing domain", "retail domain",
     )) and kind in ("select", "select-one", "radio"):
         return "No"
-    # Broad experience/skill select questions — answer Yes
+    # Broad experience/skill select questions — answer Yes.
+    # Regex first: catches "do you have <product> development experience?" where an
+    # interrupting product name (e.g. "twilio development") breaks the contiguous
+    # "do you have experience" substring the keyword list below relies on.
+    if re.search(r'do you have .{0,50}(experience|background|expertise)', l) \
+            and kind in ("select", "select-one", "radio"):
+        return "Yes"
     if any(k in l for k in (
         "hands-on experience", "have you built", "professional experience with",
         "experience building", "experience using", "experience developing",
