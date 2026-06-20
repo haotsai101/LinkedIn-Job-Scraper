@@ -579,6 +579,30 @@ def _get_profile_value(profile: dict, label: str, kind: str = "text") -> str | N
         return edu.get("field") if isinstance(edu, dict) else None
     if any(k in l for k in ("where did you hear", "how did you hear", "how did you find out", "how did you learn about", "source of hire")):
         return "LinkedIn"
+    # Travel willingness — "comfortable with" tightened to also require "travel" so it
+    # doesn't swallow unrelated "comfortable with X" questions handled further down.
+    if (any(k in l for k in ("willing to travel", "% travel", "travel requirement", "open to travel"))
+            or ("comfortable with" in l and "travel" in l)) \
+            and kind in ("select", "select-one", "radio"):
+        return p.get("willing_to_travel", "No")
+    # Notice period / start timeline — runs BEFORE the generic "start date -> Immediately"
+    # rule below so dropdowns get a realistic option (e.g. "2 weeks") instead of "Immediately".
+    if any(k in l for k in ("how quickly", "how soon", "when can you start",
+                             "notice period", "earliest start", "available to start")) \
+            and kind in ("select", "select-one", "radio"):
+        return p.get("notice_period", "2 weeks")
+    # Geographic commute / in-office proximity — user is in Utah; these appear on non-remote
+    # roles, so answer "No". Runs before the generic "comfortable commuting -> Yes" rule.
+    if any(k in l for k in ("commutable", "commute to", "in-office attendance",
+                             "commuting distance", "work onsite", "in commutable")) \
+            and kind in ("select", "select-one", "radio"):
+        return "No"
+    # Prior employment at this company
+    if any(k in l for k in ("previously employed by", "worked for us before",
+                             "former employee", "prior employment at",
+                             "previously worked at", "previously worked for")) \
+            and kind in ("select", "select-one", "radio"):
+        return "No"
     if any(k in l for k in ("earliest available", "start date", "when can you start", "available to start", "date available", "earliest start")):
         return "Immediately"
     if any(k in l for k in ("relative", "friend", "family member")) and any(k in l for k in ("work for", "employed", "works at", "work at", "employee")):
