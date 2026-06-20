@@ -711,6 +711,16 @@ async def _ask_llm(llm_client: AsyncOpenAI, model: str, profile: dict, field: di
         return answer if answer else None
     except asyncio.TimeoutError:
         _t = 45 if is_long_form else 30
+        _write_llm_log({
+            "ts":           datetime.now(timezone.utc).isoformat(),
+            "type":         "field_fill_timeout",
+            "model":        model,
+            "field_label":  label,
+            "field_kind":   field.get("kind"),
+            "options":      field.get("options", []),
+            "prompt":       prompt,
+            "timeout_s":    _t,
+        })
         print(f"  [LLM timeout] Field '{label}' — no answer in {_t}s, skipping.")
         return None
     except Exception:
@@ -1182,6 +1192,13 @@ class EasyApplyFlow:
                     if click_failures >= 3:
                         await self._verbose_screenshot(f"autofail_step{step_num + 1}")
                         return "failed"
+                    # Re-attempt any required fields the modal is still complaining about
+                    # before the next Review click. Without this the retry re-clicks the same
+                    # button against the same empty fields and is guaranteed to fail all 3
+                    # times. _fill_current_step skips already-filled fields, so this is
+                    # idempotent and safe to call on every retry.
+                    await self._fill_current_step(filled_labels)
+                    await asyncio.sleep(0.5)
                 else:
                     click_failures = 0
                 continue
