@@ -28,9 +28,14 @@ def _css_id(el_id: str) -> str:
 
 
 def _write_llm_log(entry: dict):
-    import json as _json
-    with open(_LLM_LOG_PATH, "a") as f:
-        f.write(_json.dumps(entry) + "\n")
+    # Best-effort telemetry: swallow any IO/serialization error so callers
+    # (especially except-branch handlers that must always return None) are protected.
+    try:
+        import json as _json
+        with open(_LLM_LOG_PATH, "a") as f:
+            f.write(_json.dumps(entry) + "\n")
+    except Exception:
+        pass
 
 
 async def _human_type(el, value: str):
@@ -684,6 +689,7 @@ async def _ask_llm(llm_client: AsyncOpenAI, model: str, profile: dict, field: di
             "If the profile has no relevant info for a non-select/non-radio non-numeric field, reply with an empty string. "
             "Reply with ONLY the answer value, nothing else."
         )
+    _t = 45 if is_long_form else 30
     try:
         resp = await asyncio.wait_for(
             llm_client.chat.completions.create(
@@ -691,7 +697,7 @@ async def _ask_llm(llm_client: AsyncOpenAI, model: str, profile: dict, field: di
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=400 if is_long_form else 100,
             ),
-            timeout=45 if is_long_form else 30,
+            timeout=_t,
         )
         raw_answer = resp.choices[0].message.content
         answer = raw_answer.strip().strip('"').strip("'")
@@ -710,7 +716,6 @@ async def _ask_llm(llm_client: AsyncOpenAI, model: str, profile: dict, field: di
             print(f"  [LLM empty] Field '{label}' — LLM returned empty string, skipping.")
         return answer if answer else None
     except asyncio.TimeoutError:
-        _t = 45 if is_long_form else 30
         _write_llm_log({
             "ts":           datetime.now(timezone.utc).isoformat(),
             "type":         "field_fill_timeout",
