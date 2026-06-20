@@ -909,12 +909,43 @@ async def _fill_field(page: Page, field: dict, value: str):
                     None,
                 )
             if matched is not None:
+                # Resolve the matched radio to a single-element locator, matching the
+                # selector style already used in this function.
                 if matched < len(option_ids) and option_ids[matched]:
-                    await page.locator(f'#{option_ids[matched]}').click()
+                    radio_loc = page.locator(f'#{option_ids[matched]}')
                 elif name:
-                    await page.locator(
+                    radio_loc = page.locator(
                         f'input[type="radio"][name="{name}"]'
-                    ).nth(matched).click()
+                    ).nth(matched)
+                else:
+                    return False
+                await radio_loc.click()
+                # Playwright's native .click() fires a DOM event that LinkedIn's React
+                # controlled components ignore (onChange never fires), so the selection
+                # is dropped and the field reads empty on the next step. Dispatch
+                # synthetic React-compatible events to force the onChange.
+                handle = await radio_loc.element_handle()
+                if handle is not None:
+                    await page.evaluate(
+                        """el => {
+                            el.click();
+                            el.dispatchEvent(new MouseEvent('click', {bubbles: true}));
+                            ['change', 'input'].forEach(t =>
+                                el.dispatchEvent(new Event(t, {bubbles: true}))
+                            );
+                        }""",
+                        handle,
+                    )
+                # Verify the selection registered; retry forcefully and re-dispatch if not.
+                if not await radio_loc.is_checked():
+                    await radio_loc.click(force=True)
+                    if handle is not None:
+                        await page.evaluate(
+                            "el => el.dispatchEvent(new Event('change', {bubbles:true}))",
+                            handle,
+                        )
+                # Report whether the click was confirmed so callers can decide on a retry.
+                return await radio_loc.is_checked()
 
         elif kind == "contenteditable":
             # LinkedIn rich-text screening questions (Quill editor / role=textbox)
@@ -953,8 +984,13 @@ async def _fill_field(page: Page, field: dict, value: str):
             if not any(k in label_lower for k in _opt_in):
                 sel = f'#{_css_id(el_id)}' if el_id else (f'[name="{name}"]' if name else 'input[type="checkbox"]')
                 el = page.locator(sel).first
-                if await el.count() > 0 and not await el.is_checked():
-                    await el.click()
+                if await el.count() > 0:
+                    if not await el.is_checked():
+                        await el.click()
+                    # Report whether the box ended up checked so callers can retry on failure.
+                    return await el.is_checked()
+            # Opt-in/marketing checkbox intentionally left unchecked — treat as done.
+            return True
 
     except Exception:
         pass
@@ -1250,6 +1286,13 @@ class EasyApplyFlow:
                         except Exception:
                             pass
                     if click_failures >= 2:
+                        # Re-attempt any required fields the modal is still complaining
+                        # about before trying to skip. Mirrors the Review-button stuck
+                        # path; combined with the filled_labels confirmation fix, fields
+                        # whose fill silently failed (e.g. radios) can now actually be
+                        # retried instead of being permanently skipped.
+                        await self._fill_current_step(filled_labels)
+                        await asyncio.sleep(0.5)
                         # Try to skip LinkedIn preference/screening steps via dismiss buttons
                         _skipped = False
                         for _skip_sel in (
@@ -1356,8 +1399,13 @@ class EasyApplyFlow:
                 value = await _ask_llm(self.classifier_client, self.classifier_model, self.profile, field)
             if value:
                 print(f"  [EasyApply] Filling '{label}' = {str(value)[:40]!r}")
-                await _fill_field(self.page, field, value)
-                if label:
+                confirmed = await _fill_field(self.page, field, value)
+                # For radio/checkbox, _fill_field returns a bool indicating whether the
+                # selection actually registered (LinkedIn's React form can silently drop
+                # a click). Only mark the field done when it took, so the stuck-step retry
+                # loop can re-attempt it. _fill_field returns None for other kinds, which
+                # we treat as done since no confirmation signal is available.
+                if label and not (kind in ("radio", "checkbox") and confirmed is False):
                     filled_labels.add(label)
             elif label and label not in self.unanswered_fields:
                 self.unanswered_fields.append(label)
