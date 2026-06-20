@@ -1450,7 +1450,7 @@ class EasyApplyFlow:
                 # reconciliation race) the label got added despite the fill failing, which
                 # would permanently deadlock the stuck-Review re-fill loop. Allow a re-attempt
                 # whenever the value still reads empty.
-                if kind in ("radio", "checkbox") and not current_val:
+                if (kind == "radio" and not current_val) or is_unchecked_checkbox:
                     pass  # fall through to re-fill
                 else:
                     continue
