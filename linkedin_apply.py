@@ -2597,6 +2597,19 @@ class OffsiteApplyFlow:
         job_summary = await self._summarize_job()
         print(f"  [LLM] Job summary: {job_summary[:120]}{'...' if len(job_summary) > 120 else ''}")
 
+        # reCAPTCHA pre-loop check: if the form already has a CAPTCHA widget before we start,
+        # there is no path to submission without a solver — bail immediately rather than burning
+        # the full 600s session timeout on hopeless LLM steps.
+        try:
+            _recaptcha_els = await page.locator(
+                "div.g-recaptcha, iframe[src*='recaptcha'], input[name='g-recaptcha-response']"
+            ).count()
+            if _recaptcha_els > 0:
+                print(f"  [LLM] reCAPTCHA detected on landing form — cannot submit without CAPTCHA solver, skipping")
+                return "failed"
+        except Exception as _rc_e:
+            print(f"  [LLM] Warning: reCAPTCHA pre-check failed ({_rc_e}) — continuing")
+
         _session_start = datetime.now(timezone.utc)
         for step in range(30):
             _step_start = datetime.now(timezone.utc)
@@ -2886,6 +2899,13 @@ class OffsiteApplyFlow:
             print(f"  [LLM] Thought: {reason}")
             _display_value = (self.profile.get("resume_path", value) if action_type == "upload" else value)
             print(f"  [LLM] Action: {action_type}" + (f" → {selector or text!r}" if selector or text else "") + (f" = {_display_value[:80]!r}" if _display_value else "") + f"  [{_step_ms}ms]")
+
+            # Per-step reCAPTCHA guard: if the LLM hallucinates a reCAPTCHA-related selector
+            # (e.g. "#g-recaptcha-response-100000:has-text('Submit Application')"), bail immediately
+            # rather than waiting for a Playwright timeout on a selector that can never match.
+            if "recaptcha" in (selector or "").lower() or "g-recaptcha" in (selector or "").lower():
+                print(f"  [LLM] reCAPTCHA selector in proposed action — cannot proceed without CAPTCHA solver, skipping")
+                return "failed"
 
             # Per-selector retry cap: if the same selector has been attempted 3+ times
             # without a URL change, mark it as permanently stuck and skip it.
