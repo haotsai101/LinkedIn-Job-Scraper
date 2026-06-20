@@ -520,6 +520,20 @@ def _get_profile_value(profile: dict, label: str, kind: str = "text") -> str | N
             if nums:
                 return nums[-1]  # upper bound
         return raw_sal
+    # Specific-degree completion questions: "Have you completed [DEGREE]?"
+    # Must run BEFORE the generic education branch, which would otherwise answer
+    # "Yes" for any degree the user holds (e.g. claiming a PhD when they have a B.S.).
+    _deg_label = l  # l is the lowercased label
+    if re.search(r'have you completed.{0,60}(doctor|ph\.?d|phd|master|bachelor)', _deg_label) \
+            and kind in ("select", "select-one", "radio"):
+        edu = p.get("education", {})
+        user_deg = ((edu.get("degree") or "") if isinstance(edu, dict) else "").lower()
+        if any(t in _deg_label for t in ("doctor", "ph.d", "phd")):
+            return "Yes" if any(t in user_deg for t in ("ph.d", "phd", "doctor")) else "No"
+        if "master" in _deg_label:
+            return "Yes" if any(t in user_deg for t in ("master", "ph.d", "phd", "doctor")) else "No"
+        # bachelor or associate — always "Yes" if user has any degree
+        return "Yes" if (isinstance(edu, dict) and edu.get("degree")) else "No"
     if any(k in l for k in ("highest level of education", "highest education", "education level", "level of education")):
         edu = p.get("education", {})
         # "Have you completed the following level of education: X?" is a Yes/No radio, not a degree picker
