@@ -45,9 +45,13 @@ When tickets are created (e.g. by the log-bug-detector agent after a run), follo
 
 4. **Iterate** — If the reviewer requests changes, send the feedback back to the `senior-swe` agent (use `SendMessage` with the same agent ID to resume context). Repeat until approved, then merge.
 
+5. **QA — `log-bug-detector` agent** — After the PR is merged, run a test (`python apply_jobs.py --auto --limit 3`) and pass the output to the `log-bug-detector` agent. It verifies the fix resolved the original symptom and checks for regressions. If it finds new failures, they re-enter the workflow as new tickets at step 1.
+
 **Rules:**
 - Never merge a PR without a reviewer approval.
+- Never close a ticket without a passing QA run from the monitor agent.
 - Dispatch the SWE and reviewer as separate agents — the SWE must not review its own work.
+- The monitor agent acts independently of the SWE and reviewer — it only sees runtime output, not the diff.
 - When multiple tickets are independent, dispatch their SWE agents in parallel (one `Agent` call per ticket in the same message).
 
 ## Architecture
