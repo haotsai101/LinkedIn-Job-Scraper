@@ -2266,7 +2266,7 @@ class OffsiteApplyFlow:
             "buttons": buttons,
         }
 
-    async def _ask_llm_action(self, snapshot: dict, step: int, history: list[str] | None = None, current_url: str = "", job_summary: str = "", context_notes: list[str] | None = None, override_filled: dict | None = None) -> dict:
+    async def _ask_llm_action(self, snapshot: dict, step: int, history: list[str] | None = None, current_url: str = "", job_summary: str = "", context_notes: list[str] | None = None, override_filled: dict | None = None, exhausted_selectors: set[str] | None = None) -> dict:
         """Ask the LLM what single action to take next."""
         if history is None:
             history = []
@@ -2344,10 +2344,18 @@ class OffsiteApplyFlow:
 
         url = snapshot.get("url", current_url)
         job_ctx = f"### Job context\n{job_summary}\n\n" if job_summary else ""
+        _blocked_section = ""
+        if exhausted_selectors:
+            _blocked_list = ", ".join(sorted(exhausted_selectors))
+            _blocked_section = (
+                f"BLOCKED SELECTORS (already attempted 3+ times, cannot be filled, do NOT try again): {_blocked_list}\n"
+                "If no other unfilled required fields remain, submit the form or mark as done.\n\n"
+            )
         prompt = (
             f"Job application automation — step {step + 1}.\n"
             f"URL: {url}\n"
             f"Profile: {profile_line}\n\n"
+            f"{_blocked_section}"
             f"{job_ctx}"
             f"{section1}\n\n"
             f"{section2}\n\n"
@@ -2513,6 +2521,7 @@ class OffsiteApplyFlow:
         last_action_type = None  # used to not penalize fill/select/upload for not changing URL
         consecutive_duplicates = 0  # consecutive duplicate-fill guard firings without URL change
         _selector_attempts: dict[str, int] = {}  # per-selector retry count; skip after 3 failures
+        _exhausted_selectors: set[str] = set()   # selectors permanently blocked after 3 failed attempts
         _email_verified = False  # prevents re-triggering inbox poll after verification is handled
         # Fields whose values are committed to hidden DOM state (e.g. jQuery UI autocomplete) but
         # whose visible input is cleared by site JS. Tracked here so the LLM sees them as FILLED.
@@ -2931,6 +2940,7 @@ class OffsiteApplyFlow:
                     return "failed"
             else:
                 unchanged_steps = 0
+                _exhausted_selectors.clear()   # new page — field selectors are no longer relevant
             prev_url = page.url
 
             # Throttle to avoid rate limits
@@ -2956,6 +2966,7 @@ class OffsiteApplyFlow:
                 job_summary=job_summary,
                 context_notes=context_notes,
                 override_filled=_forced_filled if _forced_filled else None,
+                exhausted_selectors=_exhausted_selectors if _exhausted_selectors else None,
             )
             action_type = action.get("action", "failed")
             reason = action.get("reason", "")
@@ -2972,6 +2983,33 @@ class OffsiteApplyFlow:
             _display_value = (self.profile.get("resume_path", value) if action_type == "upload" else value)
             print(f"  [LLM] Action: {action_type}" + (f" → {selector or text!r}" if selector or text else "") + (f" = {_display_value[:80]!r}" if _display_value else "") + f"  [{_step_ms}ms]")
 
+            # Layer 1 exhausted-selector guard: if the LLM proposes a selector that has already
+            # been permanently blocked (attempted 3+ times with no state change), intercept before
+            # execution and try to advance the form instead. This catches cases where the LLM
+            # ignores the BLOCKED SELECTORS notice in the prompt (e.g. because the visible field
+            # text still shows the field as empty even after _forced_filled is set).
+            if selector and selector in _exhausted_selectors:
+                _advanced = False
+                for _adv_sel in (
+                    'button:has-text("Submit Application")',
+                    'button:has-text("Submit")',
+                    'button:has-text("Continue")',
+                    'button:has-text("Next")',
+                ):
+                    try:
+                        _adv_btn = page.locator(_adv_sel).first
+                        if await _adv_btn.count() > 0 and await _adv_btn.is_visible():
+                            print(f"  [LLM] Exhausted selector proposed again — attempting form advance via {_adv_sel!r}")
+                            await _adv_btn.evaluate("el => el.click()")
+                            await asyncio.sleep(2)
+                            _advanced = True
+                            break
+                    except Exception:
+                        continue
+                if not _advanced:
+                    print(f"  [LLM] Exhausted selector proposed again — no advance button found, continuing loop")
+                continue
+
             # Per-step reCAPTCHA guard: if the LLM hallucinates a reCAPTCHA-related selector
             # (e.g. "#g-recaptcha-response-100000:has-text('Submit Application')"), bail immediately
             # rather than waiting for a Playwright timeout on a selector that can never match.
@@ -2987,6 +3025,8 @@ class OffsiteApplyFlow:
                 _selector_attempts[_sel_key] = _selector_attempts.get(_sel_key, 0) + 1
                 if _selector_attempts[_sel_key] >= 3:
                     print(f"  [LLM] Selector {_sel_key!r} attempted 3+ times with no change — skipping this field")
+                    # Block this selector so Layer 1 guard catches it next time the LLM proposes it
+                    _exhausted_selectors.add(_sel_key)
                     # Add to forced_filled so LLM sees it as FILLED and moves on
                     _fid = _sel_key.lstrip("#")
                     if _fid:
