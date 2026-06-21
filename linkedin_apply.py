@@ -2549,7 +2549,10 @@ class OffsiteApplyFlow:
                                    "haystack.cv",                  # Haystack — job aggregator behind account login wall
                                    "dice.com",                     # Dice — job aggregator, OAuth redirects to wrong page
                                    "app.breezy.hr",                # BreezyHR — repeated fill retries trigger spam detection
-                                   "mercor.com")                   # Mercor — job aggregator behind account login
+                                   "mercor.com",                   # Mercor — job aggregator behind account login
+                                   "applytojob.com",               # ApplyToJob ATS — reCAPTCHA on landing form, script engine hits invisible inputs
+                                   "hirebridge.com",               # HireBridge — hidden inputs in share modal + reCAPTCHA on landing form
+                                   "hackajob.com")                 # hackajob — email gate + reCAPTCHA, cannot submit without CAPTCHA solver
         _landing_domain = urlparse(page.url).netloc.lower()
         if any(ats in _landing_domain for ats in _enterprise_ats_domains):
             print(f"  [LLM] Enterprise ATS domain ({_landing_domain}) — skipping immediately")
