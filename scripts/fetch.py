@@ -21,8 +21,12 @@ def create_session(email, password):
     driver.find_element(By.ID, 'username').send_keys(email)
     driver.find_element(By.ID, 'password').send_keys(password)
     driver.find_element(By.CSS_SELECTOR, 'button.btn__primary--large[type="submit"]').click()
-    time.sleep(2)
-    input('Complete any CAPTCHA in the browser, then press ENTER to continue for "{}": '.format(email))
+    # Wait up to 30s for the login/checkpoint URL to clear (handles CAPTCHA without blocking on input())
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        if '/checkpoint' not in driver.current_url and '/login' not in driver.current_url:
+            break
+        time.sleep(1)
     driver.get('https://www.linkedin.com/jobs/search/?')
     time.sleep(1)
     cookies = driver.get_cookies()
