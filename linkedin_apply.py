@@ -2958,8 +2958,14 @@ class OffsiteApplyFlow:
                         ):
                             try:
                                 _nbtn = page.locator(_next_sel).first
-                                if await _nbtn.count() > 0 and await _nbtn.is_visible():
+                                if await _nbtn.count() > 0:
                                     print(f"  [LLM] Duplicate fill — advancing section via {_next_sel!r}")
+                                    # Scroll into view first — button may be below the fold
+                                    # (e.g. long Greenhouse forms where Submit is off-screen)
+                                    try:
+                                        await _nbtn.scroll_into_view_if_needed()
+                                    except Exception:
+                                        pass  # shadow DOM or detached element — proceed anyway
                                     # Use JS click to bypass Playwright actionability checks
                                     # (form validation can briefly detach/modify the button)
                                     await _nbtn.evaluate("el => el.click()")
