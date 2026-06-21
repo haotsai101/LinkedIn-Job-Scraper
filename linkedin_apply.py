@@ -2518,7 +2518,9 @@ class OffsiteApplyFlow:
         # whose visible input is cleared by site JS. Tracked here so the LLM sees them as FILLED.
         _forced_filled: dict[str, str] = {}
 
-        # Skip enterprise ATS domains that require employer-provisioned accounts — no self-registration path.
+        # Skip domains where autonomous submission is known to fail — covers enterprise ATS behind account
+        # login walls, CAPTCHA-blocked forms, chatbot-based flows that fail at submit, and sites where
+        # the apply form is unreachable from the job listing URL.
         # Checked at domain level so Workday's /apply/applyManually (not a login URL) is caught too.
         _enterprise_ats_domains = ("icims.com", "taleo.net", "successfactors.com", "successfactors.eu",
                                    "sap.com",
@@ -2552,7 +2554,9 @@ class OffsiteApplyFlow:
                                    "mercor.com",                   # Mercor — job aggregator behind account login
                                    "applytojob.com",               # ApplyToJob ATS — reCAPTCHA on landing form, script engine hits invisible inputs
                                    "hirebridge.com",               # HireBridge — hidden inputs in share modal + reCAPTCHA on landing form
-                                   "hackajob.com")                 # hackajob — email gate + reCAPTCHA, cannot submit without CAPTCHA solver
+                                   "hackajob.com",                 # hackajob — email gate + reCAPTCHA, cannot submit without CAPTCHA solver
+                                   "jobs.cvshealth.com",           # CVS Health Phenom chatbot ATS — chatbot nav gets confused, fails validation at submit
+                                   "peakperformers.org")           # Peak Performers staffing board — apply form not on page, LLM hallucinates nav selector
         _landing_domain = urlparse(page.url).netloc.lower()
         if any(ats in _landing_domain for ats in _enterprise_ats_domains):
             print(f"  [LLM] Enterprise ATS domain ({_landing_domain}) — skipping immediately")
