@@ -36,9 +36,8 @@ def _write_llm_log(entry: dict):
     # Best-effort telemetry: swallow any IO/serialization error so callers
     # (especially except-branch handlers that must always return None) are protected.
     try:
-        import json as _json
         with open(_LLM_LOG_PATH, "a") as f:
-            f.write(_json.dumps(entry) + "\n")
+            f.write(json.dumps(entry) + "\n")
     except Exception:
         pass
 
@@ -72,7 +71,7 @@ async def _human_type(el, value: str):
     await asyncio.sleep(random.uniform(0.05, 0.2))
 
 _AUTH_HOSTPATHS = ("/login", "/checkpoint", "/uas/")
-_ACCOUNTS_PATH = "created_accounts.json"
+ACCOUNTS_PATH = "created_accounts.json"
 
 # ATS job-listing URL params that appear on company-hosted pages (not the form itself)
 _LISTING_PARAMS = ("gh_jid", "ashby_jid", "jId", "jobId", "job_id", "requisition_id", "req_id", "jobPostingId")
@@ -123,7 +122,7 @@ def _is_job_listing_url(url: str) -> bool:
 
 
 def _load_all_accounts() -> list[dict]:
-    path = Path(_ACCOUNTS_PATH)
+    path = Path(ACCOUNTS_PATH)
     if not path.exists():
         return []
     try:
@@ -151,8 +150,8 @@ def _find_account_for_domain(domain: str) -> dict | None:
     return max(matches, key=lambda a: a.get("created_at", ""))
 
 
-def _append_account(record: dict):
-    path = Path(_ACCOUNTS_PATH)
+def append_account(record: dict):
+    path = Path(ACCOUNTS_PATH)
     if path.exists():
         try:
             data = json.loads(path.read_text())
@@ -4417,7 +4416,7 @@ class OffsiteApplyFlow:
             if save_fn:
                 save_fn(record)
             else:
-                _append_account(record)
+                append_account(record)
             print(f"  [Auth] Account registered on {domain} — credentials saved")
             return True
 

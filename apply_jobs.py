@@ -50,13 +50,18 @@ from datetime import datetime, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
+from urllib.parse import urlparse
 
 import httpx
 
 from openai import OpenAI, AsyncOpenAI
 from playwright.async_api import async_playwright
 
-from linkedin_apply import EasyApplyFlow, OffsiteApplyFlow, _get_profile_value, _session_llm_state
+from linkedin_apply import (
+    EasyApplyFlow, OffsiteApplyFlow, _get_profile_value, _session_llm_state,
+    _write_llm_log, _AUTH_HOSTPATHS, ACCOUNTS_PATH, append_account,
+)
+save_account_to_file = append_account
 
 sys.stdout.reconfigure(line_buffering=True)
 
@@ -79,15 +84,6 @@ BLOCKED_DOMAINS = {
 PROFILE_PATH = "user_profile.json"
 LOG_PATH     = "application_log.json"
 LLM_LOG_PATH = "llm_debug.jsonl"
-ACCOUNTS_PATH = "created_accounts.json"
-
-def _write_llm_log(entry: dict):
-    try:
-        with open(LLM_LOG_PATH, "a") as f:
-            f.write(json.dumps(entry) + "\n")
-    except Exception:
-        pass
-
 
 async def _llm_fill_focused(page, llm_client: AsyncOpenAI, llm_model: str, profile: dict):
     """LLM-fill whichever input field is currently focused in the browser."""
@@ -475,34 +471,6 @@ def _generate_password(length: int = 16) -> str:
     return "".join(pwd)
 
 
-def save_account_to_file(record: dict):
-    from urllib.parse import urlparse as _up
-    path = Path(ACCOUNTS_PATH)
-    if path.exists():
-        try:
-            data = json.loads(path.read_text())
-        except Exception:
-            data = {"accounts": []}
-    else:
-        data = {"accounts": []}
-
-    new_domain = _up(record.get("website_url", "")).netloc
-    updated = False
-    if new_domain:
-        for i, existing in enumerate(data["accounts"]):
-            existing_domain = _up(existing.get("website_url", "")).netloc
-            if (existing_domain == new_domain
-                    or new_domain.endswith("." + existing_domain)
-                    or existing_domain.endswith("." + new_domain)):
-                data["accounts"][i] = record  # replace with newest
-                updated = True
-                break
-    if not updated:
-        data["accounts"].append(record)
-
-    path.write_text(json.dumps(data, indent=2))
-
-
 def search_accounts(query: str) -> list[dict]:
     path = Path(ACCOUNTS_PATH)
     if not path.exists():
@@ -723,7 +691,46 @@ def print_stats(cursor):
 # ── Browser & LinkedIn login ────────────────────────────────────────────────────
 
 _LOGIN_URL    = "https://www.linkedin.com/checkpoint/rm/sign-in-another-account"
-_AUTH_HOSTPATHS = ("/login", "/checkpoint", "/uas/")
+_CAPTCHA_TIMEOUT_SEC = 300  # 5 minutes
+
+
+async def _wait_for_captcha_resolution(page, timeout_sec: int = _CAPTCHA_TIMEOUT_SEC) -> bool:
+    """Wait for CAPTCHA/auth page to clear after LinkedIn login.
+
+    Interactive (TTY): prompt user once; returns True when they press Enter.
+    Non-TTY (auto mode): polls every 5 s for up to timeout_sec; logs and returns False on timeout.
+    """
+    if sys.stdin.isatty():
+        print("\n  LinkedIn requires additional verification (CAPTCHA / 2-FA).")
+        try:
+            input("  Complete it in the browser, then press ENTER to continue…")
+        except (EOFError, KeyboardInterrupt):
+            pass
+        return True
+
+    # Non-TTY path: poll every 5 s
+    print(f"\n  LinkedIn requires additional verification (CAPTCHA / 2-FA).")
+    print(f"  Polling every 5 s — will abort after {timeout_sec // 60} min if unresolved…")
+    deadline = time.time() + timeout_sec
+    last_log = 0
+    while time.time() < deadline:
+        await asyncio.sleep(5)
+        if not any(p in page.url for p in _AUTH_HOSTPATHS):
+            print("  CAPTCHA resolved — continuing.")
+            return True
+        remaining = int(deadline - time.time())
+        if time.time() - last_log >= 30:
+            print(f"  Still waiting for CAPTCHA… {remaining}s remaining.")
+            last_log = time.time()
+
+    _write_llm_log({
+        "ts":          datetime.now(timezone.utc).isoformat(),
+        "type":        "captcha_timeout",
+        "url":         page.url,
+        "timeout_sec": timeout_sec,
+    })
+    print(f"  [!] CAPTCHA not resolved after {timeout_sec}s — aborting session.")
+    return False
 
 
 def _get_login_credentials() -> tuple[str, str]:
@@ -774,16 +781,9 @@ async def login_linkedin_playwright(page) -> None:
             print(" done.")
             return
 
-    print("\n  LinkedIn requires additional verification (CAPTCHA / 2-FA).")
-    try:
-        input("  Complete it in the browser, then press ENTER to continue…")
-    except EOFError:
-        import sys as _sys
-        if not _sys.stdin.isatty():
-            print("  No terminal — waiting 45 s for you to solve CAPTCHA in the browser…")
-            import time as _time
-            _time.sleep(45)
-            print("  Continuing.")
+    resolved = await _wait_for_captcha_resolution(page)
+    if not resolved:
+        raise RuntimeError("LinkedIn CAPTCHA not resolved within 5 minutes — session aborted.")
 
 
 # ── Main session ───────────────────────────────────────────────────────────────
@@ -921,9 +921,8 @@ async def run_session(
                     break
 
                 # Skip jobs whose application URL is on a blocked domain
-                from urllib.parse import urlparse as _urlparse
                 _app_url = url or ""
-                if any(bd in _urlparse(_app_url).netloc for bd in BLOCKED_DOMAINS):
+                if any(bd in urlparse(_app_url).netloc for bd in BLOCKED_DOMAINS):
                     mark_job(conn, cursor, job_id, -1)
                     skipped_count += 1
                     print(f"  [~] Application domain blocked — skipped.")
