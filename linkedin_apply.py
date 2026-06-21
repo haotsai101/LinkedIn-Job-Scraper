@@ -3962,6 +3962,16 @@ class OffsiteApplyFlow:
     async def _fill_external_form(self, page: Page) -> str:
         return await self._llm_guided_apply(page)
 
+    async def assist_from_page(self, page: Page) -> str:
+        """Run the LLM-guided form-filling loop from wherever the browser currently is.
+
+        Called in manual mode after an auto-apply failure: the user navigates to
+        the application page themselves, then this picks up and drives the form.
+        Returns 'applied' | 'failed'.
+        """
+        print(f"  [Manual assist] Starting LLM loop from: {page.url}")
+        return await self._llm_guided_apply(page)
+
     async def _handle_submit(self, page: Page, submit_btn) -> str:
         summary = (
             f"External application for {self.profile.get('full_name', 'user')} "

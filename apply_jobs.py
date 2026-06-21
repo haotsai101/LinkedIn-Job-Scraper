@@ -1099,8 +1099,11 @@ async def run_session(
                         print(f"  [!] Apply failed: {title or 'Unknown'}")
                         print(f"  Browser tab is still open — you can interact manually.")
                         print(f"{'═' * 64}")
+                        _can_assist = isinstance(flow, OffsiteApplyFlow)
+                        _assist_hint = "  [a] = agent fills from current page\n" if _can_assist else ""
                         try:
                             fail_choice = input(
+                                f"{_assist_hint}"
                                 "  [m] = I applied manually   [ENTER] = auto-fail   [s] = skip\n"
                                 "  > "
                             ).strip().lower()
@@ -1121,6 +1124,31 @@ async def run_session(
                             mark_job(conn, cursor, job_id, -1)
                             skipped_count += 1
                             print("  [-] Skipped.")
+                        elif fail_choice == "a" and _can_assist:
+                            # Let the user navigate to the application page, then resume the LLM loop
+                            print("\n  Navigate to the application page in the browser.")
+                            try:
+                                input("  Press Enter when ready to start agent assist: ")
+                            except (EOFError, KeyboardInterrupt):
+                                pass
+                            assist_result = await flow.assist_from_page(page)
+                            print(f"  [Manual assist] Result: {assist_result}")
+                            if assist_result == "applied":
+                                mark_job(conn, cursor, job_id, 1)
+                                applied_count += 1
+                                applications.append({
+                                    "job_id":     job_id,
+                                    "title":      title or "",
+                                    "company":    company_name or "",
+                                    "url":        url,
+                                    "applied_at": datetime.now(timezone.utc).isoformat(),
+                                })
+                                print("  [+] Applied!")
+                                await asyncio.sleep(10)
+                            else:
+                                mark_job(conn, cursor, job_id, -2)
+                                error_count += 1
+                                print("  [!] Agent assist also failed — marked as auto-failed.")
                         else:
                             mark_job(conn, cursor, job_id, -2)
                             error_count += 1
