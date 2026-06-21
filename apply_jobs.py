@@ -83,7 +83,6 @@ BLOCKED_DOMAINS = {
 }
 PROFILE_PATH = "user_profile.json"
 LOG_PATH     = "application_log.json"
-LLM_LOG_PATH = "llm_debug.jsonl"
 
 async def _llm_fill_focused(page, llm_client: AsyncOpenAI, llm_model: str, profile: dict):
     """LLM-fill whichever input field is currently focused in the browser."""
@@ -704,18 +703,24 @@ async def _wait_for_captcha_resolution(page, timeout_sec: int = _CAPTCHA_TIMEOUT
         print("\n  LinkedIn requires additional verification (CAPTCHA / 2-FA).")
         try:
             input("  Complete it in the browser, then press ENTER to continue…")
-        except (EOFError, KeyboardInterrupt):
-            pass
+        except EOFError:
+            pass  # piped stdin — assume user solved it
+        except KeyboardInterrupt:
+            return False  # user explicitly interrupted — abort session
         return True
 
     # Non-TTY path: poll every 5 s
-    print(f"\n  LinkedIn requires additional verification (CAPTCHA / 2-FA).")
+    print("\n  LinkedIn requires additional verification (CAPTCHA / 2-FA).")
     print(f"  Polling every 5 s — will abort after {timeout_sec // 60} min if unresolved…")
     deadline = time.time() + timeout_sec
     last_log = 0
     while time.time() < deadline:
         await asyncio.sleep(5)
-        if not any(p in page.url for p in _AUTH_HOSTPATHS):
+        try:
+            current_url = page.url
+        except Exception:
+            return False  # page/context closed during wait
+        if not any(p in current_url for p in _AUTH_HOSTPATHS):
             print("  CAPTCHA resolved — continuing.")
             return True
         remaining = int(deadline - time.time())
@@ -723,10 +728,14 @@ async def _wait_for_captcha_resolution(page, timeout_sec: int = _CAPTCHA_TIMEOUT
             print(f"  Still waiting for CAPTCHA… {remaining}s remaining.")
             last_log = time.time()
 
+    try:
+        current_url = page.url
+    except Exception:
+        current_url = "unknown"
     _write_llm_log({
         "ts":          datetime.now(timezone.utc).isoformat(),
         "type":        "captcha_timeout",
-        "url":         page.url,
+        "url":         current_url,
         "timeout_sec": timeout_sec,
     })
     print(f"  [!] CAPTCHA not resolved after {timeout_sec}s — aborting session.")
