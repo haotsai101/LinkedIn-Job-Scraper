@@ -2513,6 +2513,7 @@ class OffsiteApplyFlow:
         last_action_type = None  # used to not penalize fill/select/upload for not changing URL
         consecutive_duplicates = 0  # consecutive duplicate-fill guard firings without URL change
         _selector_attempts: dict[str, int] = {}  # per-selector retry count; skip after 3 failures
+        _exhausted_selectors: set[str] = set()  # selectors permanently blocked after 3 failed attempts
         _email_verified = False  # prevents re-triggering inbox poll after verification is handled
         # Fields whose values are committed to hidden DOM state (e.g. jQuery UI autocomplete) but
         # whose visible input is cleared by site JS. Tracked here so the LLM sees them as FILLED.
@@ -2985,8 +2986,8 @@ class OffsiteApplyFlow:
                 for _adv_sel in (
                     'button:has-text("Continue")',
                     'button:has-text("Next")',
-                    'button:has-text("Submit")',
                     'button:has-text("Submit Application")',
+                    'button:has-text("Submit")',
                 ):
                     try:
                         _adv_btn = page.locator(_adv_sel).first
@@ -3016,6 +3017,7 @@ class OffsiteApplyFlow:
                 _sel_key = selector or text
                 _selector_attempts[_sel_key] = _selector_attempts.get(_sel_key, 0) + 1
                 if _selector_attempts[_sel_key] >= 3:
+                    _exhausted_selectors.add(_sel_key)  # Layer 1 will intercept future proposals
                     print(f"  [LLM] Selector {_sel_key!r} attempted 3+ times with no change — skipping this field")
                     # Add to forced_filled so LLM sees it as FILLED and moves on
                     _fid = _sel_key.lstrip("#")
