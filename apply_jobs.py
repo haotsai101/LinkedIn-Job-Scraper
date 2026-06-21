@@ -16,9 +16,10 @@ Environment variables (put in a .env file or export before running):
     MAX_AUTO_APPLY      - Default daily cap (default: 10)
 
     # Optional: separate model/endpoint just for the browser agent
-    BROWSER_LLM_API     - API key (defaults to LLM_API)
-    BROWSER_LLM_URL     - Base URL (defaults to LLM_URL)
-    BROWSER_LLM_MODEL   - Model name (defaults to LLM_MODEL)
+    BROWSER_LLM_API             - API key (defaults to LLM_API)
+    BROWSER_LLM_URL             - Base URL (defaults to LLM_URL)
+    BROWSER_LLM_MODEL           - Model name (defaults to LLM_MODEL)
+    BROWSER_LLM_FALLBACK_MODEL  - Faster fallback model used after 2 consecutive LLM timeouts (defaults to LLM_MODEL)
 
 Usage:
     python apply_jobs.py                      # Semi-auto: confirm before each submit
@@ -55,7 +56,7 @@ import httpx
 from openai import OpenAI, AsyncOpenAI
 from playwright.async_api import async_playwright
 
-from linkedin_apply import EasyApplyFlow, OffsiteApplyFlow, _get_profile_value
+from linkedin_apply import EasyApplyFlow, OffsiteApplyFlow, _get_profile_value, _session_llm_state
 
 sys.stdout.reconfigure(line_buffering=True)
 
@@ -206,9 +207,10 @@ def load_env():
     gmail_pass   = os.environ.get("GMAIL_APP_PASSWORD", "").strip()
     max_auto_env = int(os.environ.get("MAX_AUTO_APPLY", "10"))
 
-    browser_api_key = os.environ.get("BROWSER_LLM_API", api_key).strip()
-    browser_url     = os.environ.get("BROWSER_LLM_URL", base_url).strip()
-    browser_model   = os.environ.get("BROWSER_LLM_MODEL", model).strip()
+    browser_api_key      = os.environ.get("BROWSER_LLM_API", api_key).strip()
+    browser_url          = os.environ.get("BROWSER_LLM_URL", base_url).strip()
+    browser_model        = os.environ.get("BROWSER_LLM_MODEL", model).strip()
+    browser_fallback_model = os.environ.get("BROWSER_LLM_FALLBACK_MODEL", model).strip()
 
     classifier_api_key = os.environ.get("CLASSIFIER_LLM_API", api_key).strip()
     classifier_url     = os.environ.get("CLASSIFIER_LLM_URL", base_url).strip()
@@ -839,6 +841,11 @@ async def run_session(
         max_retries=0,  # we handle retries ourselves in _ask_llm_action
     )
     browser_llm_model = browser_model or model
+    browser_llm_fallback = browser_fallback_model or model
+
+    # Reset circuit-breaker state for this session
+    _session_llm_state["timeout_streak"] = 0
+    _session_llm_state["model_switched"] = False
 
     print("\nOpening browser and signing into LinkedIn…")
 
@@ -984,6 +991,7 @@ async def run_session(
                         classifier_model=_classifier_model,
                         verbose=verbose,
                         inbox=inbox,
+                        fallback_model=browser_llm_fallback,
                     )
                 else:
                     flow = EasyApplyFlow(
@@ -1027,6 +1035,7 @@ async def run_session(
                         classifier_client=classifier_client,
                         classifier_model=_classifier_model,
                         inbox=inbox,
+                        fallback_model=browser_llm_fallback,
                     )
                     try:
                         status = await asyncio.wait_for(flow.run(url), timeout=600)
