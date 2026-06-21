@@ -2518,6 +2518,10 @@ class OffsiteApplyFlow:
         # whose visible input is cleared by site JS. Tracked here so the LLM sees them as FILLED.
         _forced_filled: dict[str, str] = {}
 
+        def _domain_matches(netloc: str, pattern: str) -> bool:
+            # Exact suffix match — prevents "fetchjobs.co" matching "fetchjobs.com", etc.
+            return netloc == pattern or netloc.endswith("." + pattern)
+
         # Job aggregators and contractor-only/broken sites — not real employer apply flows, skip permanently.
         _spam_domains = (
             "jobright.ai",                  # aggregator — requires Jobright account to apply
@@ -2574,10 +2578,10 @@ class OffsiteApplyFlow:
         )
 
         _landing_domain = urlparse(page.url).netloc.lower()
-        if any(d in _landing_domain for d in _spam_domains):
+        if any(_domain_matches(_landing_domain, d) for d in _spam_domains):
             print(f"  [LLM] Spam/aggregator domain ({_landing_domain}) — skipping")
             return "skipped"
-        if any(d in _landing_domain for d in _blocked_auto_apply_domains):
+        if any(_domain_matches(_landing_domain, d) for d in _blocked_auto_apply_domains):
             print(f"  [LLM] Blocked auto-apply domain ({_landing_domain}) — marking failed for manual review")
             return "failed"
 
@@ -2728,10 +2732,10 @@ class OffsiteApplyFlow:
                 return "skipped"
 
             # Mid-flow redirect to blocked domain (e.g. Dynatrace → SuccessFactors)
-            if any(d in _url_domain for d in _spam_domains):
+            if any(_domain_matches(_url_domain, d) for d in _spam_domains):
                 print(f"  [LLM] Redirected to spam/aggregator domain mid-flow ({_url_domain}) — skipping")
                 return "skipped"
-            if any(d in _url_domain for d in _blocked_auto_apply_domains):
+            if any(_domain_matches(_url_domain, d) for d in _blocked_auto_apply_domains):
                 print(f"  [LLM] Redirected to blocked ATS mid-flow ({_url_domain}) — marking failed for manual review")
                 return "failed"
 
@@ -2833,10 +2837,10 @@ class OffsiteApplyFlow:
                             prev_url = page.url
                             # Re-check blocked domains — deterministic click may have redirected into one
                             _post_nav_domain = urlparse(page.url).netloc.lower()
-                            if any(d in _post_nav_domain for d in _spam_domains):
+                            if any(_domain_matches(_post_nav_domain, d) for d in _spam_domains):
                                 print(f"  [LLM] Post-navigation spam domain ({_post_nav_domain}) — skipping")
                                 return "skipped"
-                            if any(d in _post_nav_domain for d in _blocked_auto_apply_domains):
+                            if any(_domain_matches(_post_nav_domain, d) for d in _blocked_auto_apply_domains):
                                 print(f"  [LLM] Post-navigation blocked ATS ({_post_nav_domain}) — marking failed for manual review")
                                 return "failed"
                         break  # found a match — proceed with snapshot of current page
