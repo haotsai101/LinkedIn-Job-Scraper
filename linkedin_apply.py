@@ -2518,56 +2518,68 @@ class OffsiteApplyFlow:
         # whose visible input is cleared by site JS. Tracked here so the LLM sees them as FILLED.
         _forced_filled: dict[str, str] = {}
 
-        # Skip domains where autonomous submission is known to fail — covers enterprise ATS behind account
-        # login walls, CAPTCHA-blocked forms, chatbot-based flows that fail at submit, and sites where
-        # the apply form is unreachable from the job listing URL.
+        # Job aggregators and contractor-only/broken sites — not real employer apply flows, skip permanently.
+        _spam_domains = (
+            "jobright.ai",                  # aggregator — requires Jobright account to apply
+            "sundayy.com",                  # aggregator — requires account
+            "scale.jobs",                   # aggregator — requires account
+            "dice.com",                     # aggregator — OAuth redirects to wrong page
+            "mercor.com",                   # aggregator — behind account login
+            "remotehunter.com",             # aggregator — "Apply" navigates to homepage login wall
+            "haystack.cv",                  # aggregator — behind account login wall
+            "talentally.com",               # aggregator — pre-registered account only
+            "micro1.ai",                    # aggregator
+            "tenex.ai",                     # aggregator
+            "bestjobtool.com",              # aggregator — /job-description-usb/ path; script engine fails
+            "fetchjobs.co",                 # aggregator — /job-description-usb/ path; React EEO timeouts
+            "alignerr.com",                 # contractor — Google/LinkedIn OAuth only, no email registration
+            "app.dataannotation.tech",      # contractor — /worker_signup is registration, not a job apply form
+            "peakperformers.org",           # broken — apply form not on page, LLM hallucinates nav selector
+            "sourcehire.app",               # broken — "Apply to this role" button does not navigate
+            "jobs.gainwelltechnologies.com", # broken — portal loops back to job search, no direct apply form
+        )
+
+        # Real job listings on ATS platforms or employer portals where auto-apply is blocked (CAPTCHA,
+        # account wall, chatbot, etc.). Marked failed so they surface in the manual queue for human review.
         # Checked at domain level so Workday's /apply/applyManually (not a login URL) is caught too.
-        _enterprise_ats_domains = ("icims.com", "taleo.net", "successfactors.com", "successfactors.eu",
-                                   "sap.com",
-                                   "myworkdayjobs.com",           # Workday public boards — requires account creation
-                                   "myworkdaysite.com",            # Workday client instances — same account requirement
-                                   "ultipro.com",                  # UltiPro/UKG — redirects to auth
-                                   "paycomonline.net",             # Paycom — form buried behind account login
-                                   "governmentjobs.com",           # NEOGOV — always requires pre-registered account
-                                   "workforcenow.adp.com",         # ADP Workforce Now — lands on company portal, not job form
-                                   "ycombinator.com",              # YC Work — apply requires YC Work account (SSO-only, no self-reg)
-                                   "alignerr.com",                 # Alignerr — Google/LinkedIn OAuth only, no email registration
-                                   "jobs.gainwelltechnologies.com", # Gainwell — portal loops back to job search, no direct apply form
-                                   "jobright.ai",                  # Jobright — job aggregator, requires Jobright account signup to apply
-                                   "sundayy.com",                  # Sundayy — job aggregator requiring account
-                                   "scale.jobs",                   # Scale.jobs — job aggregator, requires account
-                                   "tenex.ai",
-                                   "bamboohr.com",                 # BambooHR — requires account creation to submit
-                                   "recruitingbypaycor.com",       # Paycor — hidden location field causes 30s timeout, very slow
-                                   "yourpayrollhr.com",            # Paycor-based — LLM navigates away from job page
-                                   "zohorecruit.com",              # Zoho Recruit — CAPTCHA blocks autonomous submission
-                                   "burtchworks.com",              # React form — fills don't persist
-                                   "micro1.ai",
-                                   "recruiting.paylocity.com",     # Paylocity recruiting portal — account required
-                                   "sapsf.com",                    # SAP SuccessFactors hosted — same as successfactors.com
-                                   "sourcehire.app",               # sourcehire — "Apply to this role" button does not navigate
-                                   "remotehunter.com",             # RemoteHunter — job aggregator, "Apply" navigates to homepage login wall
-                                   "talentally.com",               # TalentAlly — requires pre-registered account, can't self-register
-                                   "haystack.cv",                  # Haystack — job aggregator behind account login wall
-                                   "dice.com",                     # Dice — job aggregator, OAuth redirects to wrong page
-                                   "app.breezy.hr",                # BreezyHR — repeated fill retries trigger spam detection
-                                   "mercor.com",                   # Mercor — job aggregator behind account login
-                                   "applytojob.com",               # ApplyToJob ATS — reCAPTCHA on landing form, script engine hits invisible inputs
-                                   "hirebridge.com",               # HireBridge — hidden inputs in share modal + reCAPTCHA on landing form
-                                   "hackajob.com",                 # hackajob — email gate + reCAPTCHA, cannot submit without CAPTCHA solver
-                                   "jobs.cvshealth.com",           # CVS Health Phenom chatbot ATS — chatbot nav gets confused, fails validation at submit
-                                   "peakperformers.org",           # Peak Performers staffing board — apply form not on page, LLM hallucinates nav selector
-                                   "fetchjobs.co",                 # FetchJobs aggregator — /job-description-usb/ path; React EEO fields cause 6+ fill timeouts (.com not known to host forms)
-                                   "jobs.twilio.com",              # Twilio careers — hidden #g-recaptcha-response textarea in DOM; ScriptEngine tries to fill it, loops 3 attempts
-                                   "amazon.jobs",                  # Amazon jobs portal — duplicate invisible search fields (lat/lng) cause strict-mode violations; apply requires Amazon account
-                                   "app.dataannotation.tech",      # Data Annotation Tech — /worker_signup path is contractor registration, not a job application form
-                                   "job-boards.greenhouse.io",     # Greenhouse public job board — reCAPTCHA on landing form (boards.greenhouse.io apply forms are unaffected)
-                                   "ats.rippling.com",             # Rippling ATS — script engine + LLM both fail; no successful applications observed
-                                   "bestjobtool.com")              # BestJobTool aggregator — /job-description-usb/ path, same pattern as fetchjobs.co; script engine fails
+        _blocked_auto_apply_domains = (
+            "icims.com",                    # iCIMS — requires account
+            "taleo.net",                    # Oracle Taleo — requires account
+            "successfactors.com",           # SAP SuccessFactors
+            "successfactors.eu",            # SAP SuccessFactors EU
+            "sap.com",                      # SAP hosted ATS
+            "sapsf.com",                    # SAP SuccessFactors alternate domain
+            "myworkdayjobs.com",            # Workday public boards — requires account
+            "myworkdaysite.com",            # Workday client instances — same account requirement
+            "ultipro.com",                  # UltiPro/UKG — redirects to auth
+            "paycomonline.net",             # Paycom — form buried behind account login
+            "governmentjobs.com",           # NEOGOV — always requires pre-registered account
+            "workforcenow.adp.com",         # ADP Workforce Now — lands on company portal, not job form
+            "recruiting.paylocity.com",     # Paylocity — account required
+            "bamboohr.com",                 # BambooHR — requires account to submit
+            "recruitingbypaycor.com",       # Paycor — hidden location field causes 30s timeout
+            "yourpayrollhr.com",            # Paycor-based — LLM navigates away from job page
+            "zohorecruit.com",              # Zoho Recruit — CAPTCHA blocks submission
+            "app.breezy.hr",                # BreezyHR — repeated fills trigger spam detection
+            "ats.rippling.com",             # Rippling ATS — script engine + LLM both fail
+            "ycombinator.com",              # YC Work — SSO-only, no self-registration
+            "amazon.jobs",                  # Amazon portal — duplicate invisible fields + account required
+            "jobs.cvshealth.com",           # CVS Health Phenom chatbot — confused navigation, fails validation
+            "applytojob.com",               # ApplyToJob — reCAPTCHA on landing form
+            "hirebridge.com",               # HireBridge — hidden inputs + reCAPTCHA
+            "hackajob.com",                 # hackajob — email gate + reCAPTCHA
+            "jobs.twilio.com",              # Twilio — hidden #g-recaptcha-response; ScriptEngine loops 3 attempts
+            "job-boards.greenhouse.io",     # Greenhouse public board — reCAPTCHA (boards.greenhouse.io unaffected)
+            "burtchworks.com",              # Burtch Works — React form fills don't persist
+        )
+
         _landing_domain = urlparse(page.url).netloc.lower()
-        if any(ats in _landing_domain for ats in _enterprise_ats_domains):
-            print(f"  [LLM] Enterprise ATS domain ({_landing_domain}) — skipping immediately")
+        if any(d in _landing_domain for d in _spam_domains):
+            print(f"  [LLM] Spam/aggregator domain ({_landing_domain}) — skipping")
             return "skipped"
+        if any(d in _landing_domain for d in _blocked_auto_apply_domains):
+            print(f"  [LLM] Blocked auto-apply domain ({_landing_domain}) — marking failed for manual review")
+            return "failed"
 
         # Lever listing-page fast-path: jobs.lever.co/<company>/<id> is a listing page with no form.
         # Append /apply to navigate directly to the application form, skipping a wasted ScriptEngine call.
@@ -2715,10 +2727,13 @@ class OffsiteApplyFlow:
                 print(f"  [LLM] Landed on dead-end domain ({_url_domain}) — skipping")
                 return "skipped"
 
-            # Mid-flow redirect to enterprise ATS (e.g. Dynatrace → SuccessFactors)
-            if any(ats in _url_domain for ats in _enterprise_ats_domains):
-                print(f"  [LLM] Redirected to enterprise ATS mid-flow ({_url_domain}) — skipping")
+            # Mid-flow redirect to blocked domain (e.g. Dynatrace → SuccessFactors)
+            if any(d in _url_domain for d in _spam_domains):
+                print(f"  [LLM] Redirected to spam/aggregator domain mid-flow ({_url_domain}) — skipping")
                 return "skipped"
+            if any(d in _url_domain for d in _blocked_auto_apply_domains):
+                print(f"  [LLM] Redirected to blocked ATS mid-flow ({_url_domain}) — marking failed for manual review")
+                return "failed"
 
             # SSO / Identity Provider redirect — hand off to dedicated sign-in flow instead of LLM
             _sso_domains = (
@@ -2816,11 +2831,14 @@ class OffsiteApplyFlow:
                         if page.url != _url_before_det:
                             print(f"  [LLM] Deterministic click navigated → {page.url}")
                             prev_url = page.url
-                            # Re-check enterprise ATS — deterministic click may have redirected into one
+                            # Re-check blocked domains — deterministic click may have redirected into one
                             _post_nav_domain = urlparse(page.url).netloc.lower()
-                            if any(ats in _post_nav_domain for ats in _enterprise_ats_domains):
-                                print(f"  [LLM] Post-navigation ATS domain ({_post_nav_domain}) — skipping")
+                            if any(d in _post_nav_domain for d in _spam_domains):
+                                print(f"  [LLM] Post-navigation spam domain ({_post_nav_domain}) — skipping")
                                 return "skipped"
+                            if any(d in _post_nav_domain for d in _blocked_auto_apply_domains):
+                                print(f"  [LLM] Post-navigation blocked ATS ({_post_nav_domain}) — marking failed for manual review")
+                                return "failed"
                         break  # found a match — proceed with snapshot of current page
                     except Exception:
                         continue
