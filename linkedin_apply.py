@@ -2561,7 +2561,9 @@ class OffsiteApplyFlow:
                                    "jobs.twilio.com",              # Twilio careers — hidden #g-recaptcha-response textarea in DOM; ScriptEngine tries to fill it, loops 3 attempts
                                    "amazon.jobs",                  # Amazon jobs portal — duplicate invisible search fields (lat/lng) cause strict-mode violations; apply requires Amazon account
                                    "app.dataannotation.tech",      # Data Annotation Tech — /worker_signup path is contractor registration, not a job application form
-                                   "job-boards.greenhouse.io")     # Greenhouse public job board — reCAPTCHA on landing form (boards.greenhouse.io apply forms are unaffected)
+                                   "job-boards.greenhouse.io",     # Greenhouse public job board — reCAPTCHA on landing form (boards.greenhouse.io apply forms are unaffected)
+                                   "ats.rippling.com",             # Rippling ATS — script engine + LLM both fail; no successful applications observed
+                                   "bestjobtool.com")              # BestJobTool aggregator — /job-description-usb/ path, same pattern as fetchjobs.co; script engine fails
         _landing_domain = urlparse(page.url).netloc.lower()
         if any(ats in _landing_domain for ats in _enterprise_ats_domains):
             print(f"  [LLM] Enterprise ATS domain ({_landing_domain}) — skipping immediately")
