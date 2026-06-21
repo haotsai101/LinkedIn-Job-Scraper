@@ -2931,6 +2931,8 @@ class OffsiteApplyFlow:
                     return "failed"
             else:
                 unchanged_steps = 0
+                _exhausted_selectors.clear()   # new page — field selectors are no longer relevant
+                _selector_attempts.clear()     # new page — per-selector retry counts reset too
             prev_url = page.url
 
             # Throttle to avoid rate limits
@@ -2971,6 +2973,34 @@ class OffsiteApplyFlow:
             print(f"  [LLM] Thought: {reason}")
             _display_value = (self.profile.get("resume_path", value) if action_type == "upload" else value)
             print(f"  [LLM] Action: {action_type}" + (f" → {selector or text!r}" if selector or text else "") + (f" = {_display_value[:80]!r}" if _display_value else "") + f"  [{_step_ms}ms]")
+
+            # Layer 1 exhausted-selector guard: if the LLM proposes a selector that has already
+            # been permanently blocked (attempted 3+ times with no state change), intercept before
+            # execution and try to advance the form instead. This catches cases where the LLM
+            # ignores the BLOCKED SELECTORS notice in the prompt (e.g. because the visible field
+            # text still shows the field as empty even after _forced_filled is set).
+            _check_key = selector or text
+            if _check_key and _check_key in _exhausted_selectors:
+                _advanced = False
+                for _adv_sel in (
+                    'button:has-text("Continue")',
+                    'button:has-text("Next")',
+                    'button:has-text("Submit")',
+                    'button:has-text("Submit Application")',
+                ):
+                    try:
+                        _adv_btn = page.locator(_adv_sel).first
+                        if await _adv_btn.count() > 0 and await _adv_btn.is_visible() and await _adv_btn.is_enabled():
+                            print(f"  [LLM] Exhausted selector proposed again — attempting form advance via {_adv_sel!r}")
+                            await _adv_btn.evaluate("el => el.click()")
+                            await asyncio.sleep(2)
+                            _advanced = True
+                            break
+                    except Exception:
+                        continue
+                if not _advanced:
+                    print(f"  [LLM] Exhausted selector proposed again — no advance button found, continuing loop")
+                continue
 
             # Per-step reCAPTCHA guard: if the LLM hallucinates a reCAPTCHA-related selector
             # (e.g. "#g-recaptcha-response-100000:has-text('Submit Application')"), bail immediately
