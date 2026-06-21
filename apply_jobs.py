@@ -207,10 +207,10 @@ def load_env():
     gmail_pass   = os.environ.get("GMAIL_APP_PASSWORD", "").strip()
     max_auto_env = int(os.environ.get("MAX_AUTO_APPLY", "10"))
 
-    browser_api_key      = os.environ.get("BROWSER_LLM_API", api_key).strip()
-    browser_url          = os.environ.get("BROWSER_LLM_URL", base_url).strip()
-    browser_model        = os.environ.get("BROWSER_LLM_MODEL", model).strip()
-    browser_fallback_model = os.environ.get("BROWSER_LLM_FALLBACK_MODEL", model).strip()
+    browser_api_key        = os.environ.get("BROWSER_LLM_API", api_key).strip()
+    browser_url            = os.environ.get("BROWSER_LLM_URL", base_url).strip()
+    browser_model          = os.environ.get("BROWSER_LLM_MODEL", model).strip()
+    browser_fallback_model = os.environ.get("BROWSER_LLM_FALLBACK_MODEL", browser_model).strip()
 
     classifier_api_key = os.environ.get("CLASSIFIER_LLM_API", api_key).strip()
     classifier_url     = os.environ.get("CLASSIFIER_LLM_URL", base_url).strip()
@@ -841,7 +841,7 @@ async def run_session(
         max_retries=0,  # we handle retries ourselves in _ask_llm_action
     )
     browser_llm_model = browser_model or model
-    browser_llm_fallback = browser_fallback_model or model
+    browser_llm_fallback = browser_fallback_model or browser_llm_model
 
     # Reset circuit-breaker state for this session
     _session_llm_state["timeout_streak"] = 0

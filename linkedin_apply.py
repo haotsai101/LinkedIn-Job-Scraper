@@ -21,8 +21,9 @@ _LLM_LOG_PATH = "llm_debug.jsonl"
 # Session timestamp prefix for screenshot filenames — ensures cross-run uniqueness
 _SESSION_TS = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 
-# Circuit-breaker: tracks consecutive browser-LLM timeouts across all jobs in a session.
-# Reset at the start of run_session(); mutated by _ask_llm_action on timeout/success.
+# Circuit-breaker: counts individual per-attempt timeouts (not per-job exhaustions).
+# Fires (switches self.model to fallback) when streak >= 2. Reset to 0 on any successful
+# LLM response. Reset to initial state at the start of run_session().
 _session_llm_state: dict = {"timeout_streak": 0, "model_switched": False}
 
 
@@ -1798,6 +1799,9 @@ class OffsiteApplyFlow:
         self.llm_client = llm_client
         self.model = model
         self.fallback_model = fallback_model or model
+        # If the circuit-breaker already fired this session, start on the fallback immediately
+        if _session_llm_state.get("model_switched"):
+            self.model = self.fallback_model
         self.auto_mode = auto_mode
         self.callbacks = callbacks
         self.generated_password = generated_password
