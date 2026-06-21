@@ -21,6 +21,11 @@ _LLM_LOG_PATH = "llm_debug.jsonl"
 # Session timestamp prefix for screenshot filenames — ensures cross-run uniqueness
 _SESSION_TS = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 
+# Circuit-breaker: counts individual per-attempt timeouts (not per-job exhaustions).
+# Fires (switches self.model to fallback) when streak >= 2. Reset to 0 on any successful
+# LLM response. Reset to initial state at the start of run_session().
+_session_llm_state: dict = {"timeout_streak": 0, "model_switched": False}
+
 
 def _css_id(el_id: str) -> str:
     """Escape CSS-special characters in an element ID for use in a #id selector."""
@@ -1786,12 +1791,17 @@ class OffsiteApplyFlow:
         classifier_model: str = "",
         verbose: bool = False,
         inbox=None,
+        fallback_model: str = "",
     ):
         self.page = page
         self.context = context
         self.profile = profile
         self.llm_client = llm_client
         self.model = model
+        self.fallback_model = fallback_model or model
+        # If the circuit-breaker already fired this session, start on the fallback immediately
+        if _session_llm_state.get("model_switched"):
+            self.model = self.fallback_model
         self.auto_mode = auto_mode
         self.callbacks = callbacks
         self.generated_password = generated_password
@@ -2415,6 +2425,7 @@ class OffsiteApplyFlow:
                     print(f"\n{'─' * 40} LLM OUTPUT (step {step+1}) {'─' * 40}")
                     print(raw)
                     print(f"{'─' * 90}\n")
+                _session_llm_state["timeout_streak"] = 0  # successful response resets streak
                 return parsed
             except asyncio.TimeoutError:
                 _to_ms = int((datetime.now(timezone.utc) - _call_start).total_seconds() * 1000)
@@ -2428,6 +2439,11 @@ class OffsiteApplyFlow:
                     "job_title": self.job_title,
                     "snapshot":  snapshot,
                 })
+                _session_llm_state["timeout_streak"] += 1
+                if _session_llm_state["timeout_streak"] >= 2 and not _session_llm_state["model_switched"]:
+                    self.model = self.fallback_model
+                    _session_llm_state["model_switched"] = True
+                    print(f"  [LLM] Circuit-breaker: {_session_llm_state['timeout_streak']} consecutive timeouts — switching to fallback model {self.model!r}")
                 print(f"  [LLM] API timeout on attempt {_attempt + 1}/3 — retrying" if _attempt < 2 else "  [LLM] API timeout after 3 attempts — giving up")
                 continue
             except json.JSONDecodeError:
