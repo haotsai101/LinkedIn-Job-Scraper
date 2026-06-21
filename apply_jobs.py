@@ -646,7 +646,7 @@ def migrate_db(conn, cursor):
         print("DB migrated: added 'applied' column.")
 
 
-def get_pending_jobs(cursor, limit=None, apply_type=None):
+def get_pending_jobs(cursor, limit=None, apply_type=None, include_failed=False):
     where_extra = ""
     if apply_type:
         types = [f"'{t.strip()}'" for t in apply_type.split(",")]
@@ -658,6 +658,7 @@ def get_pending_jobs(cursor, limit=None, apply_type=None):
             for co in BLOCKED_COMPANIES
         )
         blocked_clause = f" AND ({conditions})"
+    applied_filter = "(j.applied IS NULL OR j.applied = -2)" if include_failed else "j.applied IS NULL"
     query = f"""
         SELECT j.job_id, j.title, j.job_posting_url, j.location,
                j.formatted_experience_level, j.description,
@@ -666,7 +667,7 @@ def get_pending_jobs(cursor, limit=None, apply_type=None):
         FROM jobs j
         LEFT JOIN companies c ON j.company_id = c.company_id
         WHERE j.scraped > 0
-          AND j.applied IS NULL
+          AND {applied_filter}
           AND (
               j.remote_allowed = 1
               OR LOWER(j.location) LIKE '%remote%'
@@ -1241,7 +1242,7 @@ def main():
     if ineligible:
         print(f"  Auto-skipped {ineligible} job(s) not matching remote/Utah criteria.")
 
-    jobs  = get_pending_jobs(cursor, limit=args.limit, apply_type=args.type)
+    jobs  = get_pending_jobs(cursor, limit=args.limit, apply_type=args.type, include_failed=not args.auto)
     total = len(jobs)
 
     if total == 0:
