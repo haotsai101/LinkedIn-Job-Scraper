@@ -39,11 +39,31 @@ def _write_llm_log(entry: dict):
 
 
 async def _human_type(el, value: str):
-    """Type text character-by-character with random delays to mimic human input."""
+    """Type text character-by-character with random delays to mimic human input.
+
+    Falls back to direct el.fill() if press_sequentially times out (e.g. Ashby
+    long-answer textareas whose JS character-count handlers stall the event loop).
+    """
     await el.click()
     await asyncio.sleep(random.uniform(0.1, 0.3))
     await el.clear()
-    await el.press_sequentially(str(value), delay=random.randint(40, 120))
+    _delay = random.randint(40, 120)
+    try:
+        await el.press_sequentially(str(value), delay=_delay)
+    except Exception as _ps_exc:
+        if "Timeout" in str(_ps_exc) or "timeout" in str(_ps_exc):
+            # Rapid keydown events can stall browser JS handlers on fields with
+            # character-count / autosave listeners.  el.fill() bypasses keyboard
+            # events entirely (JS property set + dispatched input event) and
+            # succeeds where press_sequentially stalls.
+            print(f"  [fill] press_sequentially timed out — falling back to direct fill()")
+            try:
+                await el.fill(str(value))
+            except Exception as _fb_exc:
+                print(f"  [fill] fill() fallback also failed: {_fb_exc}")
+                raise
+        else:
+            raise
     await asyncio.sleep(random.uniform(0.05, 0.2))
 
 _AUTH_HOSTPATHS = ("/login", "/checkpoint", "/uas/")
@@ -2597,6 +2617,19 @@ class OffsiteApplyFlow:
         job_summary = await self._summarize_job()
         print(f"  [LLM] Job summary: {job_summary[:120]}{'...' if len(job_summary) > 120 else ''}")
 
+        # reCAPTCHA pre-loop check: if the form already has a CAPTCHA widget before we start,
+        # there is no path to submission without a solver — bail immediately rather than burning
+        # the full 600s session timeout on hopeless LLM steps.
+        try:
+            _recaptcha_els = await page.locator(
+                "div.g-recaptcha, iframe[src*='recaptcha'], input[name='g-recaptcha-response']"
+            ).count()
+            if _recaptcha_els > 0:
+                print(f"  [LLM] reCAPTCHA detected on landing form — cannot submit without CAPTCHA solver, skipping")
+                return "skipped"
+        except Exception as _rc_e:
+            print(f"  [LLM] Warning: reCAPTCHA pre-check failed ({_rc_e}) — continuing")
+
         _session_start = datetime.now(timezone.utc)
         for step in range(30):
             _step_start = datetime.now(timezone.utc)
@@ -2887,13 +2920,20 @@ class OffsiteApplyFlow:
             _display_value = (self.profile.get("resume_path", value) if action_type == "upload" else value)
             print(f"  [LLM] Action: {action_type}" + (f" → {selector or text!r}" if selector or text else "") + (f" = {_display_value[:80]!r}" if _display_value else "") + f"  [{_step_ms}ms]")
 
+            # Per-step reCAPTCHA guard: if the LLM hallucinates a reCAPTCHA-related selector
+            # (e.g. "#g-recaptcha-response-100000:has-text('Submit Application')"), bail immediately
+            # rather than waiting for a Playwright timeout on a selector that can never match.
+            if "recaptcha" in (selector or "").lower() or "g-recaptcha" in (selector or "").lower():
+                print(f"  [LLM] reCAPTCHA selector in proposed action — cannot proceed without CAPTCHA solver, skipping")
+                return "skipped"
+
             # Per-selector retry cap: if the same selector has been attempted 3+ times
             # without a URL change, mark it as permanently stuck and skip it.
             # This prevents infinite loops on unresolvable fields (React Select, tabindex=-1, etc.)
             if action_type in ("fill", "select") and (selector or text):
                 _sel_key = selector or text
                 _selector_attempts[_sel_key] = _selector_attempts.get(_sel_key, 0) + 1
-                if _selector_attempts[_sel_key] > 3:
+                if _selector_attempts[_sel_key] >= 3:
                     print(f"  [LLM] Selector {_sel_key!r} attempted 3+ times with no change — skipping this field")
                     # Add to forced_filled so LLM sees it as FILLED and moves on
                     _fid = _sel_key.lstrip("#")
@@ -3495,16 +3535,29 @@ class OffsiteApplyFlow:
                     el = page.locator(selector).first
                     if await el.count() > 0:
                         _sel_done = False
-                        # Try native select_option first
-                        try:
-                            await el.select_option(label=value)
+                        # Guard: radio/checkbox must be .check()ed — select_option raises and
+                        # the combobox fallback's `_tag == "input"` check would match, then
+                        # el.fill() on a radio throws "Input of type 'radio' cannot be filled".
+                        _input_type = (await el.get_attribute("type") or "").lower()
+                        if _input_type in ("radio", "checkbox"):
+                            if _input_type != "checkbox" or not await el.is_checked():
+                                await el.check()
                             _sel_done = True
-                        except Exception:
+                            _field_id = await el.get_attribute("id") or ""
+                            if _field_id:
+                                _forced_filled[_field_id] = value
+                            print(f"  [LLM] Auto-redirected select→check for {_input_type}")
+                        # Try native select_option first
+                        if not _sel_done:
                             try:
-                                await el.select_option(value=value)
+                                await el.select_option(label=value)
                                 _sel_done = True
                             except Exception:
-                                pass
+                                try:
+                                    await el.select_option(value=value)
+                                    _sel_done = True
+                                except Exception:
+                                    pass
                         # Fallback: React Select / combobox (input[role="combobox"] or aria-haspopup)
                         if not _sel_done:
                             try:
@@ -3710,6 +3763,14 @@ class OffsiteApplyFlow:
                                             print(f"  [LLM] React Select: dropdown closed, cannot select")
                             except Exception as _cb_exc:
                                 print(f"  [LLM] React Select combobox fallback failed: {_cb_exc}")
+                                # Mark the field as filled so the LLM doesn't re-propose the same
+                                # select action on the next step, creating an infinite retry loop.
+                                try:
+                                    _fail_id = (await el.get_attribute("id") or selector).lstrip("#")
+                                    if _fail_id:
+                                        _forced_filled[_fail_id] = "(failed)"
+                                except Exception:
+                                    pass
                         await asyncio.sleep(0.5)
                 except Exception as exc:
                     print(f"  [LLM] Select failed: {exc}")
