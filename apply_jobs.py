@@ -219,7 +219,7 @@ def load_env():
     if not api_key or not base_url:
         sys.exit("Error: LLM_API and LLM_URL must be set (in .env or environment).")
 
-    return api_key, base_url, model, gmail_user, gmail_pass, max_auto_env, browser_api_key, browser_url, browser_model, classifier_api_key, classifier_url, classifier_model
+    return api_key, base_url, model, gmail_user, gmail_pass, max_auto_env, browser_api_key, browser_url, browser_model, browser_fallback_model, classifier_api_key, classifier_url, classifier_model
 
 
 # ── User profile ────────────────────────────────────────────────────────────────
@@ -805,6 +805,7 @@ async def run_session(
     browser_api_key: str = "",
     browser_url: str = "",
     browser_model: str = "",
+    browser_fallback_model: str = "",
     classifier_api_key: str = "",
     classifier_url: str = "",
     classifier_model: str = "",
@@ -1193,7 +1194,7 @@ def main():
     parser.add_argument("--verbose",      action="store_true", help="Print full LLM prompt/response and save screenshots per step.")
     args = parser.parse_args()
 
-    api_key, base_url, model, gmail_user, gmail_pass, max_auto_env, browser_api_key, browser_url, browser_model, classifier_api_key, classifier_url, classifier_model = load_env()
+    api_key, base_url, model, gmail_user, gmail_pass, max_auto_env, browser_api_key, browser_url, browser_model, browser_fallback_model, classifier_api_key, classifier_url, classifier_model = load_env()
     client = OpenAI(api_key=api_key, base_url=base_url)
 
     conn   = sqlite3.connect(DB_PATH)
@@ -1268,6 +1269,7 @@ def main():
             browser_api_key=browser_api_key,
             browser_url=browser_url,
             browser_model=browser_model,
+            browser_fallback_model=browser_fallback_model,
             classifier_api_key=classifier_api_key,
             classifier_url=classifier_url,
             classifier_model=classifier_model,
