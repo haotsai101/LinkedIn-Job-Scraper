@@ -2560,7 +2560,8 @@ class OffsiteApplyFlow:
                                    "fetchjobs.co",                 # FetchJobs aggregator — /job-description-usb/ path; React EEO fields cause 6+ fill timeouts (.com not known to host forms)
                                    "jobs.twilio.com",              # Twilio careers — hidden #g-recaptcha-response textarea in DOM; ScriptEngine tries to fill it, loops 3 attempts
                                    "amazon.jobs",                  # Amazon jobs portal — duplicate invisible search fields (lat/lng) cause strict-mode violations; apply requires Amazon account
-                                   "app.dataannotation.tech")      # Data Annotation Tech — /worker_signup path is contractor registration, not a job application form
+                                   "app.dataannotation.tech",      # Data Annotation Tech — /worker_signup path is contractor registration, not a job application form
+                                   "job-boards.greenhouse.io")     # Greenhouse public job board — reCAPTCHA on landing form (boards.greenhouse.io apply forms are unaffected)
         _landing_domain = urlparse(page.url).netloc.lower()
         if any(ats in _landing_domain for ats in _enterprise_ats_domains):
             print(f"  [LLM] Enterprise ATS domain ({_landing_domain}) — skipping immediately")
