@@ -2556,7 +2556,8 @@ class OffsiteApplyFlow:
                                    "hirebridge.com",               # HireBridge — hidden inputs in share modal + reCAPTCHA on landing form
                                    "hackajob.com",                 # hackajob — email gate + reCAPTCHA, cannot submit without CAPTCHA solver
                                    "jobs.cvshealth.com",           # CVS Health Phenom chatbot ATS — chatbot nav gets confused, fails validation at submit
-                                   "peakperformers.org")           # Peak Performers staffing board — apply form not on page, LLM hallucinates nav selector
+                                   "peakperformers.org",           # Peak Performers staffing board — apply form not on page, LLM hallucinates nav selector
+                                   "fetchjobs.co")                 # FetchJobs aggregator — /job-description-usb/ page has React EEO fields, script engine burns 6+ fill timeouts
         _landing_domain = urlparse(page.url).netloc.lower()
         if any(ats in _landing_domain for ats in _enterprise_ats_domains):
             print(f"  [LLM] Enterprise ATS domain ({_landing_domain}) — skipping immediately")
