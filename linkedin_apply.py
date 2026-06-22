@@ -1826,6 +1826,15 @@ class OffsiteApplyFlow:
         "Applications are closed",
     ]
 
+    async def assist_from_page(self) -> str:
+        """Resume LLM-guided apply from wherever the browser currently is.
+
+        Call this after the user has manually navigated to the application form.
+        Returns the same status strings as run(): 'applied', 'skipped', 'failed', etc.
+        """
+        print(f"  [Retry] Resuming from: {self.page.url}")
+        return await self._llm_guided_apply(self.page)
+
     async def run(self, job_url: str) -> str:
         job_url = _clean_linkedin_url(job_url)
         try:

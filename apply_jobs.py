@@ -1099,32 +1099,69 @@ async def run_session(
                         print(f"  [!] Apply failed: {title or 'Unknown'}")
                         print(f"  Browser tab is still open — you can interact manually.")
                         print(f"{'═' * 64}")
-                        try:
-                            fail_choice = input(
-                                "  [m] = I applied manually   [ENTER] = auto-fail   [s] = skip\n"
-                                "  > "
-                            ).strip().lower()
-                        except (EOFError, KeyboardInterrupt):
-                            fail_choice = ""
-                        if fail_choice == "m":
-                            mark_job(conn, cursor, job_id, 1)
-                            applied_count += 1
-                            applications.append({
-                                "job_id":     job_id,
-                                "title":      title or "",
-                                "company":    company_name or "",
-                                "url":        url,
-                                "applied_at": datetime.now(timezone.utc).isoformat(),
-                            })
-                            print("  [~] Marked as manually applied.")
-                        elif fail_choice in ("s", "skip"):
-                            mark_job(conn, cursor, job_id, -1)
-                            skipped_count += 1
-                            print("  [-] Skipped.")
-                        else:
-                            mark_job(conn, cursor, job_id, -2)
-                            error_count += 1
-                            print("  [!] Marked as auto-failed.")
+                        while True:
+                            try:
+                                fail_choice = input(
+                                    "  [r] = retry (navigate to form, agent fills)   "
+                                    "[m] = I applied manually   [s] = skip   [ENTER] = auto-fail\n"
+                                    "  > "
+                                ).strip().lower()
+                            except (EOFError, KeyboardInterrupt):
+                                fail_choice = ""
+                            if fail_choice == "r" and isinstance(flow, OffsiteApplyFlow):
+                                try:
+                                    input("  Navigate to the application form in the browser, then press ENTER…")
+                                except (EOFError, KeyboardInterrupt):
+                                    pass
+                                try:
+                                    status = await asyncio.wait_for(flow.assist_from_page(), timeout=600)
+                                except asyncio.TimeoutError:
+                                    status = "failed"
+                                except Exception as _retry_exc:
+                                    print(f"  [!] Retry error: {_retry_exc}")
+                                    status = "failed"
+                                if status == "applied":
+                                    mark_job(conn, cursor, job_id, 1)
+                                    applied_count += 1
+                                    applications.append({
+                                        "job_id":     job_id,
+                                        "title":      title or "",
+                                        "company":    company_name or "",
+                                        "url":        url,
+                                        "applied_at": datetime.now(timezone.utc).isoformat(),
+                                    })
+                                    print("  [+] Applied!")
+                                    break
+                                elif status in ("skipped", "expired", "no_apply_button"):
+                                    mark_job(conn, cursor, job_id, -1)
+                                    skipped_count += 1
+                                    print("  [-] Skipped.")
+                                    break
+                                else:
+                                    print("  [!] Retry also failed — choose again.")
+                                    continue
+                            elif fail_choice == "m":
+                                mark_job(conn, cursor, job_id, 1)
+                                applied_count += 1
+                                applications.append({
+                                    "job_id":     job_id,
+                                    "title":      title or "",
+                                    "company":    company_name or "",
+                                    "url":        url,
+                                    "applied_at": datetime.now(timezone.utc).isoformat(),
+                                })
+                                print("  [~] Marked as manually applied.")
+                                break
+                            elif fail_choice in ("s", "skip"):
+                                mark_job(conn, cursor, job_id, -1)
+                                skipped_count += 1
+                                print("  [-] Skipped.")
+                                break
+                            else:
+                                mark_job(conn, cursor, job_id, -2)
+                                error_count += 1
+                                print("  [!] Marked as auto-failed.")
+                                break
                     else:
                         mark_job(conn, cursor, job_id, -2)
                         error_count += 1
