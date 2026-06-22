@@ -52,15 +52,21 @@ async def _human_type(el, value: str):
     await el.click()
     await asyncio.sleep(random.uniform(0.1, 0.3))
     await el.clear()
-    _delay = random.randint(40, 120)
     try:
-        await el.press_sequentially(str(value), delay=_delay)
+        for _ch in str(value):
+            await el.press_sequentially(_ch, delay=0)
+            _r = random.random()
+            if _r < 0.05:
+                await asyncio.sleep(random.uniform(0.35, 0.8))   # rare pause
+            elif _r < 0.20:
+                await asyncio.sleep(random.uniform(0.12, 0.35))  # hesitation
+            else:
+                await asyncio.sleep(random.uniform(0.04, 0.12))  # normal
     except Exception as _ps_exc:
         if "Timeout" in str(_ps_exc) or "timeout" in str(_ps_exc):
-            # Rapid keydown events can stall browser JS handlers on fields with
-            # character-count / autosave listeners.  el.fill() bypasses keyboard
-            # events entirely (JS property set + dispatched input event) and
-            # succeeds where press_sequentially stalls.
+            # character-count / autosave listeners can stall keydown events;
+            # el.fill() bypasses keyboard events entirely and succeeds where
+            # per-char typing stalls.
             print(f"  [fill] press_sequentially timed out — falling back to direct fill()")
             try:
                 await el.fill(str(value))
