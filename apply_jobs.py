@@ -1102,12 +1102,24 @@ async def run_session(
                         while True:
                             try:
                                 fail_choice = input(
-                                    "  [r] = retry (navigate to form, agent fills)   "
+                                    "  [r] = retry (agent fills form)   [f] = fill focused field   "
                                     "[m] = I applied manually   [s] = skip   [ENTER] = auto-fail\n"
                                     "  > "
                                 ).strip().lower()
                             except (EOFError, KeyboardInterrupt):
                                 fail_choice = ""
+                            if fail_choice == "f":
+                                # Fill the focused field on whichever tab the user is looking at
+                                _active_pg = page
+                                for _pg in context.pages:
+                                    try:
+                                        if not _pg.is_closed() and "linkedin.com" not in _pg.url and _pg.url not in ("", "about:blank"):
+                                            _active_pg = _pg
+                                            break
+                                    except Exception:
+                                        continue
+                                await _llm_fill_focused(_active_pg, browser_llm_client, browser_model, profile)
+                                continue
                             if fail_choice == "r" and isinstance(flow, OffsiteApplyFlow):
                                 try:
                                     input("  Navigate to the application form in the browser, then press ENTER…")
