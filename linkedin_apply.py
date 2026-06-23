@@ -1827,13 +1827,22 @@ class OffsiteApplyFlow:
     ]
 
     async def assist_from_page(self) -> str:
-        """Resume LLM-guided apply from wherever the browser currently is.
+        """Resume LLM-guided apply from the application form tab.
 
-        Call this after the user has manually navigated to the application form.
-        Returns the same status strings as run(): 'applied', 'skipped', 'failed', etc.
+        Prefers an already-open non-LinkedIn tab (the one the failed apply left
+        behind) over the main LinkedIn page.  Falls back to self.page if no
+        third-party tab is found.
         """
-        print(f"  [Retry] Resuming from: {self.page.url}")
-        return await self._llm_guided_apply(self.page)
+        target = self.page
+        for pg in self.context.pages:
+            try:
+                if not pg.is_closed() and "linkedin.com" not in pg.url and pg.url not in ("", "about:blank"):
+                    target = pg
+                    break
+            except Exception:
+                continue
+        print(f"  [Retry] Resuming from: {target.url}")
+        return await self._llm_guided_apply(target)
 
     async def run(self, job_url: str) -> str:
         job_url = _clean_linkedin_url(job_url)
