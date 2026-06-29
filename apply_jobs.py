@@ -52,8 +52,8 @@ from email.mime.text import MIMEText
 from pathlib import Path
 
 import httpx
+import subprocess
 
-import anthropic
 from openai import OpenAI, AsyncOpenAI
 from playwright.async_api import async_playwright
 
@@ -528,8 +528,7 @@ User profile:
 Classify whether a job is relevant (software engineering, AI/ML, data engineering/science/analytics).
 Be accurate and concise. Never fabricate information not in the user's profile."""
 
-    def __init__(self, client: anthropic.Anthropic, profile: dict):
-        self.client  = client
+    def __init__(self, profile: dict):
         self._system = self._SYSTEM.format(profile=json.dumps(profile, indent=2))
 
     # Keyword patterns that unambiguously require US citizenship — checked before LLM call
@@ -578,15 +577,20 @@ Be accurate and concise. Never fabricate information not in the user's profile."
         for attempt in range(3):
             try:
                 _t0 = time.monotonic()
-                resp = self.client.messages.create(
-                    model=self._MODEL,
-                    system=self._system,
-                    messages=[{"role": "user", "content": prompt}],
-                    max_tokens=300,
-                    timeout=60.0,
+                proc = subprocess.run(
+                    ["claude", "--model", self._MODEL, "-p",
+                     self._system + "\n\n" + prompt],
+                    capture_output=True,
+                    text=True,
+                    timeout=90,
                 )
                 _call_ms = int((time.monotonic() - _t0) * 1000)
-                raw = resp.content[0].text
+                if proc.returncode != 0:
+                    raise RuntimeError(f"claude exited {proc.returncode}: {proc.stderr[:200]}")
+                raw = proc.stdout.strip()
+                if raw.startswith("```"):
+                    raw = re.sub(r"^```(?:json)?\s*\n?", "", raw)
+                    raw = re.sub(r"\n?```\s*$", "", raw).strip()
                 data = json.loads(raw)
                 relevant = bool(data.get("relevant"))
                 reason   = data.get("reason", "")
@@ -612,12 +616,10 @@ Be accurate and concise. Never fabricate information not in the user's profile."
                     "result":       {"relevant": relevant, "reason": reason, "citizenship_required": citizenship_required},
                 })
                 return relevant, reason, citizenship_required
-            except (anthropic.RateLimitError, anthropic.InternalServerError, anthropic.APITimeoutError) as exc:
+            except subprocess.TimeoutExpired:
                 if attempt < 2:
-                    wait = 10 * (2 ** attempt)  # 10s, 20s
-                    code = "429" if isinstance(exc, anthropic.RateLimitError) else ("timeout" if isinstance(exc, anthropic.APITimeoutError) else "503")
-                    print(f"\n  [rate limit] {code} — waiting {wait}s before retry…", end="", flush=True)
-                    time.sleep(wait)
+                    print(f"\n  [classifier] subprocess timeout — retrying…", end="", flush=True)
+                    time.sleep(5)
                     print(" retrying.")
                     continue
                 raise
@@ -802,8 +804,7 @@ async def run_session(
     classifier_model: str = "",
     verbose: bool = False,
 ):
-    _anthropic_client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY from env
-    agent = JobAgent(_anthropic_client, profile)
+    agent = JobAgent(profile)
 
     classifier_client = OpenAI(
         api_key=classifier_api_key or api_key,
