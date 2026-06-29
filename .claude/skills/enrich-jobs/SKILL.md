@@ -5,7 +5,7 @@ description: "Run the LinkedIn job detail enricher to fetch full attributes for 
 
 # /enrich-jobs
 
-Runs `details_retriever.py` to fetch full job details for every `scraped=0` row in `linkedin_jobs.db`. Processes random batches of up to 25 jobs per cycle with a 30-second sleep between cycles. Runs indefinitely — the user interrupts with Ctrl+C when done.
+Runs `details_retriever.py` to fetch full job details for every `scraped=0` row in `linkedin_jobs.db`. Processes random batches of up to 25 jobs per cycle with a 30-second sleep between cycles. Runs indefinitely — the user interrupts with Ctrl+C when done. All output is logged to `logs/enrich_jobs.log`.
 
 ## Usage
 
@@ -39,10 +39,10 @@ If unenriched count is 0, tell the user there is nothing to enrich and stop.
 
 ### Step 2 — Run the enricher
 
-Tell the user the enricher is starting and will run in a loop (30s sleep between batches of 25). They can press Ctrl+C when they want to stop.
+Tell the user the enricher is starting, will run in a loop (30s sleep between batches of 25), and output is being logged to `logs/enrich_jobs.log`. They can press Ctrl+C when they want to stop.
 
 ```bash
-cd /Users/zhihao/personal_projects/LinkedIn-Job-Scraper && python3 details_retriever.py
+cd /Users/zhihao/personal_projects/LinkedIn-Job-Scraper && mkdir -p logs && echo "=== $(date '+%Y-%m-%d %H:%M:%S') ===" >> logs/enrich_jobs.log && python3 details_retriever.py 2>&1 | tee -a logs/enrich_jobs.log
 ```
 
 ### Step 3 — Show final stats after interruption
@@ -62,3 +62,5 @@ conn.close()
 print(f'Done: {unenriched} remaining unenriched, {enriched} fully enriched')
 "
 ```
+
+Also tell the user the full log is at `logs/enrich_jobs.log`.

@@ -5,7 +5,7 @@ description: "Run the autonomous LinkedIn job application agent. Supports all ap
 
 # /apply-jobs
 
-Runs `apply_jobs.py` — the AI-powered job application agent. Reads enriched jobs (`scraped=1, applied IS NULL`), classifies relevance via LLM, and automates form-filling via Playwright for EasyApply and offsite career pages.
+Runs `apply_jobs.py` — the AI-powered job application agent. Reads enriched jobs (`scraped=1, applied IS NULL`), classifies relevance via LLM, and automates form-filling via Playwright for EasyApply and offsite career pages. All output is logged to `logs/apply_jobs.log`.
 
 ## Usage
 
@@ -72,10 +72,12 @@ print(f'Pending: {pending} | Applied: {applied} | Skipped: {skipped} | Failed: {
 
 ### Step 3 — Run the apply agent
 
-Tell the user the agent is starting. In semi-auto mode it will pause before each submission waiting for confirmation.
+Tell the user the agent is starting and output is being logged to `logs/apply_jobs.log`. In semi-auto mode it will pause before each submission waiting for confirmation.
 
 ```bash
-cd /Users/zhihao/personal_projects/LinkedIn-Job-Scraper && python3 apply_jobs.py FLAGS_HERE
+cd /Users/zhihao/personal_projects/LinkedIn-Job-Scraper && mkdir -p logs && echo "=== $(date '+%Y-%m-%d %H:%M:%S') ===" >> logs/apply_jobs.log && python3 apply_jobs.py FLAGS_HERE 2>&1 | tee -a logs/apply_jobs.log
 ```
 
 Replace FLAGS_HERE with the flags the user provided. If no flags were given, run with no arguments (semi-auto mode).
+
+Also tell the user the full log is at `logs/apply_jobs.log`.

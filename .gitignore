@@ -23,6 +23,7 @@ analysis/
 .tmp_*
 .dagster_home/
 # Generated / runtime output
+logs/
 jobs.db
 application_log.json
 created_accounts.json
