@@ -53,6 +53,7 @@ from pathlib import Path
 
 import httpx
 
+import anthropic
 from openai import OpenAI, AsyncOpenAI
 from playwright.async_api import async_playwright
 
@@ -518,8 +519,8 @@ def search_accounts(query: str) -> list[dict]:
 # ── LLM classifier ─────────────────────────────────────────────────────────────
 
 class JobAgent:
-    _SYSTEM = """/no_think
-You are a job application assistant helping the user review LinkedIn job listings.
+    _MODEL = "claude-haiku-4-5"
+    _SYSTEM = """You are a job application assistant helping the user review LinkedIn job listings.
 
 User profile:
 {profile}
@@ -527,9 +528,8 @@ User profile:
 Classify whether a job is relevant (software engineering, AI/ML, data engineering/science/analytics).
 Be accurate and concise. Never fabricate information not in the user's profile."""
 
-    def __init__(self, client: OpenAI, model: str, profile: dict):
+    def __init__(self, client: anthropic.Anthropic, profile: dict):
         self.client  = client
-        self.model   = model
         self._system = self._SYSTEM.format(profile=json.dumps(profile, indent=2))
 
     # Keyword patterns that unambiguously require US citizenship — checked before LLM call
@@ -575,22 +575,18 @@ Be accurate and concise. Never fabricate information not in the user's profile."
             f"Description:\n{desc[:3000]}\n\n"
             'Respond with JSON: {"relevant": true|false, "reason": "<one sentence>", "citizenship_required": true|false}'
         )
-        messages = [
-            {"role": "system", "content": self._system},
-            {"role": "user", "content": prompt},
-        ]
         for attempt in range(3):
             try:
                 _t0 = time.monotonic()
-                resp = self.client.chat.completions.create(
-                    model=self.model,
-                    messages=messages,
-                    response_format={"type": "json_object"},
+                resp = self.client.messages.create(
+                    model=self._MODEL,
+                    system=self._system,
+                    messages=[{"role": "user", "content": prompt}],
                     max_tokens=300,
-                    timeout=60,
+                    timeout=60.0,
                 )
                 _call_ms = int((time.monotonic() - _t0) * 1000)
-                raw = resp.choices[0].message.content
+                raw = resp.content[0].text
                 data = json.loads(raw)
                 relevant = bool(data.get("relevant"))
                 reason   = data.get("reason", "")
@@ -608,7 +604,7 @@ Be accurate and concise. Never fabricate information not in the user's profile."
                 _write_llm_log({
                     "ts":           datetime.now(timezone.utc).isoformat(),
                     "type":         "classifier",
-                    "model":        self.model,
+                    "model":        self._MODEL,
                     "duration_ms":  _call_ms,
                     "title":        title,
                     "prompt":       prompt,
@@ -616,22 +612,16 @@ Be accurate and concise. Never fabricate information not in the user's profile."
                     "result":       {"relevant": relevant, "reason": reason, "citizenship_required": citizenship_required},
                 })
                 return relevant, reason, citizenship_required
-            except Exception as exc:
-                exc_str = str(exc)
-                is_timeout = "timeout" in exc_str.lower() or "timed out" in exc_str.lower()
-                if ("429" in exc_str or "503" in exc_str or is_timeout) and attempt < 2:
+            except (anthropic.RateLimitError, anthropic.InternalServerError, anthropic.APITimeoutError) as exc:
+                if attempt < 2:
                     wait = 10 * (2 ** attempt)  # 10s, 20s
-                    if "429" in exc_str:
-                        code = "429"
-                    elif is_timeout:
-                        code = "timeout"
-                    else:
-                        code = "503"
+                    code = "429" if isinstance(exc, anthropic.RateLimitError) else ("timeout" if isinstance(exc, anthropic.APITimeoutError) else "503")
                     print(f"\n  [rate limit] {code} — waiting {wait}s before retry…", end="", flush=True)
                     time.sleep(wait)
                     print(" retrying.")
                     continue
-                # All retries exhausted or non-transient error
+                raise
+            except Exception:
                 raise
 
 
@@ -812,13 +802,15 @@ async def run_session(
     classifier_model: str = "",
     verbose: bool = False,
 ):
+    _anthropic_client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY from env
+    agent = JobAgent(_anthropic_client, profile)
+
     classifier_client = OpenAI(
         api_key=classifier_api_key or api_key,
         base_url=classifier_url or base_url,
         timeout=httpx.Timeout(90.0),  # 90s wall-clock per request
     )
     _classifier_model = classifier_model or model
-    agent = JobAgent(classifier_client, _classifier_model, profile)
 
     inbox = EmailInbox(gmail_user, gmail_pass) if gmail_user and gmail_pass else None
 
