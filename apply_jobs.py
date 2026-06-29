@@ -63,7 +63,7 @@ sys.stdout.reconfigure(line_buffering=True)
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 
-DB_PATH      = "linkedin_jobs.db"
+DB_PATH      = str(Path(__file__).parent / "linkedin_jobs.db")
 
 # Companies to permanently skip (case-insensitive substring match on company name)
 BLOCKED_COMPANIES = {
@@ -591,6 +591,11 @@ Be accurate and concise. Never fabricate information not in the user's profile."
                 if raw.startswith("```"):
                     raw = re.sub(r"^```(?:json)?\s*\n?", "", raw)
                     raw = re.sub(r"\n?```\s*$", "", raw).strip()
+                # Extract just the JSON object — Haiku may prepend/append prose
+                _start = raw.find("{")
+                _end   = raw.rfind("}") + 1
+                if _start != -1 and _end > _start:
+                    raw = raw[_start:_end]
                 data = json.loads(raw)
                 relevant = bool(data.get("relevant"))
                 reason   = data.get("reason", "")
