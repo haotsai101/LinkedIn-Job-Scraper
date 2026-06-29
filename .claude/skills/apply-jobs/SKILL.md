@@ -45,7 +45,7 @@ Capture any flags the user typed after `/apply-jobs` exactly as written — pass
 If the user passed `--stats` or `--reset-failed`, run via Bash tool and stop:
 
 ```bash
-cd /Users/zhihao/personal_projects/LinkedIn-Job-Scraper && python3 apply_jobs.py FLAGS_HERE
+cd /Users/zhihao/personal_projects/LinkedIn-Job-Scraper && /opt/anaconda3/bin/python apply_jobs.py FLAGS_HERE
 ```
 
 Do not proceed to Step 2.
@@ -88,13 +88,13 @@ If Cancel, stop here.
 **If `--auto` flag is present:** Run via Bash tool with timeout=600000, piping output to log:
 
 ```bash
-cd /Users/zhihao/personal_projects/LinkedIn-Job-Scraper && mkdir -p logs && echo "=== $(date '+%Y-%m-%d %H:%M:%S') ===" >> logs/apply_jobs.log && python3 apply_jobs.py FLAGS_HERE 2>&1 | tee -a logs/apply_jobs.log
+cd /Users/zhihao/personal_projects/LinkedIn-Job-Scraper && mkdir -p logs && echo "=== $(date '+%Y-%m-%d %H:%M:%S') ===" >> logs/apply_jobs.log && /opt/anaconda3/bin/python apply_jobs.py FLAGS_HERE 2>&1 | tee -a logs/apply_jobs.log
 ```
 
 **If no `--auto` flag (semi-auto mode):** The script pauses at each job for user confirmation via `input()` prompts in the terminal — it cannot run through Claude's Bash tool. Tell the user to run this in their own terminal:
 
 ```bash
-cd /Users/zhihao/personal_projects/LinkedIn-Job-Scraper && mkdir -p logs && echo "=== $(date '+%Y-%m-%d %H:%M:%S') ===" >> logs/apply_jobs.log && python3 apply_jobs.py FLAGS_HERE 2>&1 | tee -a logs/apply_jobs.log
+cd /Users/zhihao/personal_projects/LinkedIn-Job-Scraper && mkdir -p logs && echo "=== $(date '+%Y-%m-%d %H:%M:%S') ===" >> logs/apply_jobs.log && /opt/anaconda3/bin/python apply_jobs.py FLAGS_HERE 2>&1 | tee -a logs/apply_jobs.log
 ```
 
 ### Step 5 — Wait for login confirmation
