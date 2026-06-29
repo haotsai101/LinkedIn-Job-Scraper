@@ -85,15 +85,15 @@ If Cancel, stop here.
 
 ### Step 4 — Run the apply agent
 
-**For all modes:** `apply_jobs.py` opens a Playwright browser window and requires interactive input — it must run in a real Terminal.app / iTerm2 window. Do NOT run it via the `!` prefix in Claude Code (that subprocess context blocks GUI windows).
+**For all modes:** `apply_jobs.py` opens a Playwright browser and requires interactive input. Launch it in a real Terminal.app window via osascript so the browser displays properly.
 
-Tell the user to open Terminal.app and run:
+Run via Bash tool:
 
 ```bash
-cd /Users/zhihao/personal_projects/LinkedIn-Job-Scraper && python apply_jobs.py FLAGS_HERE
+osascript -e 'tell application "Terminal" to do script "cd /Users/zhihao/personal_projects/LinkedIn-Job-Scraper && python apply_jobs.py FLAGS_HERE"'
 ```
 
-Replace FLAGS_HERE with any flags the user passed, or omit for semi-auto mode. Semi-auto pauses at each job waiting for ENTER (submit) or `s` (skip) directly in that terminal. The script writes session results to `application_log.json` and `llm_debug.jsonl`.
+Replace FLAGS_HERE with any flags, or omit entirely for semi-auto mode. This opens a new Terminal.app window where the browser will appear and the user can interact (ENTER to submit, `s` to skip). Session results are written to `application_log.json` and `llm_debug.jsonl`.
 
 ### Step 5 — Wait for login confirmation
 
