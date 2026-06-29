@@ -70,14 +70,46 @@ print(f'Pending: {pending} | Applied: {applied} | Skipped: {skipped} | Failed: {
 "
 ```
 
-### Step 3 — Run the apply agent
+### Step 3 — Confirm ready to start
 
-Tell the user the agent is starting and output is being logged to `logs/apply_jobs.log`. In semi-auto mode it will pause before each submission waiting for confirmation.
+Use AskUserQuestion with this exact question and options:
+
+**Question:** "A Playwright browser will open and sign into LinkedIn (tsaizhihao@gmail.com). Watch for the browser — you may need to complete 2FA or CAPTCHA before the agent can proceed. Ready?"
+**Options:**
+- "Yes, I'm watching — start it"
+- "Cancel"
+
+If the user selects Cancel, stop here.
+
+### Step 4 — Tell user to run the apply agent
+
+Tell the user to run this in their terminal. In semi-auto mode the script will pause before each submit waiting for their input directly in the terminal.
 
 ```bash
 cd /Users/zhihao/personal_projects/LinkedIn-Job-Scraper && mkdir -p logs && echo "=== $(date '+%Y-%m-%d %H:%M:%S') ===" >> logs/apply_jobs.log && python3 apply_jobs.py FLAGS_HERE 2>&1 | tee -a logs/apply_jobs.log
 ```
 
-Replace FLAGS_HERE with the flags the user provided. If no flags were given, run with no arguments (semi-auto mode).
+Replace FLAGS_HERE with the flags the user provided. If no flags were given, omit FLAGS_HERE (semi-auto mode).
 
-Also tell the user the full log is at `logs/apply_jobs.log`.
+### Step 5 — Wait for login confirmation
+
+Use AskUserQuestion with this exact question and options:
+
+**Question:** "How did the LinkedIn sign-in go?"
+**Options:**
+- "Signed in — agent is running"
+- "Waiting on 2FA / CAPTCHA — give me a moment"
+- "Login failed / browser didn't open"
+
+If "Waiting on 2FA / CAPTCHA", use AskUserQuestion again:
+
+**Question:** "Ready to continue?"
+**Options:**
+- "Done — agent is running now"
+- "Abort"
+
+If login failed or user aborts, stop and suggest they check `logins.csv` credentials.
+
+### Step 6 — Session wrap-up
+
+Tell the user the full log is at `logs/apply_jobs.log`. When they report the session is done, offer to pull final stats.
