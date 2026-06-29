@@ -85,15 +85,19 @@ If Cancel, stop here.
 
 ### Step 4 — Run the apply agent
 
-**For all modes:** `apply_jobs.py` opens a Playwright browser and requires interactive input. Launch it in a real Terminal.app window via osascript so the browser displays properly.
+**If `--auto` is present:** No interactive prompts — run via Bash tool with timeout=600000:
 
-Run via Bash tool:
+```bash
+cd /Users/zhihao/personal_projects/LinkedIn-Job-Scraper && /opt/anaconda3/bin/python apply_jobs.py FLAGS_HERE
+```
+
+**If no `--auto` flag (semi-auto mode):** The script uses `input()` to pause at each job for confirmation. Claude's Bash tool has no connected keyboard stdin, so it must run in a real Terminal.app window. Launch via Bash tool with osascript:
 
 ```bash
 osascript -e 'tell application "Terminal" to do script "cd /Users/zhihao/personal_projects/LinkedIn-Job-Scraper && python apply_jobs.py FLAGS_HERE"'
 ```
 
-Replace FLAGS_HERE with any flags, or omit entirely for semi-auto mode. This opens a new Terminal.app window where the browser will appear and the user can interact (ENTER to submit, `s` to skip). Session results are written to `application_log.json` and `llm_debug.jsonl`.
+This opens a new Terminal.app window where the browser appears and the user can type ENTER (submit), `s` (skip), or `f` (LLM-fill focused field). Session results are written to `application_log.json` and `llm_debug.jsonl`.
 
 ### Step 5 — Wait for login confirmation
 
