@@ -2598,7 +2598,6 @@ class OffsiteApplyFlow:
             "hirebridge.com",               # HireBridge — hidden inputs + reCAPTCHA
             "hackajob.com",                 # hackajob — email gate + reCAPTCHA
             "jobs.twilio.com",              # Twilio — hidden #g-recaptcha-response; ScriptEngine loops 3 attempts
-            "job-boards.greenhouse.io",     # Greenhouse public board — reCAPTCHA (boards.greenhouse.io unaffected)
             "burtchworks.com",              # Burtch Works — React form fills don't persist
         )
 
