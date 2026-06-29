@@ -107,6 +107,12 @@ Single database file. Key `jobs` columns:
 
 `logins.csv` must have columns: `emails`, `passwords`, `method`. Accounts with `method=apply` are preferred by the apply agent; it falls back to `search` accounts if none exist.
 
+## Skills
+
+When the user types `/search-jobs`, invoke the Skill tool with `skill: "search-jobs"` before doing anything else.
+When the user types `/enrich-jobs`, invoke the Skill tool with `skill: "enrich-jobs"` before doing anything else.
+When the user types `/apply-jobs`, invoke the Skill tool with `skill: "apply-jobs"` before doing anything else.
+
 ## graphify
 
 This project has a knowledge graph at graphify-out/ with god nodes, community structure, and cross-file relationships.
