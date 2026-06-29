@@ -48,7 +48,7 @@ If the user passed `--stats` or `--reset-failed`, run via Bash tool and stop:
 cd /Users/zhihao/personal_projects/LinkedIn-Job-Scraper && /opt/anaconda3/bin/python apply_jobs.py FLAGS_HERE
 ```
 
-Do not proceed to Step 2.
+These flags exit immediately (no browser needed) — run via Bash tool. Do not proceed to Step 2.
 
 ### Step 2 — Show pending count (non-instant-exit only)
 
@@ -85,17 +85,15 @@ If Cancel, stop here.
 
 ### Step 4 — Run the apply agent
 
-**If `--auto` flag is present:** Run via Bash tool with timeout=600000, piping output to log:
+**For all modes:** `apply_jobs.py` must run in the user's own terminal without any output piping — piping breaks the TTY context that Playwright needs to show and control the browser window. The script writes its own persistent logs to `application_log.json` and `llm_debug.jsonl`.
+
+Tell the user to run this in their own terminal:
 
 ```bash
-cd /Users/zhihao/personal_projects/LinkedIn-Job-Scraper && mkdir -p logs && echo "=== $(date '+%Y-%m-%d %H:%M:%S') ===" >> logs/apply_jobs.log && /opt/anaconda3/bin/python apply_jobs.py FLAGS_HERE 2>&1 | tee -a logs/apply_jobs.log
+cd /Users/zhihao/personal_projects/LinkedIn-Job-Scraper && /opt/anaconda3/bin/python apply_jobs.py FLAGS_HERE
 ```
 
-**If no `--auto` flag (semi-auto mode):** The script pauses at each job for user confirmation via `input()` prompts in the terminal — it cannot run through Claude's Bash tool. Tell the user to run this in their own terminal:
-
-```bash
-cd /Users/zhihao/personal_projects/LinkedIn-Job-Scraper && mkdir -p logs && echo "=== $(date '+%Y-%m-%d %H:%M:%S') ===" >> logs/apply_jobs.log && /opt/anaconda3/bin/python apply_jobs.py FLAGS_HERE 2>&1 | tee -a logs/apply_jobs.log
-```
+Semi-auto mode (no `--auto`): the script pauses at each job waiting for the user to press ENTER or type `s` to skip directly in that terminal.
 
 ### Step 5 — Wait for login confirmation
 
