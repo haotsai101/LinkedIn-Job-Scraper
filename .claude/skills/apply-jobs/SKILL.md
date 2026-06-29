@@ -42,15 +42,17 @@ Capture any flags the user typed after `/apply-jobs` exactly as written — pass
 
 ### Step 1 — Handle instant-exit flags
 
-If the user passed `--stats` or `--reset-failed`, run immediately and stop after:
+If the user passed `--stats` or `--reset-failed`, run via Bash tool and stop:
 
 ```bash
 cd /Users/zhihao/personal_projects/LinkedIn-Job-Scraper && python3 apply_jobs.py FLAGS_HERE
 ```
 
-Replace FLAGS_HERE with the flags the user provided. Do not proceed to Step 2.
+Do not proceed to Step 2.
 
 ### Step 2 — Show pending count (non-instant-exit only)
+
+Run via Bash tool:
 
 ```bash
 cd /Users/zhihao/personal_projects/LinkedIn-Job-Scraper && python3 -c "
@@ -72,28 +74,32 @@ print(f'Pending: {pending} | Applied: {applied} | Skipped: {skipped} | Failed: {
 
 ### Step 3 — Confirm ready to start
 
-Use AskUserQuestion with this exact question and options:
+Use AskUserQuestion:
 
-**Question:** "A Playwright browser will open and sign into LinkedIn (tsaizhihao@gmail.com). Watch for the browser — you may need to complete 2FA or CAPTCHA before the agent can proceed. Ready?"
+**Question:** "A Playwright browser will open and sign into LinkedIn (tsaizhihao@gmail.com). Watch for the browser — you may need to complete 2FA or CAPTCHA. Ready?"
 **Options:**
 - "Yes, I'm watching — start it"
 - "Cancel"
 
-If the user selects Cancel, stop here.
+If Cancel, stop here.
 
-### Step 4 — Tell user to run the apply agent
+### Step 4 — Run the apply agent
 
-Tell the user to run this in their terminal. In semi-auto mode the script will pause before each submit waiting for their input directly in the terminal.
+**If `--auto` flag is present:** Run via Bash tool with timeout=600000, piping output to log:
 
 ```bash
 cd /Users/zhihao/personal_projects/LinkedIn-Job-Scraper && mkdir -p logs && echo "=== $(date '+%Y-%m-%d %H:%M:%S') ===" >> logs/apply_jobs.log && python3 apply_jobs.py FLAGS_HERE 2>&1 | tee -a logs/apply_jobs.log
 ```
 
-Replace FLAGS_HERE with the flags the user provided. If no flags were given, omit FLAGS_HERE (semi-auto mode).
+**If no `--auto` flag (semi-auto mode):** The script pauses at each job for user confirmation via `input()` prompts in the terminal — it cannot run through Claude's Bash tool. Tell the user to run this in their own terminal:
+
+```bash
+cd /Users/zhihao/personal_projects/LinkedIn-Job-Scraper && mkdir -p logs && echo "=== $(date '+%Y-%m-%d %H:%M:%S') ===" >> logs/apply_jobs.log && python3 apply_jobs.py FLAGS_HERE 2>&1 | tee -a logs/apply_jobs.log
+```
 
 ### Step 5 — Wait for login confirmation
 
-Use AskUserQuestion with this exact question and options:
+Use AskUserQuestion:
 
 **Question:** "How did the LinkedIn sign-in go?"
 **Options:**
@@ -112,4 +118,4 @@ If login failed or user aborts, stop and suggest they check `logins.csv` credent
 
 ### Step 6 — Session wrap-up
 
-Tell the user the full log is at `logs/apply_jobs.log`. When they report the session is done, offer to pull final stats.
+Tell the user the full log is at `logs/apply_jobs.log`. When the session finishes, offer to pull final stats.

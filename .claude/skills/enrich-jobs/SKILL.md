@@ -5,12 +5,12 @@ description: "Run the LinkedIn job detail enricher to fetch full attributes for 
 
 # /enrich-jobs
 
-Runs `details_retriever.py` to fetch full job details for every `scraped=0` row in `linkedin_jobs.db`. Processes random batches of up to 25 jobs per cycle with a 30-second sleep between cycles. Runs indefinitely — the user interrupts with Ctrl+C when done. All output is logged to `logs/enrich_jobs.log`.
+Runs `details_retriever.py` to fetch full job details for every `scraped=0` row in `linkedin_jobs.db`. Processes random batches of up to 25 jobs per cycle with a 30-second sleep between cycles. Exits automatically when all jobs are enriched. All output is logged to `logs/enrich_jobs.log`.
 
 ## Usage
 
 ```
-/enrich-jobs    # Start enrichment loop (Ctrl+C to stop)
+/enrich-jobs    # Start enrichment — exits when all jobs are done
 ```
 
 ## What You Must Do When Invoked
@@ -20,6 +20,8 @@ The project directory is `/Users/zhihao/personal_projects/LinkedIn-Job-Scraper`.
 Follow these steps in order.
 
 ### Step 1 — Show unenriched count
+
+Run via Bash tool:
 
 ```bash
 cd /Users/zhihao/personal_projects/LinkedIn-Job-Scraper && python3 -c "
@@ -39,26 +41,26 @@ If unenriched count is 0, tell the user there is nothing to enrich and stop.
 
 ### Step 2 — Confirm ready to start
 
-Use AskUserQuestion with this exact question and options:
+Use AskUserQuestion:
 
-**Question:** "A Chrome window will open and auto-sign into LinkedIn (tsaizhihao@gmail.com) to start the enrichment loop. Watch for the browser — you may need to handle 2FA or CAPTCHA. Ready?"
+**Question:** "A Chrome window will open and auto-sign into LinkedIn (tsaizhihao@gmail.com) to start enrichment. Watch for the browser — you may need to handle 2FA or CAPTCHA. Ready?"
 **Options:**
 - "Yes, I'm watching — start it"
 - "Cancel"
 
-If the user selects Cancel, stop here.
+If Cancel, stop here.
 
-### Step 3 — Tell user to run the enricher
+### Step 3 — Run the enricher via Bash tool
 
-Tell the user to run this command in their terminal. It loops indefinitely with 30s sleeps between batches — press Ctrl+C to stop.
+Run this via Bash tool with timeout=600000. It exits automatically when all jobs are enriched:
 
 ```bash
-cd /Users/zhihao/personal_projects/LinkedIn-Job-Scraper && mkdir -p logs && echo "=== $(date '+%Y-%m-%d %H:%M:%S') ===" >> logs/enrich_jobs.log && python3 details_retriever.py 2>&1 | tee -a logs/enrich_jobs.log
+cd /Users/zhihao/personal_projects/LinkedIn-Job-Scraper && mkdir -p logs && echo "=== $(date '+%Y-%m-%d %H:%M:%S') ===" >> logs/enrich_jobs.log && /opt/anaconda3/bin/python details_retriever.py 2>&1 | tee -a logs/enrich_jobs.log
 ```
 
 ### Step 4 — Wait for login confirmation
 
-Use AskUserQuestion with this exact question and options:
+While the script is starting up, use AskUserQuestion:
 
 **Question:** "How did the LinkedIn sign-in go?"
 **Options:**
@@ -75,13 +77,9 @@ If "Waiting on 2FA / CAPTCHA", use AskUserQuestion again:
 
 If login failed or user aborts, stop and suggest they check `logins.csv` credentials.
 
-### Step 5 — Wait for enrichment to finish
+### Step 5 — Show final stats
 
-Tell the user to press Ctrl+C when they have enough jobs enriched, then let you know. Full log is at `logs/enrich_jobs.log`.
-
-### Step 6 — Show final stats after interruption
-
-Once the user says they stopped it:
+After the script exits (prints "All jobs scraped. Done."), run via Bash tool:
 
 ```bash
 cd /Users/zhihao/personal_projects/LinkedIn-Job-Scraper && python3 -c "
