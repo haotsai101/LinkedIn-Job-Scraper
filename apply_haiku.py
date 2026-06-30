@@ -5,10 +5,14 @@ Commands:
   list   [--limit N] [--type TYPE]   Print JSON array of pending jobs.
   mark   <job_id> <applied|skipped|failed>   Update DB status.
   stats                               Print JSON counts.
+  log    <job_id> <title> <company> <url>     Append an application record to
+                                              application_answers.jsonl.
+                                              Reads answers summary from stdin.
 
 Called by the Claude Code skill; not intended for direct use.
 """
 import argparse, json, os, sqlite3, sys
+from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -91,6 +95,26 @@ def cmd_stats():
                       "skipped": skipped, "failed": failed}))
 
 
+_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "application_answers.jsonl")
+
+
+def cmd_log(job_id: str, title: str, company: str, url: str):
+    """Read answers summary from stdin, append structured record to application_answers.jsonl."""
+    answers = sys.stdin.read().strip()
+    record = {
+        "job_id":          job_id,
+        "title":           title,
+        "company":         company,
+        "application_url": url,
+        "submitted_at":    datetime.now(timezone.utc).isoformat(),
+        "answers":         answers,
+    }
+    with open(_LOG_PATH, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    print(f"Logged application record for job {job_id} → {_LOG_PATH}")
+
+
 def main():
     p = argparse.ArgumentParser(description="Haiku apply helper")
     sub = p.add_subparsers(dest="cmd")
@@ -106,6 +130,12 @@ def main():
 
     sub.add_parser("stats", help="Print job counts as JSON")
 
+    lg = sub.add_parser("log", help="Append application record (reads answers from stdin)")
+    lg.add_argument("job_id")
+    lg.add_argument("title")
+    lg.add_argument("company")
+    lg.add_argument("url")
+
     args = p.parse_args()
     if args.cmd == "list":
         cmd_list(args.limit, args.type)
@@ -113,6 +143,8 @@ def main():
         cmd_mark(args.job_id, args.status)
     elif args.cmd == "stats":
         cmd_stats()
+    elif args.cmd == "log":
+        cmd_log(args.job_id, args.title, args.company, args.url)
     else:
         p.print_help()
 

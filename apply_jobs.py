@@ -660,7 +660,8 @@ def get_pending_jobs(cursor, limit=None, apply_type=None, include_failed=False):
         SELECT j.job_id, j.title, j.job_posting_url, j.location,
                j.formatted_experience_level, j.description,
                COALESCE(c.name, '') AS company_name,
-               j.application_type
+               j.application_type,
+               COALESCE(j.posting_domain, '') AS posting_domain
         FROM jobs j
         LEFT JOIN companies c ON j.company_id = c.company_id
         WHERE j.scraped > 0
@@ -869,7 +870,7 @@ async def run_session(
 
         try:
             for idx, row in enumerate(jobs, 1):
-                job_id, title, job_url, location, exp_level, description, company_name, application_type = row
+                job_id, title, job_url, location, exp_level, description, company_name, application_type, posting_domain = row
                 url = job_url or f"https://www.linkedin.com/jobs/view/{job_id}/"
 
                 print(f"\n{'─' * 64}")
@@ -975,6 +976,20 @@ async def run_session(
                 print("  Applying via Playwright…")
 
                 if (application_type or "") == "OffsiteApply":
+                    # Skip known spam/aggregator domains before opening any browser tab
+                    _OFFSITE_SPAM = (
+                        "jobright.ai", "sundayy.com", "scale.jobs", "dice.com",
+                        "mercor.com", "remotehunter.com", "haystack.cv", "talentally.com",
+                        "micro1.ai", "tenex.ai", "bestjobtool.com", "fetchjobs.co",
+                        "alignerr.com", "app.dataannotation.tech",
+                        "theladders.com", "hiresome.ai",
+                    )
+                    _pd = (posting_domain or "").lower().strip()
+                    if _pd and any(_pd == d or _pd.endswith("." + d) for d in _OFFSITE_SPAM):
+                        print(f"  [LLM] Spam/aggregator domain ({_pd}) — skipping")
+                        mark_job(conn, cursor, job_id, -1)
+                        skipped_count += 1
+                        continue
                     flow = OffsiteApplyFlow(
                         page=page,
                         context=context,

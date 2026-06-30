@@ -171,7 +171,30 @@ Click the final submit button. Wait for a confirmation message ("Thank you", "Ap
 
 ## Step 6 — Report result
 
-End your response with EXACTLY one of:
+Before the final RESULT line, output a structured answers block so the record can be saved:
+
+```
+ANSWERS SUBMITTED:
+- Full name: <value>
+- Email: <value>
+- Phone: <value>
+- Location: <value>
+- Resume uploaded: yes/no
+- LinkedIn: <value>
+- GitHub: <value>
+- Work authorization answer: <value>
+- Sponsorship now: <value>
+- Sponsorship future: <value>
+- Salary: <value>
+- EEO fields: declined/answered
+- Open-ended questions answered:
+  Q: <question text>
+  A: <your answer>
+  ... (repeat for each)
+- Any other notable fields: <field>: <value>
+```
+
+Then end with EXACTLY one of:
   RESULT: applied
   RESULT: skipped
   REASON: <one sentence>
@@ -181,7 +204,15 @@ End your response with EXACTLY one of:
 
 ---
 
-After each agent completes, parse its last few lines for `RESULT: applied|skipped|failed`.
+After each agent completes, parse its output for `RESULT: applied|skipped|failed`.
+
+**If RESULT: applied**, extract the full `ANSWERS SUBMITTED:` block from the agent's response and run:
+
+```bash
+cd /Users/zhihao/personal_projects/LinkedIn-Job-Scraper && python apply_haiku.py log JOB_ID_HERE "JOB_TITLE_HERE" "COMPANY_HERE" "APPLICATION_URL_HERE" <<'ANSWERS'
+<paste the full ANSWERS SUBMITTED block here>
+ANSWERS
+```
 
 Then run:
 

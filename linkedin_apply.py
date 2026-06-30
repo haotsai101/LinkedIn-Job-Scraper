@@ -36,7 +36,16 @@ async def _call_claude(prompt: str, model: str = "claude-haiku-4-5", timeout: fl
             capture_output=True, text=True, timeout=int(timeout),
         )
         if proc.returncode != 0:
-            raise RuntimeError(f"claude exited {proc.returncode}: {proc.stderr[:300]}")
+            out = proc.stdout.strip()
+            err = proc.stderr.strip()
+            # If stdout has content despite non-zero exit, use it (claude sometimes exits 1
+            # with the answer still in stdout, e.g. rate-limit warnings on stderr).
+            _bad = ("error", "session limit", "rate limit", "usage limit",
+                    "issue with the selected", "does not exist", "no access",
+                    "invalid model", "model not found")
+            if out and not any(k in out.lower() for k in _bad):
+                return out
+            raise RuntimeError(f"claude exited {proc.returncode}: {err[:200] or out[:200]}")
         return proc.stdout.strip()
     return await asyncio.to_thread(_run)
 
@@ -479,9 +488,10 @@ def _get_profile_value(profile: dict, label: str, kind: str = "text") -> str | N
         return p.get("country", "United States")
     if "phone" in l or "mobile" in l:
         return p.get("phone")
-    if "linkedin" in l:
+    _is_years_q = any(k in l for k in ("years of", "how many years", "how many months", "years experience"))
+    if "linkedin" in l and not _is_years_q:
         return p.get("linkedin_url")
-    if "github" in l:
+    if "github" in l and not _is_years_q:
         return p.get("github_url")
     if any(k in l for k in ("portfolio", "personal website", "personal site")):
         return p.get("portfolio_url")
@@ -564,12 +574,25 @@ def _get_profile_value(profile: dict, label: str, kind: str = "text") -> str | N
     if any(k in l for k in ("how many years", "how many months")) and kind in ("text", "number"):
         # Default to 0 for technology-specific year questions we can't match
         return "0"
+    # "Are you currently on OPT or STEM OPT?" → Yes if profile work_authorization is OPT/STEM
+    if any(k in l for k in ("opt or stem", "opt/stem", "stem opt", "currently on opt")) \
+            and kind in ("select", "select-one", "radio"):
+        auth = (p.get("work_authorization") or "").upper()
+        return "Yes" if any(x in auth for x in ("OPT", "STEM")) else "No"
     if any(k in l for k in ("sponsor", "sponsorship", "visa support", "work visa")):
         if p.get("need_sponsorship", "").lower() in ("yes", "true", "1"):
             return "Yes"
         auth = (p.get("work_authorization") or "").upper()
         return "Yes" if any(x in auth for x in ("OPT", "H1B", "H-1B", "F1", "TN")) else "No"
     if any(k in l for k in ("authorized to work", "legally authorized", "legal right to work", "eligible to work")):
+        return "Yes"
+    # AI coding tools usage — user actively uses Claude Code, Cursor, Copilot etc.
+    if any(k in l for k in ("ai coding", "ai code", "coding agent", "coding assistant", "copilot", "cursor", "claude code")) \
+            and kind in ("select", "select-one", "radio"):
+        return "Yes"
+    # W2 employment — OPT holders can work on W2
+    if any(k in l for k in ("willing to work on w2", "work on w2", "w2 employment", "w2 contractor", "w2 basis")) \
+            and kind in ("select", "select-one", "radio"):
         return "Yes"
     if any(k in l for k in ("work authorization expire", "authorization expir", "visa expir")):
         return p.get("work_authorization_expiry", "N/A")
@@ -611,6 +634,11 @@ def _get_profile_value(profile: dict, label: str, kind: str = "text") -> str | N
                     "b.s.": "Bachelor's Degree", "bs": "Bachelor's Degree", "b.s": "Bachelor's Degree",
                     "ph.d": "Doctorate", "phd": "Doctorate", "mba": "Master's Degree"}
         return _deg_map.get(deg.lower().strip("."), deg) or "Master's Degree"
+    # "In which year did you complete your master's/bachelor's degree?" → graduation year
+    if "year" in l and any(k in l for k in ("degree", "master", "bachelor", "graduate", "graduated", "complet")):
+        edu = p.get("education", {}) if isinstance(p.get("education"), dict) else {}
+        yr = str(edu.get("year", "")).strip()
+        return yr if yr else None
     if "degree" in l:
         edu = p.get("education", {})
         if kind == "radio":
@@ -791,10 +819,13 @@ async def _ask_llm(llm_client: AsyncOpenAI, model: str, profile: dict, field: di
             "If the profile has no relevant info for a non-select/non-radio non-numeric field, reply with an empty string. "
             "Reply with ONLY the answer value, nothing else."
         )
-    _t = 45 if is_long_form else 30
+    _t = 70 if is_long_form else 50
+    # _call_claude uses the claude CLI which only accepts Anthropic model IDs.
+    # BROWSER_LLM_MODEL is already set to a valid Claude model; fall back to haiku.
+    _claude_model = os.environ.get("BROWSER_LLM_MODEL", "claude-haiku-4-5")
     try:
         raw_answer = await asyncio.wait_for(
-            _call_claude(prompt, model=model, timeout=_t - 5),
+            _call_claude(prompt, model=_claude_model, timeout=_t - 5),
             timeout=_t,
         )
         answer = raw_answer.strip().strip('"').strip("'")
@@ -2138,8 +2169,8 @@ class OffsiteApplyFlow:
         except Exception:
             pass
 
-        print(f"  [Offsite] Apply click didn't navigate — still on {self.page.url}")
-        return None, "failed"
+        print(f"  [Offsite] Apply click didn't navigate — still on {self.page.url} — skipping (LinkedIn wall / closed)")
+        return None, "skipped"
 
     async def _try_career_page_apply(self, page: Page) -> tuple:
         """
@@ -2432,8 +2463,8 @@ class OffsiteApplyFlow:
             try:
                 _call_start = datetime.now(timezone.utc)
                 raw = await asyncio.wait_for(
-                    _call_claude(prompt, model=self.model, timeout=55),
-                    timeout=60,
+                    _call_claude(prompt, model=self.model, timeout=110),
+                    timeout=120,
                 )
                 _call_ms = int((datetime.now(timezone.utc) - _call_start).total_seconds() * 1000)
                 # Strip markdown fences if present
