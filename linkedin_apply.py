@@ -10,6 +10,7 @@ import json
 import os
 import random
 import re
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
@@ -25,6 +26,19 @@ _SESSION_TS = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 # Fires (switches self.model to fallback) when streak >= 2. Reset to 0 on any successful
 # LLM response. Reset to initial state at the start of run_session().
 _session_llm_state: dict = {"timeout_streak": 0, "model_switched": False}
+
+
+async def _call_claude(prompt: str, model: str = "claude-haiku-4-5", timeout: float = 85) -> str:
+    """Call the claude CLI as a subprocess and return its stdout. Runs in a thread to stay async."""
+    def _run():
+        proc = subprocess.run(
+            ["claude", "--model", model, "-p", prompt],
+            capture_output=True, text=True, timeout=int(timeout),
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(f"claude exited {proc.returncode}: {proc.stderr[:300]}")
+        return proc.stdout.strip()
+    return await asyncio.to_thread(_run)
 
 
 def _css_id(el_id: str) -> str:
@@ -779,15 +793,10 @@ async def _ask_llm(llm_client: AsyncOpenAI, model: str, profile: dict, field: di
         )
     _t = 45 if is_long_form else 30
     try:
-        resp = await asyncio.wait_for(
-            llm_client.chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=400 if is_long_form else 100,
-            ),
+        raw_answer = await asyncio.wait_for(
+            _call_claude(prompt, model=model, timeout=_t - 5),
             timeout=_t,
         )
-        raw_answer = resp.choices[0].message.content
         answer = raw_answer.strip().strip('"').strip("'")
         _write_llm_log({
             "ts":           datetime.now(timezone.utc).isoformat(),
@@ -816,7 +825,15 @@ async def _ask_llm(llm_client: AsyncOpenAI, model: str, profile: dict, field: di
         })
         print(f"  [LLM timeout] Field '{label}' — no answer in {_t}s, skipping.")
         return None
-    except Exception:
+    except Exception as _exc:
+        print(f"  [LLM error] Field '{label}' — {type(_exc).__name__}: {_exc}")
+        _write_llm_log({
+            "ts":        datetime.now(timezone.utc).isoformat(),
+            "type":      "field_fill_error",
+            "model":     model,
+            "field_label": label,
+            "error":     f"{type(_exc).__name__}: {_exc}",
+        })
         return None
 
 
@@ -1483,6 +1500,14 @@ class EasyApplyFlow:
                 else:
                     continue
             value = _get_profile_value(self.profile, label, kind)
+            # If _get_profile_value returned a value that doesn't match any available select option,
+            # discard it and let the LLM decide — prevents numeric years ("4") being used for Yes/No selects.
+            if value is not None and kind in ("select", "select-one", "select-multiple"):
+                field_opts = field.get("options", [])
+                if field_opts:
+                    opts_lower = [o.lower() for o in field_opts]
+                    if value.lower() not in opts_lower:
+                        value = None
             if value is None:
                 value = await _ask_llm(self.classifier_client, self.classifier_model, self.profile, field)
             if value:
@@ -2221,6 +2246,8 @@ class OffsiteApplyFlow:
                     'select, textarea'
                 ))
                 .filter(el => !el.disabled)
+                // Skip OneTrust cookie-consent inputs — they're always offscreen and irrelevant
+                .filter(el => !(el.id && el.id.startsWith('ot-')) && !el.closest('#onetrust-consent-sdk'))
                 // Skip tabindex=-1 inputs (autocomplete children like Workable #city, phone country search)
                 // Skip React Select internal combobox inputs — they always appear empty even when selected
                 // Skip fully unlabeled/unnamed inputs with no id — hidden React control inputs
@@ -2255,7 +2282,7 @@ class OffsiteApplyFlow:
 
                 // Buttons visible in viewport, plus off-screen submit/apply/next buttons
                 const _allBtns = Array.from(document.querySelectorAll(
-                    'button:not([disabled]), [role="button"], a[href]'
+                    'button:not([disabled]), [role="button"], [role="tab"], a[href]'
                 ));
                 const _submitKeywords = ['submit', 'apply', 'next', 'continue', 'send', 'finish', 'complete'];
                 const buttons = _allBtns
@@ -2382,6 +2409,7 @@ class OffsiteApplyFlow:
             '"reason":"<1 sentence>","update":"<1 sentence describing what this page/step revealed — e.g. form structure, new requirements, page count>"}\n\n'
             "Rules: done=thank-you/confirmation visible. failed=captcha/identity-verify/stuck/job-no-longer-available. "
             "If you see 'job not found', 'no longer available', 'position closed', or similar expired-job text → failed with reason 'job no longer available'. "
+            "If you see a tab or link labeled 'Application' or 'Apply' in the buttons list, click it immediately — it opens the application form. "
             "click=button or link (use :has-text() NOT :contains()). fill=empty text input. "
             "select=native <select> element ONLY (tag is SELECT in HTML). upload=resume file input. scroll=reveal more. "
             "Priority: Fill ALL [EMPTY] fields in top-to-bottom order BEFORE clicking any Submit/Apply button. "
@@ -2403,16 +2431,11 @@ class OffsiteApplyFlow:
         for _attempt in range(3):
             try:
                 _call_start = datetime.now(timezone.utc)
-                resp = await asyncio.wait_for(
-                    self.llm_client.chat.completions.create(
-                        model=self.model,
-                        messages=[{"role": "user", "content": prompt}],
-                        max_tokens=1000,
-                    ),
+                raw = await asyncio.wait_for(
+                    _call_claude(prompt, model=self.model, timeout=55),
                     timeout=60,
                 )
                 _call_ms = int((datetime.now(timezone.utc) - _call_start).total_seconds() * 1000)
-                raw = resp.choices[0].message.content
                 # Strip markdown fences if present
                 clean = raw.strip()
                 if "```" in clean:
@@ -2504,15 +2527,11 @@ class OffsiteApplyFlow:
             f"Description:\n{self.job_description[:3000]}"
         )
         try:
-            resp = await asyncio.wait_for(
-                self.classifier_client.chat.completions.create(
-                    model=self.classifier_model,
-                    messages=[{"role": "user", "content": prompt}],
-                    max_tokens=200,
-                ),
+            result = await asyncio.wait_for(
+                _call_claude(prompt, model=self.classifier_model, timeout=25),
                 timeout=30,
             )
-            return resp.choices[0].message.content.strip()
+            return result
         except Exception:
             return f"Role: {self.job_title} at {self.company_name}."
 
@@ -3465,19 +3484,14 @@ class OffsiteApplyFlow:
                                             if _llm_opts_texts:
                                                 print(f"  [LLM] React Select fill: asking LLM to pick decline option from {_llm_opts_texts}")
                                                 try:
-                                                    _llm_pick_resp = await self.llm_client.chat.completions.create(
+                                                    _llm_picked = await _call_claude(
+                                                        f"Dropdown options: {_llm_opts_texts}\n"
+                                                        f"Which option best means 'prefer not to disclose' or declining to answer? "
+                                                        f"Reply with ONLY the exact option text from the list.",
                                                         model=self.model,
-                                                        max_tokens=30,
-                                                        messages=[{
-                                                            "role": "user",
-                                                            "content": (
-                                                                f"Dropdown options: {_llm_opts_texts}\n"
-                                                                f"Which option best means 'prefer not to disclose' or declining to answer? "
-                                                                f"Reply with ONLY the exact option text from the list."
-                                                            )
-                                                        }]
+                                                        timeout=20,
                                                     )
-                                                    _llm_picked = (_llm_pick_resp.choices[0].message.content or "").strip().strip('"').strip("'")
+                                                    _llm_picked = _llm_picked.strip().strip('"').strip("'")
                                                     print(f"  [LLM] React Select fill: LLM picked {_llm_picked!r}")
                                                     for _ri in range(_rc_count_all):
                                                         try:
@@ -3762,19 +3776,14 @@ class OffsiteApplyFlow:
                                         if _llm_sel_texts:
                                             print(f"  [LLM] React Select: asking LLM to pick decline option from {_llm_sel_texts}")
                                             try:
-                                                _llm_sel_resp = await self.llm_client.chat.completions.create(
+                                                _llm_sel_pick = await _call_claude(
+                                                    f"Dropdown options: {_llm_sel_texts}\n"
+                                                    f"Which option best means 'prefer not to disclose' or declining to answer? "
+                                                    f"Reply with ONLY the exact option text from the list.",
                                                     model=self.model,
-                                                    max_tokens=30,
-                                                    messages=[{
-                                                        "role": "user",
-                                                        "content": (
-                                                            f"Dropdown options: {_llm_sel_texts}\n"
-                                                            f"Which option best means 'prefer not to disclose' or declining to answer? "
-                                                            f"Reply with ONLY the exact option text from the list."
-                                                        )
-                                                    }]
+                                                    timeout=20,
                                                 )
-                                                _llm_sel_pick = (_llm_sel_resp.choices[0].message.content or "").strip().strip('"').strip("'")
+                                                _llm_sel_pick = _llm_sel_pick.strip().strip('"').strip("'")
                                                 print(f"  [LLM] React Select: LLM picked {_llm_sel_pick!r}")
                                                 for _oi in range(_sel_count_all):
                                                     try:
