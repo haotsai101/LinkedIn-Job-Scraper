@@ -2681,8 +2681,8 @@ class OffsiteApplyFlow:
             print(f"  [LLM] Spam/aggregator domain ({_landing_domain}) — skipping")
             return "skipped"
         if any(_domain_matches(_landing_domain, d) for d in _blocked_auto_apply_domains):
-            print(f"  [LLM] Blocked auto-apply domain ({_landing_domain}) — marking failed for manual review")
-            return "failed"
+            print(f"  [LLM] Blocked auto-apply domain ({_landing_domain}) — skipping")
+            return "skipped"
 
         # Lever listing-page fast-path: jobs.lever.co/<company>/<id> is a listing page with no form.
         # Append /apply to navigate directly to the application form, skipping a wasted ScriptEngine call.

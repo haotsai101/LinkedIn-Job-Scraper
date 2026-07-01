@@ -997,6 +997,12 @@ async def run_session(
                         "ed.crossover.com", "crossover.com",
                         # Greenhouse with mandatory reCAPTCHA — cannot submit headlessly
                         "job-boards.greenhouse.io", "boards.greenhouse.io", "grnh.se",
+                        # Known-blocked ATS platforms (account required / reCAPTCHA / broken fills)
+                        "hackajob.com", "workforcenow.adp.com", "recruiting.paylocity.com",
+                        "amazon.jobs", "jobs.cvshealth.com", "applytojob.com",
+                        "ats.rippling.com", "bamboohr.com", "hirebridge.com",
+                        "jobs.twilio.com", "zohorecruit.com", "app.breezy.hr",
+                        "peakperformers.org", "governmentjobs.com", "ycombinator.com",
                     )
                     _pd = (posting_domain or "").lower().strip()
                     if _pd and any(_pd == d or _pd.endswith("." + d) for d in _OFFSITE_SPAM):
