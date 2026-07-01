@@ -993,6 +993,10 @@ async def run_session(
                         "micro1.ai", "tenex.ai", "bestjobtool.com", "fetchjobs.co",
                         "alignerr.com", "app.dataannotation.tech",
                         "theladders.com", "hiresome.ai",
+                        # OAuth-only / assessment walls — cannot auto-apply
+                        "ed.crossover.com", "crossover.com",
+                        # Greenhouse with mandatory reCAPTCHA — cannot submit headlessly
+                        "job-boards.greenhouse.io", "boards.greenhouse.io", "grnh.se",
                     )
                     _pd = (posting_domain or "").lower().strip()
                     if _pd and any(_pd == d or _pd.endswith("." + d) for d in _OFFSITE_SPAM):
