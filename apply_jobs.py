@@ -849,7 +849,13 @@ async def run_session(
     _session_llm_state["timeout_streak"] = 0
     _session_llm_state["model_switched"] = False
 
-    print("\nOpening browser and signing into LinkedIn…")
+    # Skip LinkedIn login when every job in the queue is OffsiteApply —
+    # those jobs navigate directly to the company ATS via application_url.
+    _all_offsite = all(row[7] == "OffsiteApply" for row in jobs)
+    if _all_offsite:
+        print("\nOpening browser (OffsiteApply only — skipping LinkedIn login)…")
+    else:
+        print("\nOpening browser and signing into LinkedIn…")
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=False)
@@ -858,12 +864,15 @@ async def run_session(
         )
         page    = await context.new_page()
 
-        try:
-            await login_linkedin_playwright(page)
+        if not _all_offsite:
+            try:
+                await login_linkedin_playwright(page)
+                print("  Session ready.\n")
+            except Exception as _login_err:
+                await browser.close()
+                raise
+        else:
             print("  Session ready.\n")
-        except Exception as _login_err:
-            await browser.close()
-            raise
 
         if not _check_recent_session_health():
             print("\n  [!] Warning: the last 3 sessions all had >80% error rates.")
