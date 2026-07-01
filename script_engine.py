@@ -501,8 +501,8 @@ Output the completed script only — no markdown, no explanation."""
                 "element_count": element_count,
                 "duration_ms": int((datetime.now(timezone.utc) - _t0).total_seconds() * 1000),
                 "script": script,
-                "input_tokens": getattr(getattr(resp, "usage", None), "prompt_tokens", None),
-                "output_tokens": getattr(getattr(resp, "usage", None), "completion_tokens", None),
+                "input_tokens": None,
+                "output_tokens": None,
             })
 
             return script or None

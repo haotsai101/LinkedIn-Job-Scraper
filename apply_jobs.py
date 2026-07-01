@@ -661,7 +661,8 @@ def get_pending_jobs(cursor, limit=None, apply_type=None, include_failed=False):
                j.formatted_experience_level, j.description,
                COALESCE(c.name, '') AS company_name,
                j.application_type,
-               COALESCE(j.posting_domain, '') AS posting_domain
+               COALESCE(j.posting_domain, '') AS posting_domain,
+               COALESCE(j.application_url, '') AS application_url
         FROM jobs j
         LEFT JOIN companies c ON j.company_id = c.company_id
         WHERE j.scraped > 0
@@ -870,7 +871,7 @@ async def run_session(
 
         try:
             for idx, row in enumerate(jobs, 1):
-                job_id, title, job_url, location, exp_level, description, company_name, application_type, posting_domain = row
+                job_id, title, job_url, location, exp_level, description, company_name, application_type, posting_domain, application_url = row
                 url = job_url or f"https://www.linkedin.com/jobs/view/{job_id}/"
 
                 print(f"\n{'─' * 64}")
@@ -1007,6 +1008,7 @@ async def run_session(
                         verbose=verbose,
                         inbox=inbox,
                         fallback_model=browser_llm_fallback,
+                        application_url=application_url or "",
                     )
                 else:
                     flow = EasyApplyFlow(
@@ -1049,8 +1051,10 @@ async def run_session(
                         job_description=description or "",
                         classifier_client=classifier_client,
                         classifier_model=_classifier_model,
+                        verbose=verbose,
                         inbox=inbox,
                         fallback_model=browser_llm_fallback,
+                        application_url=application_url or "",
                     )
                     try:
                         status = await asyncio.wait_for(flow.run(url), timeout=600)

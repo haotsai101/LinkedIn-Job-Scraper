@@ -288,9 +288,9 @@ print(f'Pending: {pending} | Applied: {applied} | Skipped: {skipped} | Failed: {
 
 Use AskUserQuestion:
 
-**Question:** "A Playwright browser will open and sign into LinkedIn (tsaizhihao@gmail.com). Watch for the browser — you may need to complete 2FA or CAPTCHA. Ready?"
+**Question:** "OffsiteApply jobs navigate directly to the company ATS (no LinkedIn click needed). EasyApply jobs still require a LinkedIn sign-in. Ready to start?"
 **Options:**
-- "Yes, I'm watching — start it"
+- "Yes, start it"
 - "Cancel"
 
 If Cancel, stop here.
@@ -311,15 +311,16 @@ osascript -e 'tell application "Terminal" to do script "cd /Users/zhihao/persona
 
 This opens a new Terminal.app window where the browser appears and the user can type ENTER (submit), `s` (skip), or `f` (LLM-fill focused field). Session results are written to `application_log.json` and `llm_debug.jsonl`.
 
-### Step 5 — Wait for login confirmation
+### Step 5 — Monitor for LinkedIn sign-in (EasyApply only)
 
-Use AskUserQuestion:
+If the job queue contains EasyApply jobs (SimpleOnsiteApply / ComplexOnsiteApply), the browser will sign into LinkedIn. Use AskUserQuestion:
 
 **Question:** "How did the LinkedIn sign-in go?"
 **Options:**
 - "Signed in — agent is running"
 - "Waiting on 2FA / CAPTCHA — give me a moment"
 - "Login failed / browser didn't open"
+- "No EasyApply jobs in this run — skip"
 
 If "Waiting on 2FA / CAPTCHA", use AskUserQuestion again:
 

@@ -1854,6 +1854,7 @@ class OffsiteApplyFlow:
         verbose: bool = False,
         inbox=None,
         fallback_model: str = "",
+        application_url: str = "",
     ):
         self.page = page
         self.context = context
@@ -1861,6 +1862,7 @@ class OffsiteApplyFlow:
         self.llm_client = llm_client
         self.model = model
         self.fallback_model = fallback_model or model
+        self.application_url = application_url
         # If the circuit-breaker already fired this session, start on the fallback immediately
         if _session_llm_state.get("model_switched"):
             self.model = self.fallback_model
@@ -1901,6 +1903,19 @@ class OffsiteApplyFlow:
         return await self._llm_guided_apply(target)
 
     async def run(self, job_url: str) -> str:
+        # Fast path: navigate directly to the ATS application URL from DB,
+        # skipping LinkedIn entirely (avoids Premium wall / Apply button click)
+        if self.application_url and "linkedin.com" not in self.application_url:
+            print(f"  [Offsite] Direct ATS navigation: {self.application_url[:80]}")
+            try:
+                await self.page.goto(self.application_url, wait_until="domcontentloaded", timeout=20000)
+            except Exception as _e:
+                print(f"  [Offsite] Direct nav failed ({_e}) — falling back to LinkedIn click")
+            else:
+                if "linkedin.com" not in self.page.url:
+                    return await self._fill_external_form(self.page)
+
+        # Fallback: open LinkedIn job page and click Apply
         job_url = _clean_linkedin_url(job_url)
         try:
             await self.page.goto(job_url, wait_until="domcontentloaded", timeout=20000)
@@ -1931,7 +1946,7 @@ class OffsiteApplyFlow:
 
         ext_page, apply_status = await self._click_apply_and_get_page()
         if ext_page is None:
-            return apply_status  # "failed", "no_easy_apply", etc.
+            return apply_status
 
         return await self._fill_external_form(ext_page)
 
@@ -2169,8 +2184,18 @@ class OffsiteApplyFlow:
         except Exception:
             pass
 
-        print(f"  [Offsite] Apply click didn't navigate — still on {self.page.url} — skipping (LinkedIn wall / closed)")
-        return None, "skipped"
+        # Final fallback: navigate directly to application_url from DB (bypasses LinkedIn wall)
+        if self.application_url and "linkedin.com" not in self.application_url:
+            print(f"  [Offsite] Navigating directly to application_url: {self.application_url[:80]}")
+            try:
+                await self.page.goto(self.application_url, wait_until="domcontentloaded", timeout=20000)
+                if "linkedin.com" not in self.page.url:
+                    return self.page, "ok"
+            except Exception as _e:
+                print(f"  [Offsite] Direct application_url navigation failed: {_e}")
+
+        print(f"  [Offsite] Apply click didn't navigate — still on {self.page.url} — marking failed")
+        return None, "failed"
 
     async def _try_career_page_apply(self, page: Page) -> tuple:
         """
@@ -2695,12 +2720,15 @@ class OffsiteApplyFlow:
 
         # Check immediately if the landing page shows an expired/unavailable job.
         # URL check runs first (never throws); text check is separate so a JS error can't suppress the URL check.
-        _expired_url_patterns = ("/second-chance", "/job-expired", "/job-not-found", "/404", "/error")
+        _expired_url_patterns = ("/second-chance", "/job-expired", "/job-not-found", "/404", "/error",
+                                  "ns_inactive_job=1", "inactive_job")
         _expired_text_phrases = (
             "no longer available", "opportunity is no longer", "position has been filled",
             "listing expired", "job has been filled", "this job is no longer", "job is closed",
             "no longer accepting applications", "job not found", "error: job not found",
             "this position has been", "this role has been filled",
+            "no longer active", "posting is no longer", "job posting has expired",
+            "this posting has been removed", "job has expired",
         )
         if any(p in page.url.lower() for p in _expired_url_patterns):
             print(f"  [LLM] Landing URL indicates expired job ({page.url}) — skipping")
@@ -3177,7 +3205,9 @@ class OffsiteApplyFlow:
                 continue
 
             if action_type == "failed":
-                _expired_reasons = ("no longer available", "job not found", "position closed", "job closed", "expired")
+                _expired_reasons = ("no longer available", "no longer active", "job not found",
+                                    "position closed", "job closed", "expired", "posting.*no longer",
+                                    "not accepting", "has been filled", "position has been")
                 if any(k in reason.lower() for k in _expired_reasons):
                     print(f"  [LLM] Job reported as expired/closed ({reason}) — skipping")
                     return "expired"
