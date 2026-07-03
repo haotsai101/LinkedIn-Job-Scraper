@@ -2475,7 +2475,7 @@ class OffsiteApplyFlow:
             "Never fill or upload to any field labeled 'Cover Letter' or 'Covering Letter' — skip entirely. "
             f"Sponsorship questions: answer '{_sponsor_val}'. Work authorization: always 'Yes'. "
             "CRITICAL: Never fabricate URLs, social media handles, usernames, or any information not in the profile. "
-            "For URL/link fields asking for Twitter, Instagram, Facebook, personal blog, or any social/platform not listed in the profile, use value='' (empty string) — leave them blank. "
+            "For any field where you have no value (optional URL, referral email, social handle, portfolio, etc.) — do NOT issue a fill action at all. Skip that field entirely and move to the next [EMPTY] field or click Submit. Never fill a field with an empty string (value='') — an empty fill does nothing useful and can trigger browser validation errors. "
             "If all [EMPTY] fields are filled and a submit button is listed as (offscreen), use action=click with its selector to click it — do not scroll first. "
             "Never click bare 'Apply' nav links — only 'Apply Now', 'Apply for this job', 'Submit application'. "
             "Never click Login/Sign-in unless you just filled email+password. "
@@ -2647,33 +2647,49 @@ class OffsiteApplyFlow:
         # account wall, chatbot, etc.). Marked failed so they surface in the manual queue for human review.
         # Checked at domain level so Workday's /apply/applyManually (not a login URL) is caught too.
         _blocked_auto_apply_domains = (
-            "icims.com",                    # iCIMS — requires account
-            "taleo.net",                    # Oracle Taleo — requires account
-            "successfactors.com",           # SAP SuccessFactors
-            "successfactors.eu",            # SAP SuccessFactors EU
-            "sap.com",                      # SAP hosted ATS
-            "sapsf.com",                    # SAP SuccessFactors alternate domain
-            "myworkdayjobs.com",            # Workday public boards — requires account
-            "myworkdaysite.com",            # Workday client instances — same account requirement
-            "ultipro.com",                  # UltiPro/UKG — redirects to auth
-            "paycomonline.net",             # Paycom — form buried behind account login
-            "governmentjobs.com",           # NEOGOV — always requires pre-registered account
-            "workforcenow.adp.com",         # ADP Workforce Now — lands on company portal, not job form
-            "recruiting.paylocity.com",     # Paylocity — account required
-            "bamboohr.com",                 # BambooHR — requires account to submit
-            "recruitingbypaycor.com",       # Paycor — hidden location field causes 30s timeout
-            "yourpayrollhr.com",            # Paycor-based — LLM navigates away from job page
+            # reCAPTCHA / technical blockers the agent cannot overcome
+            "governmentjobs.com",           # NEOGOV — account + CAPTCHA required
             "zohorecruit.com",              # Zoho Recruit — CAPTCHA blocks submission
-            "app.breezy.hr",                # BreezyHR — repeated fills trigger spam detection
-            "ats.rippling.com",             # Rippling ATS — script engine + LLM both fail
-            "ycombinator.com",              # YC Work — SSO-only, no self-registration
-            "amazon.jobs",                  # Amazon portal — duplicate invisible fields + account required
-            "jobs.cvshealth.com",           # CVS Health Phenom chatbot — confused navigation, fails validation
             "applytojob.com",               # ApplyToJob — reCAPTCHA on landing form
             "hirebridge.com",               # HireBridge — hidden inputs + reCAPTCHA
             "hackajob.com",                 # hackajob — email gate + reCAPTCHA
-            "jobs.twilio.com",              # Twilio — hidden #g-recaptcha-response; ScriptEngine loops 3 attempts
+            "jobs.twilio.com",              # Twilio — hidden g-recaptcha-response
             "burtchworks.com",              # Burtch Works — React form fills don't persist
+            "jobs.cvshealth.com",           # CVS Health Phenom chatbot — navigation fails
+            "amazon.jobs",                  # Amazon portal — duplicate invisible fields
+            # Company career pages backed by reCAPTCHA (Greenhouse)
+            "careers.airbnb.com",
+            "www.pinterestcareers.com",
+            # Company sites requiring account login
+            "apply.careers.microsoft.com",  # Requires Microsoft account
+            "ycombinator.com",              # YC Work — SSO only
+            # ATS platforms with invisible SPA login modals (Apply opens overlay Playwright can't inspect)
+            "myworkdayjobs.com", "myworkdaysite.com",   # Workday
+            "ultipro.com",                              # UltiPro/UKG
+            "bamboohr.com",                             # BambooHR
+            "ats.rippling.com",                         # Rippling
+            "app.breezy.hr",                            # BreezyHR
+            "icims.com",                                # iCIMS
+            "jibeapply.com",                            # Jibe/Jobvite
+            "taleo.net",                                # Oracle Taleo
+            "successfactors.com", "sapsf.com",          # SAP SuccessFactors
+            "paycomonline.net",                         # Paycom
+            "recruitingbypaycor.com",                   # Paycor
+            "yourpayrollhr.com",                        # Paycor-based
+            "oraclecloud.com",                          # Oracle HCM
+            "jobvite.com",                              # Jobvite
+            "workforcenow.adp.com",                     # ADP Workforce Now
+            "recruiting.paylocity.com",                 # Paylocity
+            "etscareers.submit4jobs.com",               # ETS careers
+            # Career pages / ATSes where Apply form is inaccessible headlessly
+            "talent.fullstack.com",                     # FullStack — invisible modal
+            "careers-page.com",                         # Careers Page ATS
+            "careers.bigbear.ai",                       # BigBear.ai — only Search inputs visible
+            "careers.rideuta.com",                      # Utah Transit Authority — no Apply button
+            "entertimeonline.com",                      # EnterTime ATS — only Search field
+            "butterflymx.com",                          # ButterflyMX — Ashby embed, only Search visible
+            "www.seismic.com",                          # Seismic — embedded form, URL never changes
+            "hiringthing.com",                          # HiringThing ATS — stuck on listing page
         )
 
         _landing_domain = urlparse(page.url).netloc.lower()
@@ -2681,8 +2697,8 @@ class OffsiteApplyFlow:
             print(f"  [LLM] Spam/aggregator domain ({_landing_domain}) — skipping")
             return "skipped"
         if any(_domain_matches(_landing_domain, d) for d in _blocked_auto_apply_domains):
-            print(f"  [LLM] Blocked auto-apply domain ({_landing_domain}) — skipping")
-            return "skipped"
+            print(f"  [LLM] Blocked auto-apply domain ({_landing_domain}) — marking failed for manual retry")
+            return "failed"
 
         # Lever listing-page fast-path: jobs.lever.co/<company>/<id> is a listing page with no form.
         # Append /apply to navigate directly to the application form, skipping a wasted ScriptEngine call.
@@ -2770,7 +2786,9 @@ class OffsiteApplyFlow:
         # the full 600s session timeout on hopeless LLM steps.
         try:
             _recaptcha_els = await page.locator(
-                "div.g-recaptcha, iframe[src*='recaptcha'], input[name='g-recaptcha-response']"
+                "div.g-recaptcha, iframe[src*='recaptcha'], iframe[title*='recaptcha'], "
+                "input[name='g-recaptcha-response'], textarea[id*='g-recaptcha-response'], "
+                "input[id*='g-recaptcha-response']"
             ).count()
             if _recaptcha_els > 0:
                 print(f"  [LLM] reCAPTCHA detected on landing form — cannot submit without CAPTCHA solver, skipping")
@@ -2874,11 +2892,9 @@ class OffsiteApplyFlow:
                 auth_attempted = True
                 ok = await self._handle_auth_page(page)
                 if not ok:
-                    # Any auth wall we can't get past (no registration link, SSO-only, enterprise ATS)
-                    # is not an agent error — count as skipped so error rates reflect real failures.
                     _auth_domain = urlparse(page.url).netloc.lower()
-                    print(f"  [LLM] Could not authenticate on {_auth_domain} — skipping")
-                    return "skipped"
+                    print(f"  [LLM] Login wall on {_auth_domain} — marking failed for manual retry")
+                    return "failed"
                 await asyncio.sleep(2)
                 continue
 
@@ -2967,6 +2983,36 @@ class OffsiteApplyFlow:
             if _snap_empty:
                 print("  [LLM] Page still blank after retries — skipping")
                 return "expired"
+
+            # Mid-loop login-wall check: if page has a password field, it's a login gate we can't pass
+            try:
+                _pwd_fields = await page.locator("input[type='password']").count()
+                if _pwd_fields > 0:
+                    _cur_domain = urlparse(page.url).netloc.lower()
+                    existing = _find_account_for_domain(_cur_domain)
+                    if existing:
+                        if await self._try_login(page, existing["email"], existing["password"]):
+                            pass  # logged in — continue loop
+                        else:
+                            print(f"  [LLM] Login with stored credentials failed for {_cur_domain} — marking failed")
+                            return "failed"
+                    else:
+                        print(f"  [LLM] Login wall detected (password field) on {_cur_domain} — marking failed for manual login")
+                        return "failed"
+            except Exception:
+                pass
+
+            # Mid-loop reCAPTCHA check: catch forms that load CAPTCHA after the Apply button click
+            try:
+                _rc_mid = await page.locator(
+                    "div.g-recaptcha, iframe[src*='recaptcha'], iframe[title*='recaptcha'], "
+                    "textarea[id*='g-recaptcha-response'], input[id*='g-recaptcha-response']"
+                ).count()
+                if _rc_mid > 0:
+                    print(f"  [LLM] reCAPTCHA detected mid-loop — cannot submit, skipping")
+                    return "skipped"
+            except Exception:
+                pass
 
             # Mid-loop check: detect Cloudflare bot-gates and "job no longer available" after navigation
             if step > 0:
@@ -3169,6 +3215,8 @@ class OffsiteApplyFlow:
                                 pass
                             print(f"  [LLM] Action '{hist_key}' already in history — page not advancing, giving up")
                             return "failed"
+                        # Page advanced (or we tried to) — skip re-executing the duplicate action
+                        continue
                     else:
                         print(f"  [LLM] Action '{hist_key}' already in history — page not advancing, giving up")
                         return "failed"
@@ -3689,20 +3737,23 @@ class OffsiteApplyFlow:
                                                 _clicked_suggestion = True
                                         except Exception:
                                             pass
-                                    # Greenhouse autocomplete fields (location, etc.) commit their value
-                                    # to a hidden field and clear the visible input. Track any field
-                                    # whose value disappears after autocomplete selection so the LLM
-                                    # sees it as FILLED and doesn't retry.
-                                    if _clicked_suggestion and "greenhouse.io" in page.url:
-                                        await asyncio.sleep(0.5)
-                                        try:
-                                            _ov_id = await el.get_attribute("id") or ""
-                                            _post_sug_val = await el.input_value()
-                                            if not _post_sug_val and _ov_id:
-                                                _forced_filled[_ov_id] = value
-                                                print(f"  [LLM] Greenhouse #{_ov_id!r}: marked as filled in prompt override")
-                                        except Exception:
-                                            pass
+                                    # Some ATSes (Greenhouse, Lever, etc.) commit the autocomplete
+                                    # value to a hidden field and clear the visible input. Track any
+                                    # field whose value disappears after autocomplete selection so the
+                                    # LLM sees it as FILLED and doesn't retry it next step.
+                                    # Track fields where the value disappeared after fill — some ATSes
+                                    # (Greenhouse, Lever, etc.) commit the value to a hidden field and
+                                    # clear the visible input. Mark as filled so LLM doesn't retry.
+                                    await asyncio.sleep(0.5)
+                                    try:
+                                        _ov_id = await el.get_attribute("id") or ""
+                                        _post_fill_val = await el.input_value()
+                                        if not _post_fill_val and _ov_id:
+                                            _forced_filled[_ov_id] = value
+                                            _reason = "after suggestion click" if _clicked_suggestion else "value committed internally"
+                                            print(f"  [LLM] Field #{_ov_id!r}: {_reason}, marked as filled")
+                                    except Exception:
+                                        pass
                 except Exception as exc:
                     exc_str = str(exc)
                     print(f"  [LLM] Fill failed: {exc_str[:200]}")
@@ -4323,8 +4374,8 @@ class OffsiteApplyFlow:
                 return True
             print(f"  [Auth] Login failed with stored credentials")
 
-        print(f"  [Auth] No valid credentials for {domain} — attempting registration")
-        return await self._try_register(page, domain)
+        print(f"  [Auth] No stored credentials for {domain} — marking failed for manual login")
+        return False
 
     async def _try_login(self, page: Page, email: str, password: str) -> bool:
         """Fill login form and submit. Returns True if URL changed away from login page."""

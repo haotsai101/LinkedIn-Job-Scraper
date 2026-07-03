@@ -988,21 +988,19 @@ async def run_session(
                 if (application_type or "") == "OffsiteApply":
                     # Skip known spam/aggregator domains before opening any browser tab
                     _OFFSITE_SPAM = (
+                        # Pure spam / aggregator job boards
                         "jobright.ai", "sundayy.com", "scale.jobs", "dice.com",
                         "mercor.com", "remotehunter.com", "haystack.cv", "talentally.com",
                         "micro1.ai", "tenex.ai", "bestjobtool.com", "fetchjobs.co",
                         "alignerr.com", "app.dataannotation.tech",
                         "theladders.com", "hiresome.ai",
-                        # OAuth-only / assessment walls — cannot auto-apply
+                        # Assessment / crossover platforms — not real direct-hire jobs
                         "ed.crossover.com", "crossover.com",
-                        # Greenhouse with mandatory reCAPTCHA — cannot submit headlessly
+                        # Greenhouse generic redirect boards — reCAPTCHA required, no real form
                         "job-boards.greenhouse.io", "boards.greenhouse.io", "grnh.se",
-                        # Known-blocked ATS platforms (account required / reCAPTCHA / broken fills)
-                        "hackajob.com", "workforcenow.adp.com", "recruiting.paylocity.com",
-                        "amazon.jobs", "jobs.cvshealth.com", "applytojob.com",
-                        "ats.rippling.com", "bamboohr.com", "hirebridge.com",
-                        "jobs.twilio.com", "zohorecruit.com", "app.breezy.hr",
-                        "peakperformers.org", "governmentjobs.com", "ycombinator.com",
+                        # Recruiter broker / broken stub sites
+                        "peakperformers.org", "work.mercor.com", "rex.zone",
+                        "motionrecruitment.com", "hirecrap.com",
                     )
                     _pd = (posting_domain or "").lower().strip()
                     if _pd and any(_pd == d or _pd.endswith("." + d) for d in _OFFSITE_SPAM):
