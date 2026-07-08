@@ -2667,18 +2667,14 @@ class OffsiteApplyFlow:
             "myworkdayjobs.com", "myworkdaysite.com",   # Workday
             "ultipro.com",                              # UltiPro/UKG
             "bamboohr.com",                             # BambooHR
-            "ats.rippling.com",                         # Rippling
-            "app.breezy.hr",                            # BreezyHR
             "icims.com",                                # iCIMS
             "jibeapply.com",                            # Jibe/Jobvite
             "taleo.net",                                # Oracle Taleo
-            "successfactors.com", "sapsf.com",          # SAP SuccessFactors
             "paycomonline.net",                         # Paycom
             "recruitingbypaycor.com",                   # Paycor
             "yourpayrollhr.com",                        # Paycor-based
             "oraclecloud.com",                          # Oracle HCM
             "jobvite.com",                              # Jobvite
-            "workforcenow.adp.com",                     # ADP Workforce Now
             "recruiting.paylocity.com",                 # Paylocity
             "etscareers.submit4jobs.com",               # ETS careers
             # Career pages / ATSes where Apply form is inaccessible headlessly

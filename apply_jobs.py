@@ -1001,6 +1001,7 @@ async def run_session(
                         # Recruiter broker / broken stub sites
                         "peakperformers.org", "work.mercor.com", "rex.zone",
                         "motionrecruitment.com", "hirecrap.com",
+                        "codevertexinnovations.com",                # Scam site
                     )
                     _pd = (posting_domain or "").lower().strip()
                     if _pd and any(_pd == d or _pd.endswith("." + d) for d in _OFFSITE_SPAM):
