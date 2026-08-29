@@ -57,7 +57,7 @@ import subprocess
 from openai import OpenAI, AsyncOpenAI
 from playwright.async_api import async_playwright
 
-from common import extract_json_object, strip_code_fence
+from common import extract_json_object, prune_debug_screenshots, rotate_llm_log, strip_code_fence
 from common import write_llm_log as _write_llm_log
 from linkedin_apply import EasyApplyFlow, OffsiteApplyFlow, _get_profile_value, _session_llm_state
 from scripts.create_db import BLOCKED_ENTITIES_SEED, ensure_schema_current
@@ -1356,6 +1356,12 @@ def main():
                     print(f"  Notes    : {r['notes']}")
         conn.close()
         return
+
+    # An actual apply session starts here (the --stats / --reset-failed /
+    # --accounts branches above have already returned). Keep the unbounded
+    # artifacts in check before we start writing more of them (ticket T3).
+    rotate_llm_log()
+    prune_debug_screenshots()
 
     profile = load_profile()
     if profile is None or args.setup:

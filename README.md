@@ -94,3 +94,24 @@ python to_csv.py --folder <dest> --database linkedin_jobs.db
 ```
 
 [Full database structure](DatabaseStructure.md)
+
+## Runtime artifacts & housekeeping
+
+The apply agent writes two growing artifacts at the repo root:
+
+| Artifact | Purpose | Rotation |
+|---|---|---|
+| `llm_debug.jsonl` | JSONL telemetry of every LLM call | On each apply-session start, `common.rotate_llm_log()` rotates it to `llm_debug.jsonl.1` (keeping 2 generations) once it exceeds ~20 MB |
+| `debug_screenshots/` | Per-step / per-failure PNGs | On each apply-session start, `common.prune_debug_screenshots()` deletes all but the newest ~100 files |
+
+Both run only for a real apply session (not `--stats` / `--reset-failed` / `--accounts`) and are best-effort (errors swallowed). All of `llm_debug.jsonl*` and `debug_screenshots/` are gitignored.
+
+### Analysis notebooks
+
+The exploratory notebooks and rendered HTML that used to live in `analysis/` (~160 MB) are **not kept in the repo** — they bloated every `grep` / editor index / knowledge-graph build. Keep them in a sibling directory instead, e.g.:
+
+```
+../linkedin-job-scraper-analysis/
+```
+
+`analysis/` stays in `.gitignore`, so if you recreate it inside the repo it will not be committed — but prefer the sibling location.
