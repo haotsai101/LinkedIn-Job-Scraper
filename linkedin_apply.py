@@ -27,8 +27,11 @@ try:
 except ImportError:  # pragma: no cover
     Page = BrowserContext = object
 
+# Shared stdlib-only helpers (ticket T4). ``_write_llm_log`` keeps its old private
+# name as a thin alias so the ~6 internal call sites are untouched.
+from common import extract_json_object, strip_code_fence
+from common import write_llm_log as _write_llm_log
 
-_LLM_LOG_PATH = "llm_debug.jsonl"
 # Session timestamp prefix for screenshot filenames — ensures cross-run uniqueness
 _SESSION_TS = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 
@@ -63,17 +66,6 @@ async def _call_claude(prompt: str, model: str = "claude-haiku-4-5", timeout: fl
 def _css_id(el_id: str) -> str:
     """Escape CSS-special characters in an element ID for use in a #id selector."""
     return re.sub(r'([\[\]().#+*?^$|{},~>\\])', r'\\\1', el_id)
-
-
-def _write_llm_log(entry: dict):
-    # Best-effort telemetry: swallow any IO/serialization error so callers
-    # (especially except-branch handlers that must always return None) are protected.
-    try:
-        import json as _json
-        with open(_LLM_LOG_PATH, "a") as f:
-            f.write(_json.dumps(entry) + "\n")
-    except Exception:
-        pass
 
 
 async def _human_type(el, value: str):
@@ -2502,15 +2494,13 @@ class OffsiteApplyFlow:
                     timeout=120,
                 )
                 _call_ms = int((datetime.now(timezone.utc) - _call_start).total_seconds() * 1000)
-                # Strip markdown fences if present
-                clean = raw.strip()
-                if "```" in clean:
-                    clean = clean.split("```")[1].lstrip("json").strip()
-                # Find JSON object in response
+                # Strip markdown fences if present, then isolate the JSON object
+                clean = strip_code_fence(raw)
+                # NOTE: `start` indexes the pre-extraction string; extract_json_object
+                # then trims to [first '{' .. last '}'], so clean[start:first_end]
+                # in the fallback below still points at the first object.
                 start = clean.find("{")
-                end = clean.rfind("}") + 1
-                if start >= 0 and end > start:
-                    clean = clean[start:end]
+                clean = extract_json_object(clean)
                 # If the model emitted multiple JSON objects, take only the first one
                 first_end = clean.find("}", start) + 1
                 try:

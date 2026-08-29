@@ -11,7 +11,6 @@ Usage (called from OffsiteApplyFlow._llm_guided_apply):
 """
 
 import asyncio
-import json
 import os
 import re
 import subprocess
@@ -20,8 +19,7 @@ from datetime import datetime, timezone
 from openai import AsyncOpenAI
 from playwright.async_api import Page, BrowserContext
 
-
-_LLM_LOG_PATH = "llm_debug.jsonl"
+from common import write_llm_log as _write_llm_log
 
 
 async def _call_claude(prompt: str, model: str = "claude-haiku-4-5", timeout: float = 175) -> str:
@@ -34,14 +32,6 @@ async def _call_claude(prompt: str, model: str = "claude-haiku-4-5", timeout: fl
             raise RuntimeError(f"claude exited {proc.returncode}: {proc.stderr[:300]}")
         return proc.stdout.strip()
     return await asyncio.to_thread(_run)
-
-
-def _write_llm_log(entry: dict):
-    try:
-        with open(_LLM_LOG_PATH, "a") as f:
-            f.write(json.dumps(entry) + "\n")
-    except Exception:
-        pass
 
 
 # ---------------------------------------------------------------------------
