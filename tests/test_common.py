@@ -9,6 +9,7 @@ safety net T14 will lean on when it replaces the salvage code.
 """
 
 import json
+import os
 
 import pytest
 
@@ -116,6 +117,86 @@ def _parse_like_decide_action(raw):
         return json.loads(clean)
     except json.JSONDecodeError:
         return json.loads(clean[start:first_end])
+
+
+# ── rotate_llm_log ────────────────────────────────────────────────────────────
+
+def test_rotate_llm_log_noop_when_absent(tmp_path, monkeypatch):
+    log = tmp_path / "llm_debug.jsonl"
+    monkeypatch.setattr(common, "LLM_LOG_PATH", str(log))
+    common.rotate_llm_log(max_bytes=10)  # must not raise
+    assert not log.exists()
+
+
+def test_rotate_llm_log_noop_below_threshold(tmp_path, monkeypatch):
+    log = tmp_path / "llm_debug.jsonl"
+    log.write_text("x" * 50)
+    monkeypatch.setattr(common, "LLM_LOG_PATH", str(log))
+    common.rotate_llm_log(max_bytes=1000)
+    assert log.exists()
+    assert log.read_text() == "x" * 50
+    assert not (tmp_path / "llm_debug.jsonl.1").exists()
+
+
+def test_rotate_llm_log_rotates_above_threshold(tmp_path, monkeypatch):
+    log = tmp_path / "llm_debug.jsonl"
+    log.write_text("current" * 100)
+    monkeypatch.setattr(common, "LLM_LOG_PATH", str(log))
+    common.rotate_llm_log(max_bytes=10, keep=2)
+    # Live log moved to .1; a fresh session will recreate the base path.
+    assert not log.exists()
+    assert (tmp_path / "llm_debug.jsonl.1").read_text() == "current" * 100
+
+
+def test_rotate_llm_log_shifts_generations_and_drops_oldest(tmp_path, monkeypatch):
+    log = tmp_path / "llm_debug.jsonl"
+    log.write_text("gen0" * 100)
+    (tmp_path / "llm_debug.jsonl.1").write_text("gen1")
+    (tmp_path / "llm_debug.jsonl.2").write_text("gen2-oldest")
+    monkeypatch.setattr(common, "LLM_LOG_PATH", str(log))
+    common.rotate_llm_log(max_bytes=10, keep=2)
+    assert not log.exists()
+    assert (tmp_path / "llm_debug.jsonl.1").read_text() == "gen0" * 100
+    assert (tmp_path / "llm_debug.jsonl.2").read_text() == "gen1"
+    # Only `keep` generations survive — the previous .2 is gone, not shifted to .3.
+    assert not (tmp_path / "llm_debug.jsonl.3").exists()
+
+
+# ── prune_debug_screenshots ───────────────────────────────────────────────────
+
+def test_prune_debug_screenshots_noop_when_dir_absent(tmp_path):
+    common.prune_debug_screenshots(keep=5, screenshot_dir=str(tmp_path / "nope"))
+
+
+def test_prune_debug_screenshots_noop_when_under_keep(tmp_path):
+    for i in range(3):
+        (tmp_path / f"s{i}.png").write_text("x")
+    common.prune_debug_screenshots(keep=5, screenshot_dir=str(tmp_path))
+    assert len(list(tmp_path.iterdir())) == 3
+
+
+def test_prune_debug_screenshots_keeps_newest_n(tmp_path):
+    # Create 10 files with strictly increasing mtimes.
+    paths = []
+    for i in range(10):
+        p = tmp_path / f"s{i:02d}.png"
+        p.write_text("x")
+        os.utime(p, (1_000_000 + i * 10, 1_000_000 + i * 10))
+        paths.append(p)
+    common.prune_debug_screenshots(keep=3, screenshot_dir=str(tmp_path))
+    survivors = sorted(p.name for p in tmp_path.iterdir())
+    assert survivors == ["s07.png", "s08.png", "s09.png"]
+
+
+def test_prune_debug_screenshots_ignores_subdirectories(tmp_path):
+    (tmp_path / "keep_me").mkdir()
+    for i in range(5):
+        p = tmp_path / f"s{i}.png"
+        p.write_text("x")
+        os.utime(p, (1_000_000 + i, 1_000_000 + i))
+    common.prune_debug_screenshots(keep=1, screenshot_dir=str(tmp_path))
+    remaining = sorted(p.name for p in tmp_path.iterdir())
+    assert remaining == ["keep_me", "s4.png"]
 
 
 @pytest.mark.parametrize(
