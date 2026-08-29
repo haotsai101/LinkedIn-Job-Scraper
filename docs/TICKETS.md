@@ -4,15 +4,27 @@ Derived from `docs/ARCHITECTURE_AND_OPTIMIZATION.md` §4. Each ticket ships as i
 
 Baseline artifacts captured 2026-08-28 in `docs/baseline/` (application_log snapshot, llm_debug summary, DB state).
 
+## Status
+
+| Wave | Tickets | State |
+|---|---|---|
+| 1 | T1 #5, T2 #2, T5 #6, T8 #4, T12 #3 | ✅ **CLOSED** — merged, reviewed, QA passed 2026-08-28 (`docs/qa/wave1-qa.md`) |
+| 2a | T6, T9, T13 | 🔨 in progress |
+| 2b | T4 | blocked on T9 (apply_jobs.py collision) |
+| 2c | T3 | blocked on T4 (common.py) |
+| 3+ | T14, T15, T16, T17 | not started |
+| P3 backlog | T19, T20 | not started |
+
 ## Dependency graph
 
 ```
-Wave 1 (independent, parallel now):
-  T1  dependency & tooling hygiene
-  T2  remove Haiku / chrome-in-chrome apply path
-  T5  characterization tests for _get_profile_value / field matching
-  T8  DB indexes + WAL
-  T12 trim Dagster
+Wave 1 — DONE:
+  T1 T2 T5 T8 T12
+
+Wave 2a (parallel, in progress):
+  T6  narrow search keywords
+  T9  DB schema modernization       (needs: T8 ✓)
+  T13 config.py model config         (needs: T1 ✓)
 
 Wave 2 (after wave 1 merges):
   T3  log/artifact rotation + move analysis/ out of tree      (needs: T1)
@@ -210,6 +222,26 @@ The SDA lineage assets produce a graph nothing consumes.
 ## T16a / T16b — Phase 4 (shape TBD by T15)
 
 Ticket written after T15 reports. **16a (go):** browser-use = OffsiteApply primary, fallback to a *lightly* decomposed `_llm_guided_apply` (5 seams: `page_snapshot` / `decide_action` / `execute_action` / `detect_terminal_state` / `handle_auth`), triggers = {error|timeout|max-steps w/o verified submission} ∪ {NIM 429 after N retries} ∪ {claimed success but `verify_submission` false}; retire `ScriptApplyEngine`. **16b (no-go):** full decomposition of `_llm_guided_apply` as primary; browser-use shelved; retire `ScriptApplyEngine`.
+
+---
+
+## T19 — Auto-run pending DB migrations on startup
+
+**Phase:** P3 · **Risk:** low · **Deps:** T8, T9 · Raised by log-bug-detector during Wave 1 QA.
+
+T8's indexes + WAL and T9's schema changes only take effect when the operator manually runs the migration scripts. For an unattended agent that's a footgun. Add a lightweight "run all `scripts/migrations/NNN_*.py` that haven't been applied" step to `apply_jobs.py` startup (and/or a Dagster op), tracked via a `schema_migrations(id TEXT PRIMARY KEY, applied_at INTEGER)` table. Each migration is already idempotent, so worst case is a fast no-op.
+
+**Acceptance:** a fresh checkout + first `apply_jobs.py` run leaves `linkedin_jobs.db` fully migrated with no manual step.
+
+---
+
+## T20 — Pin `ruff` into the interpreter that runs the agent
+
+**Phase:** P3 · **Risk:** trivial · **Deps:** T1 · Raised by log-bug-detector during Wave 1 QA.
+
+`ruff` is in `[project.optional-dependencies].dev` but the `/opt/anaconda3/bin/python` env that actually runs the agent doesn't have it, so `ruff check .` only works in a fresh venv. Either document that lint runs in the venv, add a `make lint` / `scripts/lint.sh` that bootstraps it, or install it into the anaconda env and note that in `CLAUDE.md`.
+
+**Acceptance:** `ruff check .` runs from the documented dev setup with one obvious command.
 
 ---
 
