@@ -7,6 +7,9 @@ name = "linkedin-job-scraper"
 version = "0.1.0"
 description = "LinkedIn Job Scraper with Dagster integration"
 authors = [{name = "LinkedIn Job Scraper Contributors"}]
+requires-python = ">=3.11"
+# This list is the single source of truth for runtime dependencies.
+# requirements.txt only points back here (`-e .[dev]`).
 dependencies = [
     "selenium>=4.14.0",
     "requests>=2.31.0",
@@ -17,13 +20,36 @@ dependencies = [
     "wordcloud>=1.8.2",
     "dagster>=1.12.18",
     "dagster-webserver>=1.12.18",
+    "playwright>=1.44.0",
+    "httpx>=0.27.0",
+    "openai>=1.0.0",  # deprecated: removed in Phase 2 (T14)
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.0"]
+dev = ["pytest>=7.0", "ruff"]
 
 [tool.dagster]
 module_name = "scripts.definitions"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+# Flat layout with several top-level modules alongside the `scripts` package —
+# setuptools auto-discovery can't handle that, so state it explicitly.
+[tool.setuptools]
+packages = ["scripts"]
+py-modules = [
+    "apply_jobs",
+    "linkedin_apply",
+    "script_engine",
+    "search_retriever",
+    "details_retriever",
+    "to_csv",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
