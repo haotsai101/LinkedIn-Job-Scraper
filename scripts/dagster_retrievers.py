@@ -32,6 +32,7 @@ from scripts.create_db import create_tables
 from scripts.database_scripts import insert_job_postings, insert_data
 from scripts.fetch import JobSearchRetriever, JobDetailRetriever
 from scripts.helpers import clean_job_postings
+from scripts.search_config import SEARCH_KEYWORDS
 
 logger = get_dagster_logger()
 
@@ -40,16 +41,28 @@ logger = get_dagster_logger()
 # ============================================================================
 
 
-@op(config_schema={"keywords": str, "pages_to_fetch": int})
+@op(
+    config_schema={
+        "keywords": Field(
+            str,
+            default_value=SEARCH_KEYWORDS,
+            description="LinkedIn Voyager search query. Defaults to the shared "
+            "SEARCH_KEYWORDS constant in scripts/search_config.py.",
+        ),
+        "pages_to_fetch": Field(
+            Int, default_value=5, description="Number of result pages to fetch."
+        ),
+    }
+)
 def search_jobs_op(context) -> dict:
     """
     Search for LinkedIn jobs and insert new ones into database.
-    
+
     Config:
-        keywords: Search keywords (default: "software data")
-        pages_to_fetch: Number of pages to search (default: 1)
+        keywords: Search keywords (default: shared SEARCH_KEYWORDS)
+        pages_to_fetch: Number of pages to search (default: 5)
     """
-    keywords = context.op_config.get("keywords", "software data")
+    keywords = context.op_config.get("keywords", SEARCH_KEYWORDS)
     pages_to_fetch = context.op_config.get("pages_to_fetch", 5)
     
     conn = sqlite3.connect("linkedin_jobs.db")
