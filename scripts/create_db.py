@@ -163,4 +163,34 @@ def create_tables(conn, cursor):
 
 
     conn.commit()
+
+    create_indexes(conn, cursor)
+    enable_wal(conn, cursor)
+
     return True
+
+
+# Index / PRAGMA statements shared by create_tables and scripts/migrations/001_indexes.py.
+# Keep this list in sync with that migration.
+INDEX_STATEMENTS = (
+    "CREATE INDEX IF NOT EXISTS idx_jobs_pending ON jobs(applied, scraped)",
+    "CREATE INDEX IF NOT EXISTS idx_jobs_company ON jobs(company_id)",
+    "CREATE INDEX IF NOT EXISTS idx_jobs_listed ON jobs(original_listed_time DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_jobs_apptype ON jobs(application_type)",
+)
+
+
+def create_indexes(conn, cursor):
+    """Create the secondary indexes that back the apply-agent's hot pending-jobs
+    query. Additive and idempotent (CREATE INDEX IF NOT EXISTS)."""
+    for stmt in INDEX_STATEMENTS:
+        cursor.execute(stmt)
+    conn.commit()
+    return True
+
+
+def enable_wal(conn, cursor):
+    """Switch the database to WAL journal mode (persists on the DB file).
+    Must run outside an open transaction, hence the commit in create_indexes."""
+    mode = cursor.execute("PRAGMA journal_mode=WAL").fetchone()
+    return mode[0] if mode else None
