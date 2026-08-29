@@ -94,6 +94,13 @@ def test_legacy_alias_fallback(monkeypatch):
     assert cfg.base_url == "https://legacy.test/v1"
 
 
+def test_browser_use_legacy_model_alias(monkeypatch):
+    monkeypatch.setenv("BROWSER_LLM_MODEL", "x")
+    with pytest.warns(DeprecationWarning):
+        cfg = config.get_llm_config("browser_use")
+    assert cfg.model == "x"
+
+
 def test_canonical_wins_over_legacy(monkeypatch):
     monkeypatch.setenv("BROWSER_USE_MODEL", "new/model")
     monkeypatch.setenv("BROWSER_LLM_MODEL", "old/model")

@@ -42,6 +42,7 @@ _NIM_BASE_URL = "https://integrate.api.nvidia.com/v1"
 # role -> resolved defaults when no env var (new or legacy) is set
 _DEFAULTS: dict[str, dict[str, Optional[str]]] = {
     "classifier": {"model": "meta/llama-3.1-8b-instruct", "base_url": _NIM_BASE_URL},
+    # deepseek-ai/deepseek-v4-flash-0731: verified on build.nvidia.com NIM catalog, 2026-08
     "browser_use": {"model": "deepseek-ai/deepseek-v4-flash-0731", "base_url": _NIM_BASE_URL},
     "guided_apply": {"model": "claude-sonnet-5", "base_url": None},
 }
@@ -69,15 +70,15 @@ _ENV_LOADED = False
 
 # ── .env loading ───────────────────────────────────────────────────────────────
 
-def _load_dotenv(path: str = ".env") -> None:
-    """Populate ``os.environ`` from a ``.env`` file, without overriding existing
+def _load_dotenv() -> None:
+    """Populate ``os.environ`` from ``./.env``, without overriding existing
     values. Runs at most once per process. Mirrors ``apply_jobs.load_env``."""
     global _ENV_LOADED
     if _ENV_LOADED:
         return
     _ENV_LOADED = True
 
-    env_file = Path(path)
+    env_file = Path(".env")
     if not env_file.exists():
         return
     for raw in env_file.read_text().splitlines():
@@ -96,6 +97,11 @@ class LLMConfig:
 
     ``api_key`` and ``base_url`` are ``None`` for the ``guided_apply`` role,
     which runs through the Claude Agent SDK with no explicit endpoint.
+    ``api_key`` is also ``None`` for ``classifier`` / ``browser_use`` whenever
+    no key env var is set (there is a default ``model`` and ``base_url``, but no
+    default key). T14 callers must check ``api_key is not None`` before
+    constructing an OpenAI-compatible client and surface a clear error
+    otherwise.
     """
 
     model: str
