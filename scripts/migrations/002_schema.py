@@ -24,6 +24,11 @@ Re-running this migration is a no-op: the column check is guarded, the backfill
 only touches ``listed_epoch IS NULL`` rows, the index swap + ANALYZE are
 unconditional but cheap, and the seed uses ``INSERT OR IGNORE``.
 
+The canonical runtime version of this logic now lives in
+``scripts.create_db.ensure_schema_current`` (invoked by ``create_tables`` and the
+apply path). This migration is kept as a standalone, individually-runnable script
+with verbose reporting; the two are intentionally independent and both idempotent.
+
 Usage:
     python scripts/migrations/002_schema.py [path/to/linkedin_jobs.db]
 """

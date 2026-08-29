@@ -25,7 +25,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 import apply_jobs  # noqa: E402
-from scripts.create_db import create_tables  # noqa: E402
+from scripts.create_db import BLOCKED_ENTITIES_SEED, create_tables  # noqa: E402
 
 
 def _load_migration_002():
@@ -179,6 +179,93 @@ def test_hot_path_query_plan_has_no_temp_btree(conn):
     plan_text = " ".join(row[-1] for row in plan)
     assert "TEMP B-TREE" not in plan_text, plan_text
     assert "idx_jobs_listed" in plan_text, plan_text
+
+
+def test_create_tables_is_migration_safe_on_pre_002_db(tmp_path):
+    """T23 regression: create_tables() must migrate an existing pre-002 ``jobs``
+    table in place.
+
+    T9 pointed ``idx_jobs_listed`` at ``jobs(applied, listed_epoch DESC)`` but
+    ``CREATE TABLE IF NOT EXISTS jobs`` is a no-op on an existing table, so
+    ``listed_epoch`` never got added before ``create_indexes()`` ran ->
+    ``OperationalError: no such column: listed_epoch`` on every
+    ``search_retriever`` / ``details_retriever`` / Dagster op import.
+    """
+    db = tmp_path / "pre002.db"
+    conn = sqlite3.connect(str(db))
+    # Hand-written pre-002 schema: no listed_epoch column, no blocked_entities
+    # table, idx_jobs_listed still on the old TEXT column.
+    conn.execute(
+        "CREATE TABLE jobs (job_id INTEGER PRIMARY KEY, scraped INTEGER NOT NULL DEFAULT 0, "
+        "company_id INTEGER, application_type TEXT, remote_allowed INTEGER, location TEXT, "
+        "applied INTEGER DEFAULT NULL, original_listed_time TEXT, listed_time TEXT)"
+    )
+    conn.execute("CREATE INDEX idx_jobs_listed ON jobs(original_listed_time DESC)")
+    conn.executemany(
+        "INSERT INTO jobs (job_id, scraped, original_listed_time) VALUES (?, 1, ?)",
+        [(1, "1718939799000"), (2, "1700000000")],
+    )
+    conn.commit()
+
+    # Must not raise.
+    create_tables(conn, conn.cursor())
+
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(jobs)").fetchall()}
+    assert "listed_epoch" in cols
+
+    epochs = dict(conn.execute("SELECT job_id, listed_epoch FROM jobs").fetchall())
+    assert epochs[1] == 1718939799   # 13-digit epoch-millis / 1000
+    assert epochs[2] == 1700000000   # already epoch-seconds
+
+    seeded = conn.execute("SELECT COUNT(*) FROM blocked_entities").fetchone()[0]
+    assert seeded >= len(BLOCKED_ENTITIES_SEED)
+
+    idx_sql = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_jobs_listed'"
+    ).fetchone()[0]
+    assert "listed_epoch" in idx_sql and "applied" in idx_sql
+
+    # Second call is a pure no-op and must not raise.
+    create_tables(conn, conn.cursor())
+    conn.close()
+
+
+def test_ensure_schema_current_skips_analyze_when_already_current(tmp_path):
+    """ensure_schema_current() must not ANALYZE on a database that is already
+    current — that write-lock used to hit every retriever startup (T23)."""
+    import scripts.create_db as cdb
+
+    db = tmp_path / "fresh.db"
+    conn = sqlite3.connect(str(db))
+    create_tables(conn, conn.cursor())          # first call migrates + builds
+    conn.commit()
+
+    executed: list[str] = []
+
+    class RecordingCursor:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def execute(self, sql, *a):
+            executed.append(sql)
+            return self._inner.execute(sql, *a)
+
+        def executemany(self, sql, seq):
+            executed.append(sql)
+            return self._inner.executemany(sql, seq)
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+    # Second call on an already-current DB: no schema change -> no ANALYZE, no
+    # backfill UPDATE, no index rebuild.
+    changed = cdb.ensure_schema_current(conn, RecordingCursor(conn.cursor()))
+    assert changed is False
+    upper = [s.strip().upper() for s in executed]
+    assert not any(s.startswith("ANALYZE") for s in upper)
+    assert not any(s.startswith("UPDATE JOBS SET LISTED_EPOCH") for s in upper)
+    assert not any(s.startswith("CREATE INDEX") for s in upper)
+    conn.close()
 
 
 def test_migration_002_backfill_and_idempotency(tmp_path):

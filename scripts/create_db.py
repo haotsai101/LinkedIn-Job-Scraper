@@ -203,11 +203,99 @@ def create_tables(conn, cursor):
 
     conn.commit()
 
-    seed_blocked_entities(conn, cursor)
+    # ``CREATE TABLE IF NOT EXISTS jobs`` above is a no-op on a database whose
+    # ``jobs`` table predates a later column (e.g. ``listed_epoch``, T9). Bring
+    # such a database up to the current schema *before* create_indexes() runs —
+    # otherwise ``CREATE INDEX ... ON jobs(applied, listed_epoch DESC)`` fails
+    # with ``no such column: listed_epoch`` (T23 regression fix).
+    ensure_schema_current(conn, cursor)
     create_indexes(conn, cursor)
     enable_wal(conn, cursor)
 
     return True
+
+
+def _index_sql(cursor, name: str):
+    """Return the stored ``CREATE INDEX`` SQL for ``name``, or ``None``."""
+    row = cursor.execute(
+        "SELECT sql FROM sqlite_master WHERE type='index' AND name=?", (name,)
+    ).fetchone()
+    return row[0] if row else None
+
+
+def ensure_schema_current(conn, cursor):
+    """Bring an existing database up to the current schema baseline.
+
+    This is the **one** home for schema-modernization logic. It is invoked by
+    ``create_tables()`` (every retriever / Dagster op entry point) and, via a thin
+    wrapper, by ``apply_jobs._ensure_apply_schema`` (the apply path). The
+    standalone migrations in ``scripts/migrations/`` predate this consolidation
+    and keep their own copies for detailed logging / offline use.
+
+    Idempotent and cheap — on an already-current database every step is a no-op
+    (the backfill is gated behind a ``LIMIT 1`` probe, and index rebuild +
+    ``ANALYZE`` run only when something changed).
+    Steps:
+      1. ``blocked_entities`` table + seed rows (``INSERT OR IGNORE``).
+      2. ``jobs.listed_epoch INTEGER`` added if absent; the shared
+         ``LISTED_EPOCH_BACKFILL_SQL`` runs only when the column was just added
+         or a probe finds ``listed_epoch IS NULL`` rows still outstanding.
+      3. A stale ``idx_jobs_listed`` (built on the old TEXT
+         ``original_listed_time`` column) is dropped.
+      4. On an actual schema change only: ``create_indexes()`` rebuilds every
+         secondary index (``CREATE INDEX IF NOT EXISTS`` — so ``idx_jobs_listed``
+         comes back on ``jobs(applied, listed_epoch DESC)`` even for callers that
+         never go through ``create_tables()``), then ``ANALYZE`` refreshes
+         planner stats. Neither runs on an already-current DB, so this is not a
+         write lock on every retriever startup.
+
+    Returns ``True`` if a schema change was applied this call, else ``False``.
+    """
+    schema_changed = False
+
+    # ── 1. blocked_entities table + seed ─────────────────────────────────────
+    cursor.execute(BLOCKED_ENTITIES_DDL)
+    cursor.executemany(
+        "INSERT OR IGNORE INTO blocked_entities (kind, pattern, reason) VALUES (?, ?, ?)",
+        BLOCKED_ENTITIES_SEED,
+    )
+
+    # ── 2. jobs.listed_epoch column + backfill ───────────────────────────────
+    # The backfill (``UPDATE ... WHERE listed_epoch IS NULL``) must NOT run
+    # unconditionally: rows whose timestamps are permanently unparseable stay
+    # NULL and keep matching that predicate, so an unguarded call would take a
+    # write lock and full-scan on every retriever / Dagster startup. Run it only
+    # when the column was just added, or when a cheap ``LIMIT 1`` probe shows
+    # there is still work to do.
+    cols = {row[1] for row in cursor.execute("PRAGMA table_info(jobs)").fetchall()}
+    if "listed_epoch" not in cols:
+        cursor.execute("ALTER TABLE jobs ADD COLUMN listed_epoch INTEGER")
+        schema_changed = True
+        cursor.execute(LISTED_EPOCH_BACKFILL_SQL)
+    elif cursor.execute(
+        "SELECT 1 FROM jobs WHERE listed_epoch IS NULL LIMIT 1"
+    ).fetchone():
+        cursor.execute(LISTED_EPOCH_BACKFILL_SQL)
+
+    # ── 3. drop a stale idx_jobs_listed so it is rebuilt on the new shape ────
+    stale = _index_sql(cursor, "idx_jobs_listed")
+    if stale is not None and "listed_epoch" not in stale:
+        cursor.execute("DROP INDEX IF EXISTS idx_jobs_listed")
+        schema_changed = True
+
+    conn.commit()
+
+    # ── 4. on an actual schema change: (re)build indexes + refresh stats ────
+    # Recreating the indexes here (not just in create_tables) is what makes this
+    # the single home for schema modernization — an apply-only clone that never
+    # runs a retriever still ends up with idx_jobs_listed on the new shape, so
+    # get_pending_jobs's _has_index() check is a safety net, not load-bearing.
+    if schema_changed:
+        create_indexes(conn, cursor)   # CREATE INDEX IF NOT EXISTS — idempotent
+        cursor.execute("ANALYZE")
+        conn.commit()
+
+    return schema_changed
 
 
 # Secondary indexes backing the apply-agent's hot get_pending_jobs query.
@@ -247,7 +335,8 @@ def _epoch_case(col: str) -> str:
 # Backfill jobs.listed_epoch from original_listed_time, falling back to
 # listed_time. Only touches rows where listed_epoch IS NULL, so it is safe to
 # re-run. Shared by scripts/migrations/002_schema.py and
-# apply_jobs._ensure_apply_schema.
+# ensure_schema_current() (which the apply path calls via
+# apply_jobs._ensure_apply_schema).
 LISTED_EPOCH_BACKFILL_SQL = (
     "UPDATE jobs SET listed_epoch = CASE "
     + _epoch_case("original_listed_time")
@@ -259,13 +348,16 @@ LISTED_EPOCH_BACKFILL_SQL = (
 
 def create_indexes(conn, cursor):
     """Create the secondary indexes that back the apply-agent's hot pending-jobs
-    query. Additive and idempotent (CREATE INDEX IF NOT EXISTS). Runs ANALYZE so
-    the planner has the stats to choose idx_jobs_listed for the ORDER BY rather
-    than falling back to a TEMP B-TREE sort."""
+    query. Additive and idempotent (CREATE INDEX IF NOT EXISTS).
+
+    Does **not** run ANALYZE — that took a write lock on every
+    ``search_retriever`` / ``details_retriever`` startup (T23). ``ANALYZE`` now
+    runs only in ``ensure_schema_current()`` right after an actual schema change,
+    and in the standalone migrations. Callers that need the ``jobs`` table to
+    exist first should go through ``create_tables()``, which invokes
+    ``ensure_schema_current()`` before this function."""
     for stmt in INDEX_STATEMENTS.values():
         cursor.execute(stmt)
-    conn.commit()
-    cursor.execute("ANALYZE")
     conn.commit()
     return True
 

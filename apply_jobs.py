@@ -60,12 +60,7 @@ from playwright.async_api import async_playwright
 from common import extract_json_object, strip_code_fence
 from common import write_llm_log as _write_llm_log
 from linkedin_apply import EasyApplyFlow, OffsiteApplyFlow, _get_profile_value, _session_llm_state
-from scripts.create_db import (
-    BLOCKED_ENTITIES_DDL,
-    BLOCKED_ENTITIES_SEED,
-    INDEX_STATEMENTS,
-    LISTED_EPOCH_BACKFILL_SQL,
-)
+from scripts.create_db import BLOCKED_ENTITIES_SEED, ensure_schema_current
 
 sys.stdout.reconfigure(line_buffering=True)
 
@@ -633,33 +628,22 @@ def migrate_db(conn, cursor):
 
 
 def _ensure_apply_schema(cursor):
-    """Bring an apply-agent DB up to the T9 baseline. Idempotent + cheap.
+    """Bring an apply-agent DB up to the current schema baseline. Idempotent + cheap.
 
-    ``get_pending_jobs`` sorts on ``jobs.listed_epoch`` and filters against the
-    ``blocked_entities`` table — both introduced by
-    scripts/migrations/002_schema.py. This guard lets the function also work on a
-    database that has not had that migration run yet, and on the bare fixtures
-    used by tests. When the schema is already current every check below is a
-    no-op. Seed / DDL come from scripts.create_db (bound params — never
-    interpolated).
+    Thin wrapper: the canonical schema-modernization logic now lives in
+    ``scripts.create_db.ensure_schema_current`` (T23 — killed the dual
+    implementation that used to live here). Kept as a named function because
+    ``get_pending_jobs`` and the tests reference it.
+
+    ``ensure_schema_current`` adds ``jobs.listed_epoch`` + backfills, creates and
+    seeds ``blocked_entities``, and — when it changed the schema — rebuilds every
+    secondary index (so ``idx_jobs_listed`` lands on ``(applied, listed_epoch
+    DESC)`` even on an apply-only clone that never runs a retriever). That makes
+    the ``_has_index`` check in ``get_pending_jobs`` a safety net rather than
+    load-bearing.
     """
     # TODO(T19): consolidate with the startup auto-migrator
-    cursor.execute(BLOCKED_ENTITIES_DDL)
-    cursor.executemany(
-        "INSERT OR IGNORE INTO blocked_entities (kind, pattern, reason) VALUES (?, ?, ?)",
-        BLOCKED_ENTITIES_SEED,
-    )
-
-    cols = {row[1] for row in cursor.execute("PRAGMA table_info(jobs)").fetchall()}
-    if "listed_epoch" not in cols:
-        cursor.execute("ALTER TABLE jobs ADD COLUMN listed_epoch INTEGER")
-        cursor.execute(LISTED_EPOCH_BACKFILL_SQL)
-        cursor.execute("DROP INDEX IF EXISTS idx_jobs_listed")
-        cursor.execute(INDEX_STATEMENTS["idx_jobs_listed"])
-        cursor.execute("ANALYZE")
-        print("DB migrated: added 'listed_epoch' column + rebuilt idx_jobs_listed.")
-
-    cursor.connection.commit()
+    ensure_schema_current(cursor.connection, cursor)
 
 
 def _has_index(cursor, name: str) -> bool:
