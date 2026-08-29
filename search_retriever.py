@@ -1,6 +1,7 @@
 from scripts.create_db import create_tables
 from scripts.database_scripts import insert_job_postings
 from scripts.fetch import JobSearchRetriever
+from scripts.search_config import SEARCH_KEYWORDS
 import sqlite3
 import time
 from collections import deque
@@ -17,7 +18,7 @@ cursor = conn.cursor()
 create_tables(conn, cursor)
 
 
-KEYWORDS = "software engineer AI ML"
+KEYWORDS = SEARCH_KEYWORDS  # single source of truth: scripts/search_config.py
 TARGET = 100  # stop after this many new jobs are inserted; set to None to run forever
 
 # Remote (workplaceType:2) and Utah (geoId:102095887) — run two passes alternating

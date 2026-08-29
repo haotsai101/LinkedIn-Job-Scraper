@@ -5,7 +5,7 @@ description: "Run the LinkedIn job search scraper to discover new job postings a
 
 # /search-jobs
 
-Runs `search_retriever.py` to scrape LinkedIn for new job postings (keywords: software engineer AI ML, locations: remote + Utah) and inserts them into `linkedin_jobs.db`. All output is logged to `logs/search_jobs.log`.
+Runs `search_retriever.py` to scrape LinkedIn for new job postings (search query defined by `SEARCH_KEYWORDS` in `scripts/search_config.py`, locations: remote + Utah) and inserts them into `linkedin_jobs.db`. All output is logged to `logs/search_jobs.log`.
 
 ## Usage
 
