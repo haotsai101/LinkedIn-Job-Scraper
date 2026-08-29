@@ -52,6 +52,7 @@ from email.mime.text import MIMEText
 from pathlib import Path
 
 import httpx
+import subprocess
 
 from openai import OpenAI, AsyncOpenAI
 from playwright.async_api import async_playwright
@@ -62,7 +63,7 @@ sys.stdout.reconfigure(line_buffering=True)
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 
-DB_PATH      = "linkedin_jobs.db"
+DB_PATH      = str(Path(__file__).parent / "linkedin_jobs.db")
 
 # Companies to permanently skip (case-insensitive substring match on company name)
 BLOCKED_COMPANIES = {
@@ -518,8 +519,8 @@ def search_accounts(query: str) -> list[dict]:
 # ── LLM classifier ─────────────────────────────────────────────────────────────
 
 class JobAgent:
-    _SYSTEM = """/no_think
-You are a job application assistant helping the user review LinkedIn job listings.
+    _MODEL = "claude-haiku-4-5"
+    _SYSTEM = """You are a job application assistant helping the user review LinkedIn job listings.
 
 User profile:
 {profile}
@@ -527,9 +528,7 @@ User profile:
 Classify whether a job is relevant (software engineering, AI/ML, data engineering/science/analytics).
 Be accurate and concise. Never fabricate information not in the user's profile."""
 
-    def __init__(self, client: OpenAI, model: str, profile: dict):
-        self.client  = client
-        self.model   = model
+    def __init__(self, profile: dict):
         self._system = self._SYSTEM.format(profile=json.dumps(profile, indent=2))
 
     # Keyword patterns that unambiguously require US citizenship — checked before LLM call
@@ -575,22 +574,28 @@ Be accurate and concise. Never fabricate information not in the user's profile."
             f"Description:\n{desc[:3000]}\n\n"
             'Respond with JSON: {"relevant": true|false, "reason": "<one sentence>", "citizenship_required": true|false}'
         )
-        messages = [
-            {"role": "system", "content": self._system},
-            {"role": "user", "content": prompt},
-        ]
         for attempt in range(3):
             try:
                 _t0 = time.monotonic()
-                resp = self.client.chat.completions.create(
-                    model=self.model,
-                    messages=messages,
-                    response_format={"type": "json_object"},
-                    max_tokens=300,
-                    timeout=60,
+                proc = subprocess.run(
+                    ["claude", "--model", self._MODEL, "-p",
+                     self._system + "\n\n" + prompt],
+                    capture_output=True,
+                    text=True,
+                    timeout=90,
                 )
                 _call_ms = int((time.monotonic() - _t0) * 1000)
-                raw = resp.choices[0].message.content
+                if proc.returncode != 0:
+                    raise RuntimeError(f"claude exited {proc.returncode}: {proc.stderr[:200]}")
+                raw = proc.stdout.strip()
+                if raw.startswith("```"):
+                    raw = re.sub(r"^```(?:json)?\s*\n?", "", raw)
+                    raw = re.sub(r"\n?```\s*$", "", raw).strip()
+                # Extract just the JSON object — Haiku may prepend/append prose
+                _start = raw.find("{")
+                _end   = raw.rfind("}") + 1
+                if _start != -1 and _end > _start:
+                    raw = raw[_start:_end]
                 data = json.loads(raw)
                 relevant = bool(data.get("relevant"))
                 reason   = data.get("reason", "")
@@ -608,7 +613,7 @@ Be accurate and concise. Never fabricate information not in the user's profile."
                 _write_llm_log({
                     "ts":           datetime.now(timezone.utc).isoformat(),
                     "type":         "classifier",
-                    "model":        self.model,
+                    "model":        self._MODEL,
                     "duration_ms":  _call_ms,
                     "title":        title,
                     "prompt":       prompt,
@@ -616,22 +621,14 @@ Be accurate and concise. Never fabricate information not in the user's profile."
                     "result":       {"relevant": relevant, "reason": reason, "citizenship_required": citizenship_required},
                 })
                 return relevant, reason, citizenship_required
-            except Exception as exc:
-                exc_str = str(exc)
-                is_timeout = "timeout" in exc_str.lower() or "timed out" in exc_str.lower()
-                if ("429" in exc_str or "503" in exc_str or is_timeout) and attempt < 2:
-                    wait = 10 * (2 ** attempt)  # 10s, 20s
-                    if "429" in exc_str:
-                        code = "429"
-                    elif is_timeout:
-                        code = "timeout"
-                    else:
-                        code = "503"
-                    print(f"\n  [rate limit] {code} — waiting {wait}s before retry…", end="", flush=True)
-                    time.sleep(wait)
+            except subprocess.TimeoutExpired:
+                if attempt < 2:
+                    print(f"\n  [classifier] subprocess timeout — retrying…", end="", flush=True)
+                    time.sleep(5)
                     print(" retrying.")
                     continue
-                # All retries exhausted or non-transient error
+                raise
+            except Exception:
                 raise
 
 
@@ -663,7 +660,9 @@ def get_pending_jobs(cursor, limit=None, apply_type=None, include_failed=False):
         SELECT j.job_id, j.title, j.job_posting_url, j.location,
                j.formatted_experience_level, j.description,
                COALESCE(c.name, '') AS company_name,
-               j.application_type
+               j.application_type,
+               COALESCE(j.posting_domain, '') AS posting_domain,
+               COALESCE(j.application_url, '') AS application_url
         FROM jobs j
         LEFT JOIN companies c ON j.company_id = c.company_id
         WHERE j.scraped > 0
@@ -812,13 +811,14 @@ async def run_session(
     classifier_model: str = "",
     verbose: bool = False,
 ):
+    agent = JobAgent(profile)
+
     classifier_client = OpenAI(
         api_key=classifier_api_key or api_key,
         base_url=classifier_url or base_url,
         timeout=httpx.Timeout(90.0),  # 90s wall-clock per request
     )
     _classifier_model = classifier_model or model
-    agent = JobAgent(classifier_client, _classifier_model, profile)
 
     inbox = EmailInbox(gmail_user, gmail_pass) if gmail_user and gmail_pass else None
 
@@ -849,7 +849,13 @@ async def run_session(
     _session_llm_state["timeout_streak"] = 0
     _session_llm_state["model_switched"] = False
 
-    print("\nOpening browser and signing into LinkedIn…")
+    # Skip LinkedIn login when every job in the queue is OffsiteApply —
+    # those jobs navigate directly to the company ATS via application_url.
+    _all_offsite = all(row[7] == "OffsiteApply" for row in jobs)
+    if _all_offsite:
+        print("\nOpening browser (OffsiteApply only — skipping LinkedIn login)…")
+    else:
+        print("\nOpening browser and signing into LinkedIn…")
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=False)
@@ -858,12 +864,15 @@ async def run_session(
         )
         page    = await context.new_page()
 
-        try:
-            await login_linkedin_playwright(page)
+        if not _all_offsite:
+            try:
+                await login_linkedin_playwright(page)
+                print("  Session ready.\n")
+            except Exception as _login_err:
+                await browser.close()
+                raise
+        else:
             print("  Session ready.\n")
-        except Exception as _login_err:
-            await browser.close()
-            raise
 
         if not _check_recent_session_health():
             print("\n  [!] Warning: the last 3 sessions all had >80% error rates.")
@@ -871,7 +880,7 @@ async def run_session(
 
         try:
             for idx, row in enumerate(jobs, 1):
-                job_id, title, job_url, location, exp_level, description, company_name, application_type = row
+                job_id, title, job_url, location, exp_level, description, company_name, application_type, posting_domain, application_url = row
                 url = job_url or f"https://www.linkedin.com/jobs/view/{job_id}/"
 
                 print(f"\n{'─' * 64}")
@@ -977,6 +986,29 @@ async def run_session(
                 print("  Applying via Playwright…")
 
                 if (application_type or "") == "OffsiteApply":
+                    # Skip known spam/aggregator domains before opening any browser tab
+                    _OFFSITE_SPAM = (
+                        # Pure spam / aggregator job boards
+                        "jobright.ai", "sundayy.com", "scale.jobs", "dice.com",
+                        "mercor.com", "remotehunter.com", "haystack.cv", "talentally.com",
+                        "micro1.ai", "tenex.ai", "bestjobtool.com", "fetchjobs.co",
+                        "alignerr.com", "app.dataannotation.tech",
+                        "theladders.com", "hiresome.ai",
+                        # Assessment / crossover platforms — not real direct-hire jobs
+                        "ed.crossover.com", "crossover.com",
+                        # Greenhouse generic redirect boards — reCAPTCHA required, no real form
+                        "job-boards.greenhouse.io", "boards.greenhouse.io", "grnh.se",
+                        # Recruiter broker / broken stub sites
+                        "peakperformers.org", "work.mercor.com", "rex.zone",
+                        "motionrecruitment.com", "hirecrap.com",
+                        "codevertexinnovations.com",                # Scam site
+                    )
+                    _pd = (posting_domain or "").lower().strip()
+                    if _pd and any(_pd == d or _pd.endswith("." + d) for d in _OFFSITE_SPAM):
+                        print(f"  [LLM] Spam/aggregator domain ({_pd}) — skipping")
+                        mark_job(conn, cursor, job_id, -1)
+                        skipped_count += 1
+                        continue
                     flow = OffsiteApplyFlow(
                         page=page,
                         context=context,
@@ -994,6 +1026,7 @@ async def run_session(
                         verbose=verbose,
                         inbox=inbox,
                         fallback_model=browser_llm_fallback,
+                        application_url=application_url or "",
                     )
                 else:
                     flow = EasyApplyFlow(
@@ -1036,8 +1069,10 @@ async def run_session(
                         job_description=description or "",
                         classifier_client=classifier_client,
                         classifier_model=_classifier_model,
+                        verbose=verbose,
                         inbox=inbox,
                         fallback_model=browser_llm_fallback,
+                        application_url=application_url or "",
                     )
                     try:
                         status = await asyncio.wait_for(flow.run(url), timeout=600)
@@ -1099,32 +1134,81 @@ async def run_session(
                         print(f"  [!] Apply failed: {title or 'Unknown'}")
                         print(f"  Browser tab is still open — you can interact manually.")
                         print(f"{'═' * 64}")
-                        try:
-                            fail_choice = input(
-                                "  [m] = I applied manually   [ENTER] = auto-fail   [s] = skip\n"
-                                "  > "
-                            ).strip().lower()
-                        except (EOFError, KeyboardInterrupt):
-                            fail_choice = ""
-                        if fail_choice == "m":
-                            mark_job(conn, cursor, job_id, 1)
-                            applied_count += 1
-                            applications.append({
-                                "job_id":     job_id,
-                                "title":      title or "",
-                                "company":    company_name or "",
-                                "url":        url,
-                                "applied_at": datetime.now(timezone.utc).isoformat(),
-                            })
-                            print("  [~] Marked as manually applied.")
-                        elif fail_choice in ("s", "skip"):
-                            mark_job(conn, cursor, job_id, -1)
-                            skipped_count += 1
-                            print("  [-] Skipped.")
-                        else:
-                            mark_job(conn, cursor, job_id, -2)
-                            error_count += 1
-                            print("  [!] Marked as auto-failed.")
+                        while True:
+                            try:
+                                fail_choice = input(
+                                    "  [r] = retry (agent fills form)   [f] = fill focused field   "
+                                    "[m] = I applied manually   [s] = skip   [ENTER] = auto-fail\n"
+                                    "  > "
+                                ).strip().lower()
+                            except (EOFError, KeyboardInterrupt):
+                                fail_choice = ""
+                            if fail_choice == "f":
+                                # Fill the focused field on whichever tab the user is looking at
+                                _active_pg = page
+                                for _pg in context.pages:
+                                    try:
+                                        if not _pg.is_closed() and "linkedin.com" not in _pg.url and _pg.url not in ("", "about:blank"):
+                                            _active_pg = _pg
+                                            break
+                                    except Exception:
+                                        continue
+                                await _llm_fill_focused(_active_pg, browser_llm_client, browser_model, profile)
+                                continue
+                            if fail_choice == "r" and isinstance(flow, OffsiteApplyFlow):
+                                try:
+                                    input("  Navigate to the application form in the browser, then press ENTER…")
+                                except (EOFError, KeyboardInterrupt):
+                                    pass
+                                try:
+                                    status = await asyncio.wait_for(flow.assist_from_page(), timeout=600)
+                                except asyncio.TimeoutError:
+                                    status = "failed"
+                                except Exception as _retry_exc:
+                                    print(f"  [!] Retry error: {_retry_exc}")
+                                    status = "failed"
+                                if status == "applied":
+                                    mark_job(conn, cursor, job_id, 1)
+                                    applied_count += 1
+                                    applications.append({
+                                        "job_id":     job_id,
+                                        "title":      title or "",
+                                        "company":    company_name or "",
+                                        "url":        url,
+                                        "applied_at": datetime.now(timezone.utc).isoformat(),
+                                    })
+                                    print("  [+] Applied!")
+                                    break
+                                elif status in ("skipped", "expired", "no_apply_button"):
+                                    mark_job(conn, cursor, job_id, -1)
+                                    skipped_count += 1
+                                    print("  [-] Skipped.")
+                                    break
+                                else:
+                                    print("  [!] Retry also failed — choose again.")
+                                    continue
+                            elif fail_choice == "m":
+                                mark_job(conn, cursor, job_id, 1)
+                                applied_count += 1
+                                applications.append({
+                                    "job_id":     job_id,
+                                    "title":      title or "",
+                                    "company":    company_name or "",
+                                    "url":        url,
+                                    "applied_at": datetime.now(timezone.utc).isoformat(),
+                                })
+                                print("  [~] Marked as manually applied.")
+                                break
+                            elif fail_choice in ("s", "skip"):
+                                mark_job(conn, cursor, job_id, -1)
+                                skipped_count += 1
+                                print("  [-] Skipped.")
+                                break
+                            else:
+                                mark_job(conn, cursor, job_id, -2)
+                                error_count += 1
+                                print("  [!] Marked as auto-failed.")
+                                break
                     else:
                         mark_job(conn, cursor, job_id, -2)
                         error_count += 1

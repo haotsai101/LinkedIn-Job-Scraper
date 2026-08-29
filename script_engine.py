@@ -14,6 +14,7 @@ import asyncio
 import json
 import os
 import re
+import subprocess
 from datetime import datetime, timezone
 
 from openai import AsyncOpenAI
@@ -21,6 +22,18 @@ from playwright.async_api import Page, BrowserContext
 
 
 _LLM_LOG_PATH = "llm_debug.jsonl"
+
+
+async def _call_claude(prompt: str, model: str = "claude-haiku-4-5", timeout: float = 175) -> str:
+    def _run():
+        proc = subprocess.run(
+            ["claude", "--model", model, "-p", prompt],
+            capture_output=True, text=True, timeout=int(timeout),
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(f"claude exited {proc.returncode}: {proc.stderr[:300]}")
+        return proc.stdout.strip()
+    return await asyncio.to_thread(_run)
 
 
 def _write_llm_log(entry: dict):
@@ -467,15 +480,11 @@ Output the completed script only — no markdown, no explanation."""
     async def _call_llm(self, prompt: str, page_url: str, element_count: int) -> str | None:
         _t0 = datetime.now(timezone.utc)
         try:
-            resp = await asyncio.wait_for(
-                self.client.chat.completions.create(
-                    model=self.model,
-                    messages=[{"role": "user", "content": prompt}],
-                    max_tokens=4096,
-                ),
+            script = await asyncio.wait_for(
+                _call_claude(prompt, model=self.model, timeout=175),
                 timeout=180,
             )
-            script = (resp.choices[0].message.content or "").strip()
+            script = (script or "").strip()
 
             # Strip markdown fences if the LLM added them despite instructions
             script = re.sub(r"^```(?:python)?\s*\n?", "", script)
@@ -492,8 +501,8 @@ Output the completed script only — no markdown, no explanation."""
                 "element_count": element_count,
                 "duration_ms": int((datetime.now(timezone.utc) - _t0).total_seconds() * 1000),
                 "script": script,
-                "input_tokens": getattr(getattr(resp, "usage", None), "prompt_tokens", None),
-                "output_tokens": getattr(getattr(resp, "usage", None), "completion_tokens", None),
+                "input_tokens": None,
+                "output_tokens": None,
             })
 
             return script or None

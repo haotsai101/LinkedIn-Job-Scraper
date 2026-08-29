@@ -10,6 +10,7 @@ import json
 import os
 import random
 import re
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
@@ -25,6 +26,28 @@ _SESSION_TS = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 # Fires (switches self.model to fallback) when streak >= 2. Reset to 0 on any successful
 # LLM response. Reset to initial state at the start of run_session().
 _session_llm_state: dict = {"timeout_streak": 0, "model_switched": False}
+
+
+async def _call_claude(prompt: str, model: str = "claude-haiku-4-5", timeout: float = 85) -> str:
+    """Call the claude CLI as a subprocess and return its stdout. Runs in a thread to stay async."""
+    def _run():
+        proc = subprocess.run(
+            ["claude", "--model", model, "-p", prompt],
+            capture_output=True, text=True, timeout=int(timeout),
+        )
+        if proc.returncode != 0:
+            out = proc.stdout.strip()
+            err = proc.stderr.strip()
+            # If stdout has content despite non-zero exit, use it (claude sometimes exits 1
+            # with the answer still in stdout, e.g. rate-limit warnings on stderr).
+            _bad = ("error", "session limit", "rate limit", "usage limit",
+                    "issue with the selected", "does not exist", "no access",
+                    "invalid model", "model not found")
+            if out and not any(k in out.lower() for k in _bad):
+                return out
+            raise RuntimeError(f"claude exited {proc.returncode}: {err[:200] or out[:200]}")
+        return proc.stdout.strip()
+    return await asyncio.to_thread(_run)
 
 
 def _css_id(el_id: str) -> str:
@@ -52,15 +75,21 @@ async def _human_type(el, value: str):
     await el.click()
     await asyncio.sleep(random.uniform(0.1, 0.3))
     await el.clear()
-    _delay = random.randint(40, 120)
     try:
-        await el.press_sequentially(str(value), delay=_delay)
+        for _ch in str(value):
+            await el.press_sequentially(_ch, delay=0)
+            _r = random.random()
+            if _r < 0.05:
+                await asyncio.sleep(random.uniform(0.35, 0.8))   # rare pause
+            elif _r < 0.20:
+                await asyncio.sleep(random.uniform(0.12, 0.35))  # hesitation
+            else:
+                await asyncio.sleep(random.uniform(0.04, 0.12))  # normal
     except Exception as _ps_exc:
         if "Timeout" in str(_ps_exc) or "timeout" in str(_ps_exc):
-            # Rapid keydown events can stall browser JS handlers on fields with
-            # character-count / autosave listeners.  el.fill() bypasses keyboard
-            # events entirely (JS property set + dispatched input event) and
-            # succeeds where press_sequentially stalls.
+            # character-count / autosave listeners can stall keydown events;
+            # el.fill() bypasses keyboard events entirely and succeeds where
+            # per-char typing stalls.
             print(f"  [fill] press_sequentially timed out — falling back to direct fill()")
             try:
                 await el.fill(str(value))
@@ -459,9 +488,10 @@ def _get_profile_value(profile: dict, label: str, kind: str = "text") -> str | N
         return p.get("country", "United States")
     if "phone" in l or "mobile" in l:
         return p.get("phone")
-    if "linkedin" in l:
+    _is_years_q = any(k in l for k in ("years of", "how many years", "how many months", "years experience"))
+    if "linkedin" in l and not _is_years_q:
         return p.get("linkedin_url")
-    if "github" in l:
+    if "github" in l and not _is_years_q:
         return p.get("github_url")
     if any(k in l for k in ("portfolio", "personal website", "personal site")):
         return p.get("portfolio_url")
@@ -544,12 +574,25 @@ def _get_profile_value(profile: dict, label: str, kind: str = "text") -> str | N
     if any(k in l for k in ("how many years", "how many months")) and kind in ("text", "number"):
         # Default to 0 for technology-specific year questions we can't match
         return "0"
+    # "Are you currently on OPT or STEM OPT?" → Yes if profile work_authorization is OPT/STEM
+    if any(k in l for k in ("opt or stem", "opt/stem", "stem opt", "currently on opt")) \
+            and kind in ("select", "select-one", "radio"):
+        auth = (p.get("work_authorization") or "").upper()
+        return "Yes" if any(x in auth for x in ("OPT", "STEM")) else "No"
     if any(k in l for k in ("sponsor", "sponsorship", "visa support", "work visa")):
         if p.get("need_sponsorship", "").lower() in ("yes", "true", "1"):
             return "Yes"
         auth = (p.get("work_authorization") or "").upper()
         return "Yes" if any(x in auth for x in ("OPT", "H1B", "H-1B", "F1", "TN")) else "No"
     if any(k in l for k in ("authorized to work", "legally authorized", "legal right to work", "eligible to work")):
+        return "Yes"
+    # AI coding tools usage — user actively uses Claude Code, Cursor, Copilot etc.
+    if any(k in l for k in ("ai coding", "ai code", "coding agent", "coding assistant", "copilot", "cursor", "claude code")) \
+            and kind in ("select", "select-one", "radio"):
+        return "Yes"
+    # W2 employment — OPT holders can work on W2
+    if any(k in l for k in ("willing to work on w2", "work on w2", "w2 employment", "w2 contractor", "w2 basis")) \
+            and kind in ("select", "select-one", "radio"):
         return "Yes"
     if any(k in l for k in ("work authorization expire", "authorization expir", "visa expir")):
         return p.get("work_authorization_expiry", "N/A")
@@ -591,6 +634,11 @@ def _get_profile_value(profile: dict, label: str, kind: str = "text") -> str | N
                     "b.s.": "Bachelor's Degree", "bs": "Bachelor's Degree", "b.s": "Bachelor's Degree",
                     "ph.d": "Doctorate", "phd": "Doctorate", "mba": "Master's Degree"}
         return _deg_map.get(deg.lower().strip("."), deg) or "Master's Degree"
+    # "In which year did you complete your master's/bachelor's degree?" → graduation year
+    if "year" in l and any(k in l for k in ("degree", "master", "bachelor", "graduate", "graduated", "complet")):
+        edu = p.get("education", {}) if isinstance(p.get("education"), dict) else {}
+        yr = str(edu.get("year", "")).strip()
+        return yr if yr else None
     if "degree" in l:
         edu = p.get("education", {})
         if kind == "radio":
@@ -771,17 +819,15 @@ async def _ask_llm(llm_client: AsyncOpenAI, model: str, profile: dict, field: di
             "If the profile has no relevant info for a non-select/non-radio non-numeric field, reply with an empty string. "
             "Reply with ONLY the answer value, nothing else."
         )
-    _t = 45 if is_long_form else 30
+    _t = 70 if is_long_form else 50
+    # _call_claude uses the claude CLI which only accepts Anthropic model IDs.
+    # BROWSER_LLM_MODEL is already set to a valid Claude model; fall back to haiku.
+    _claude_model = os.environ.get("BROWSER_LLM_MODEL", "claude-haiku-4-5")
     try:
-        resp = await asyncio.wait_for(
-            llm_client.chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=400 if is_long_form else 100,
-            ),
+        raw_answer = await asyncio.wait_for(
+            _call_claude(prompt, model=_claude_model, timeout=_t - 5),
             timeout=_t,
         )
-        raw_answer = resp.choices[0].message.content
         answer = raw_answer.strip().strip('"').strip("'")
         _write_llm_log({
             "ts":           datetime.now(timezone.utc).isoformat(),
@@ -810,7 +856,15 @@ async def _ask_llm(llm_client: AsyncOpenAI, model: str, profile: dict, field: di
         })
         print(f"  [LLM timeout] Field '{label}' — no answer in {_t}s, skipping.")
         return None
-    except Exception:
+    except Exception as _exc:
+        print(f"  [LLM error] Field '{label}' — {type(_exc).__name__}: {_exc}")
+        _write_llm_log({
+            "ts":        datetime.now(timezone.utc).isoformat(),
+            "type":      "field_fill_error",
+            "model":     model,
+            "field_label": label,
+            "error":     f"{type(_exc).__name__}: {_exc}",
+        })
         return None
 
 
@@ -1477,6 +1531,14 @@ class EasyApplyFlow:
                 else:
                     continue
             value = _get_profile_value(self.profile, label, kind)
+            # If _get_profile_value returned a value that doesn't match any available select option,
+            # discard it and let the LLM decide — prevents numeric years ("4") being used for Yes/No selects.
+            if value is not None and kind in ("select", "select-one", "select-multiple"):
+                field_opts = field.get("options", [])
+                if field_opts:
+                    opts_lower = [o.lower() for o in field_opts]
+                    if value.lower() not in opts_lower:
+                        value = None
             if value is None:
                 value = await _ask_llm(self.classifier_client, self.classifier_model, self.profile, field)
             if value:
@@ -1792,6 +1854,7 @@ class OffsiteApplyFlow:
         verbose: bool = False,
         inbox=None,
         fallback_model: str = "",
+        application_url: str = "",
     ):
         self.page = page
         self.context = context
@@ -1799,6 +1862,7 @@ class OffsiteApplyFlow:
         self.llm_client = llm_client
         self.model = model
         self.fallback_model = fallback_model or model
+        self.application_url = application_url
         # If the circuit-breaker already fired this session, start on the fallback immediately
         if _session_llm_state.get("model_switched"):
             self.model = self.fallback_model
@@ -1820,7 +1884,38 @@ class OffsiteApplyFlow:
         "Applications are closed",
     ]
 
+    async def assist_from_page(self) -> str:
+        """Resume LLM-guided apply from the application form tab.
+
+        Prefers an already-open non-LinkedIn tab (the one the failed apply left
+        behind) over the main LinkedIn page.  Falls back to self.page if no
+        third-party tab is found.
+        """
+        target = self.page
+        for pg in self.context.pages:
+            try:
+                if not pg.is_closed() and "linkedin.com" not in pg.url and pg.url not in ("", "about:blank"):
+                    target = pg
+                    break
+            except Exception:
+                continue
+        print(f"  [Retry] Resuming from: {target.url}")
+        return await self._llm_guided_apply(target)
+
     async def run(self, job_url: str) -> str:
+        # Fast path: navigate directly to the ATS application URL from DB,
+        # skipping LinkedIn entirely (avoids Premium wall / Apply button click)
+        if self.application_url and "linkedin.com" not in self.application_url:
+            print(f"  [Offsite] Direct ATS navigation: {self.application_url[:80]}")
+            try:
+                await self.page.goto(self.application_url, wait_until="domcontentloaded", timeout=20000)
+            except Exception as _e:
+                print(f"  [Offsite] Direct nav failed ({_e}) — falling back to LinkedIn click")
+            else:
+                if "linkedin.com" not in self.page.url:
+                    return await self._fill_external_form(self.page)
+
+        # Fallback: open LinkedIn job page and click Apply
         job_url = _clean_linkedin_url(job_url)
         try:
             await self.page.goto(job_url, wait_until="domcontentloaded", timeout=20000)
@@ -1851,7 +1946,7 @@ class OffsiteApplyFlow:
 
         ext_page, apply_status = await self._click_apply_and_get_page()
         if ext_page is None:
-            return apply_status  # "failed", "no_easy_apply", etc.
+            return apply_status
 
         return await self._fill_external_form(ext_page)
 
@@ -2089,7 +2184,17 @@ class OffsiteApplyFlow:
         except Exception:
             pass
 
-        print(f"  [Offsite] Apply click didn't navigate — still on {self.page.url}")
+        # Final fallback: navigate directly to application_url from DB (bypasses LinkedIn wall)
+        if self.application_url and "linkedin.com" not in self.application_url:
+            print(f"  [Offsite] Navigating directly to application_url: {self.application_url[:80]}")
+            try:
+                await self.page.goto(self.application_url, wait_until="domcontentloaded", timeout=20000)
+                if "linkedin.com" not in self.page.url:
+                    return self.page, "ok"
+            except Exception as _e:
+                print(f"  [Offsite] Direct application_url navigation failed: {_e}")
+
+        print(f"  [Offsite] Apply click didn't navigate — still on {self.page.url} — marking failed")
         return None, "failed"
 
     async def _try_career_page_apply(self, page: Page) -> tuple:
@@ -2197,6 +2302,8 @@ class OffsiteApplyFlow:
                     'select, textarea'
                 ))
                 .filter(el => !el.disabled)
+                // Skip OneTrust cookie-consent inputs — they're always offscreen and irrelevant
+                .filter(el => !(el.id && el.id.startsWith('ot-')) && !el.closest('#onetrust-consent-sdk'))
                 // Skip tabindex=-1 inputs (autocomplete children like Workable #city, phone country search)
                 // Skip React Select internal combobox inputs — they always appear empty even when selected
                 // Skip fully unlabeled/unnamed inputs with no id — hidden React control inputs
@@ -2231,7 +2338,7 @@ class OffsiteApplyFlow:
 
                 // Buttons visible in viewport, plus off-screen submit/apply/next buttons
                 const _allBtns = Array.from(document.querySelectorAll(
-                    'button:not([disabled]), [role="button"], a[href]'
+                    'button:not([disabled]), [role="button"], [role="tab"], a[href]'
                 ));
                 const _submitKeywords = ['submit', 'apply', 'next', 'continue', 'send', 'finish', 'complete'];
                 const buttons = _allBtns
@@ -2358,6 +2465,7 @@ class OffsiteApplyFlow:
             '"reason":"<1 sentence>","update":"<1 sentence describing what this page/step revealed — e.g. form structure, new requirements, page count>"}\n\n'
             "Rules: done=thank-you/confirmation visible. failed=captcha/identity-verify/stuck/job-no-longer-available. "
             "If you see 'job not found', 'no longer available', 'position closed', or similar expired-job text → failed with reason 'job no longer available'. "
+            "If you see a tab or link labeled 'Application' or 'Apply' in the buttons list, click it immediately — it opens the application form. "
             "click=button or link (use :has-text() NOT :contains()). fill=empty text input. "
             "select=native <select> element ONLY (tag is SELECT in HTML). upload=resume file input. scroll=reveal more. "
             "Priority: Fill ALL [EMPTY] fields in top-to-bottom order BEFORE clicking any Submit/Apply button. "
@@ -2367,7 +2475,7 @@ class OffsiteApplyFlow:
             "Never fill or upload to any field labeled 'Cover Letter' or 'Covering Letter' — skip entirely. "
             f"Sponsorship questions: answer '{_sponsor_val}'. Work authorization: always 'Yes'. "
             "CRITICAL: Never fabricate URLs, social media handles, usernames, or any information not in the profile. "
-            "For URL/link fields asking for Twitter, Instagram, Facebook, personal blog, or any social/platform not listed in the profile, use value='' (empty string) — leave them blank. "
+            "For any field where you have no value (optional URL, referral email, social handle, portfolio, etc.) — do NOT issue a fill action at all. Skip that field entirely and move to the next [EMPTY] field or click Submit. Never fill a field with an empty string (value='') — an empty fill does nothing useful and can trigger browser validation errors. "
             "If all [EMPTY] fields are filled and a submit button is listed as (offscreen), use action=click with its selector to click it — do not scroll first. "
             "Never click bare 'Apply' nav links — only 'Apply Now', 'Apply for this job', 'Submit application'. "
             "Never click Login/Sign-in unless you just filled email+password. "
@@ -2379,16 +2487,11 @@ class OffsiteApplyFlow:
         for _attempt in range(3):
             try:
                 _call_start = datetime.now(timezone.utc)
-                resp = await asyncio.wait_for(
-                    self.llm_client.chat.completions.create(
-                        model=self.model,
-                        messages=[{"role": "user", "content": prompt}],
-                        max_tokens=1000,
-                    ),
-                    timeout=60,
+                raw = await asyncio.wait_for(
+                    _call_claude(prompt, model=self.model, timeout=110),
+                    timeout=120,
                 )
                 _call_ms = int((datetime.now(timezone.utc) - _call_start).total_seconds() * 1000)
-                raw = resp.choices[0].message.content
                 # Strip markdown fences if present
                 clean = raw.strip()
                 if "```" in clean:
@@ -2480,15 +2583,11 @@ class OffsiteApplyFlow:
             f"Description:\n{self.job_description[:3000]}"
         )
         try:
-            resp = await asyncio.wait_for(
-                self.classifier_client.chat.completions.create(
-                    model=self.classifier_model,
-                    messages=[{"role": "user", "content": prompt}],
-                    max_tokens=200,
-                ),
+            result = await asyncio.wait_for(
+                _call_claude(prompt, model=self.classifier_model, timeout=25),
                 timeout=30,
             )
-            return resp.choices[0].message.content.strip()
+            return result
         except Exception:
             return f"Role: {self.job_title} at {self.company_name}."
 
@@ -2548,34 +2647,45 @@ class OffsiteApplyFlow:
         # account wall, chatbot, etc.). Marked failed so they surface in the manual queue for human review.
         # Checked at domain level so Workday's /apply/applyManually (not a login URL) is caught too.
         _blocked_auto_apply_domains = (
-            "icims.com",                    # iCIMS — requires account
-            "taleo.net",                    # Oracle Taleo — requires account
-            "successfactors.com",           # SAP SuccessFactors
-            "successfactors.eu",            # SAP SuccessFactors EU
-            "sap.com",                      # SAP hosted ATS
-            "sapsf.com",                    # SAP SuccessFactors alternate domain
-            "myworkdayjobs.com",            # Workday public boards — requires account
-            "myworkdaysite.com",            # Workday client instances — same account requirement
-            "ultipro.com",                  # UltiPro/UKG — redirects to auth
-            "paycomonline.net",             # Paycom — form buried behind account login
-            "governmentjobs.com",           # NEOGOV — always requires pre-registered account
-            "workforcenow.adp.com",         # ADP Workforce Now — lands on company portal, not job form
-            "recruiting.paylocity.com",     # Paylocity — account required
-            "bamboohr.com",                 # BambooHR — requires account to submit
-            "recruitingbypaycor.com",       # Paycor — hidden location field causes 30s timeout
-            "yourpayrollhr.com",            # Paycor-based — LLM navigates away from job page
+            # reCAPTCHA / technical blockers the agent cannot overcome
+            "governmentjobs.com",           # NEOGOV — account + CAPTCHA required
             "zohorecruit.com",              # Zoho Recruit — CAPTCHA blocks submission
-            "app.breezy.hr",                # BreezyHR — repeated fills trigger spam detection
-            "ats.rippling.com",             # Rippling ATS — script engine + LLM both fail
-            "ycombinator.com",              # YC Work — SSO-only, no self-registration
-            "amazon.jobs",                  # Amazon portal — duplicate invisible fields + account required
-            "jobs.cvshealth.com",           # CVS Health Phenom chatbot — confused navigation, fails validation
             "applytojob.com",               # ApplyToJob — reCAPTCHA on landing form
             "hirebridge.com",               # HireBridge — hidden inputs + reCAPTCHA
             "hackajob.com",                 # hackajob — email gate + reCAPTCHA
-            "jobs.twilio.com",              # Twilio — hidden #g-recaptcha-response; ScriptEngine loops 3 attempts
-            "job-boards.greenhouse.io",     # Greenhouse public board — reCAPTCHA (boards.greenhouse.io unaffected)
+            "jobs.twilio.com",              # Twilio — hidden g-recaptcha-response
             "burtchworks.com",              # Burtch Works — React form fills don't persist
+            "jobs.cvshealth.com",           # CVS Health Phenom chatbot — navigation fails
+            "amazon.jobs",                  # Amazon portal — duplicate invisible fields
+            # Company career pages backed by reCAPTCHA (Greenhouse)
+            "careers.airbnb.com",
+            "www.pinterestcareers.com",
+            # Company sites requiring account login
+            "apply.careers.microsoft.com",  # Requires Microsoft account
+            "ycombinator.com",              # YC Work — SSO only
+            # ATS platforms with invisible SPA login modals (Apply opens overlay Playwright can't inspect)
+            "myworkdayjobs.com", "myworkdaysite.com",   # Workday
+            "ultipro.com",                              # UltiPro/UKG
+            "bamboohr.com",                             # BambooHR
+            "icims.com",                                # iCIMS
+            "jibeapply.com",                            # Jibe/Jobvite
+            "taleo.net",                                # Oracle Taleo
+            "paycomonline.net",                         # Paycom
+            "recruitingbypaycor.com",                   # Paycor
+            "yourpayrollhr.com",                        # Paycor-based
+            "oraclecloud.com",                          # Oracle HCM
+            "jobvite.com",                              # Jobvite
+            "recruiting.paylocity.com",                 # Paylocity
+            "etscareers.submit4jobs.com",               # ETS careers
+            # Career pages / ATSes where Apply form is inaccessible headlessly
+            "talent.fullstack.com",                     # FullStack — invisible modal
+            "careers-page.com",                         # Careers Page ATS
+            "careers.bigbear.ai",                       # BigBear.ai — only Search inputs visible
+            "careers.rideuta.com",                      # Utah Transit Authority — no Apply button
+            "entertimeonline.com",                      # EnterTime ATS — only Search field
+            "butterflymx.com",                          # ButterflyMX — Ashby embed, only Search visible
+            "www.seismic.com",                          # Seismic — embedded form, URL never changes
+            "hiringthing.com",                          # HiringThing ATS — stuck on listing page
         )
 
         _landing_domain = urlparse(page.url).netloc.lower()
@@ -2583,7 +2693,7 @@ class OffsiteApplyFlow:
             print(f"  [LLM] Spam/aggregator domain ({_landing_domain}) — skipping")
             return "skipped"
         if any(_domain_matches(_landing_domain, d) for d in _blocked_auto_apply_domains):
-            print(f"  [LLM] Blocked auto-apply domain ({_landing_domain}) — marking failed for manual review")
+            print(f"  [LLM] Blocked auto-apply domain ({_landing_domain}) — marking failed for manual retry")
             return "failed"
 
         # Lever listing-page fast-path: jobs.lever.co/<company>/<id> is a listing page with no form.
@@ -2622,12 +2732,15 @@ class OffsiteApplyFlow:
 
         # Check immediately if the landing page shows an expired/unavailable job.
         # URL check runs first (never throws); text check is separate so a JS error can't suppress the URL check.
-        _expired_url_patterns = ("/second-chance", "/job-expired", "/job-not-found", "/404", "/error")
+        _expired_url_patterns = ("/second-chance", "/job-expired", "/job-not-found", "/404", "/error",
+                                  "ns_inactive_job=1", "inactive_job")
         _expired_text_phrases = (
             "no longer available", "opportunity is no longer", "position has been filled",
             "listing expired", "job has been filled", "this job is no longer", "job is closed",
             "no longer accepting applications", "job not found", "error: job not found",
             "this position has been", "this role has been filled",
+            "no longer active", "posting is no longer", "job posting has expired",
+            "this posting has been removed", "job has expired",
         )
         if any(p in page.url.lower() for p in _expired_url_patterns):
             print(f"  [LLM] Landing URL indicates expired job ({page.url}) — skipping")
@@ -2669,7 +2782,9 @@ class OffsiteApplyFlow:
         # the full 600s session timeout on hopeless LLM steps.
         try:
             _recaptcha_els = await page.locator(
-                "div.g-recaptcha, iframe[src*='recaptcha'], input[name='g-recaptcha-response']"
+                "div.g-recaptcha, iframe[src*='recaptcha'], iframe[title*='recaptcha'], "
+                "input[name='g-recaptcha-response'], textarea[id*='g-recaptcha-response'], "
+                "input[id*='g-recaptcha-response']"
             ).count()
             if _recaptcha_els > 0:
                 print(f"  [LLM] reCAPTCHA detected on landing form — cannot submit without CAPTCHA solver, skipping")
@@ -2773,11 +2888,9 @@ class OffsiteApplyFlow:
                 auth_attempted = True
                 ok = await self._handle_auth_page(page)
                 if not ok:
-                    # Any auth wall we can't get past (no registration link, SSO-only, enterprise ATS)
-                    # is not an agent error — count as skipped so error rates reflect real failures.
                     _auth_domain = urlparse(page.url).netloc.lower()
-                    print(f"  [LLM] Could not authenticate on {_auth_domain} — skipping")
-                    return "skipped"
+                    print(f"  [LLM] Login wall on {_auth_domain} — marking failed for manual retry")
+                    return "failed"
                 await asyncio.sleep(2)
                 continue
 
@@ -2866,6 +2979,36 @@ class OffsiteApplyFlow:
             if _snap_empty:
                 print("  [LLM] Page still blank after retries — skipping")
                 return "expired"
+
+            # Mid-loop login-wall check: if page has a password field, it's a login gate we can't pass
+            try:
+                _pwd_fields = await page.locator("input[type='password']").count()
+                if _pwd_fields > 0:
+                    _cur_domain = urlparse(page.url).netloc.lower()
+                    existing = _find_account_for_domain(_cur_domain)
+                    if existing:
+                        if await self._try_login(page, existing["email"], existing["password"]):
+                            pass  # logged in — continue loop
+                        else:
+                            print(f"  [LLM] Login with stored credentials failed for {_cur_domain} — marking failed")
+                            return "failed"
+                    else:
+                        print(f"  [LLM] Login wall detected (password field) on {_cur_domain} — marking failed for manual login")
+                        return "failed"
+            except Exception:
+                pass
+
+            # Mid-loop reCAPTCHA check: catch forms that load CAPTCHA after the Apply button click
+            try:
+                _rc_mid = await page.locator(
+                    "div.g-recaptcha, iframe[src*='recaptcha'], iframe[title*='recaptcha'], "
+                    "textarea[id*='g-recaptcha-response'], input[id*='g-recaptcha-response']"
+                ).count()
+                if _rc_mid > 0:
+                    print(f"  [LLM] reCAPTCHA detected mid-loop — cannot submit, skipping")
+                    return "skipped"
+            except Exception:
+                pass
 
             # Mid-loop check: detect Cloudflare bot-gates and "job no longer available" after navigation
             if step > 0:
@@ -3068,6 +3211,8 @@ class OffsiteApplyFlow:
                                 pass
                             print(f"  [LLM] Action '{hist_key}' already in history — page not advancing, giving up")
                             return "failed"
+                        # Page advanced (or we tried to) — skip re-executing the duplicate action
+                        continue
                     else:
                         print(f"  [LLM] Action '{hist_key}' already in history — page not advancing, giving up")
                         return "failed"
@@ -3104,7 +3249,9 @@ class OffsiteApplyFlow:
                 continue
 
             if action_type == "failed":
-                _expired_reasons = ("no longer available", "job not found", "position closed", "job closed", "expired")
+                _expired_reasons = ("no longer available", "no longer active", "job not found",
+                                    "position closed", "job closed", "expired", "posting.*no longer",
+                                    "not accepting", "has been filled", "position has been")
                 if any(k in reason.lower() for k in _expired_reasons):
                     print(f"  [LLM] Job reported as expired/closed ({reason}) — skipping")
                     return "expired"
@@ -3442,19 +3589,14 @@ class OffsiteApplyFlow:
                                             if _llm_opts_texts:
                                                 print(f"  [LLM] React Select fill: asking LLM to pick decline option from {_llm_opts_texts}")
                                                 try:
-                                                    _llm_pick_resp = await self.llm_client.chat.completions.create(
+                                                    _llm_picked = await _call_claude(
+                                                        f"Dropdown options: {_llm_opts_texts}\n"
+                                                        f"Which option best means 'prefer not to disclose' or declining to answer? "
+                                                        f"Reply with ONLY the exact option text from the list.",
                                                         model=self.model,
-                                                        max_tokens=30,
-                                                        messages=[{
-                                                            "role": "user",
-                                                            "content": (
-                                                                f"Dropdown options: {_llm_opts_texts}\n"
-                                                                f"Which option best means 'prefer not to disclose' or declining to answer? "
-                                                                f"Reply with ONLY the exact option text from the list."
-                                                            )
-                                                        }]
+                                                        timeout=20,
                                                     )
-                                                    _llm_picked = (_llm_pick_resp.choices[0].message.content or "").strip().strip('"').strip("'")
+                                                    _llm_picked = _llm_picked.strip().strip('"').strip("'")
                                                     print(f"  [LLM] React Select fill: LLM picked {_llm_picked!r}")
                                                     for _ri in range(_rc_count_all):
                                                         try:
@@ -3591,20 +3733,23 @@ class OffsiteApplyFlow:
                                                 _clicked_suggestion = True
                                         except Exception:
                                             pass
-                                    # Greenhouse autocomplete fields (location, etc.) commit their value
-                                    # to a hidden field and clear the visible input. Track any field
-                                    # whose value disappears after autocomplete selection so the LLM
-                                    # sees it as FILLED and doesn't retry.
-                                    if _clicked_suggestion and "greenhouse.io" in page.url:
-                                        await asyncio.sleep(0.5)
-                                        try:
-                                            _ov_id = await el.get_attribute("id") or ""
-                                            _post_sug_val = await el.input_value()
-                                            if not _post_sug_val and _ov_id:
-                                                _forced_filled[_ov_id] = value
-                                                print(f"  [LLM] Greenhouse #{_ov_id!r}: marked as filled in prompt override")
-                                        except Exception:
-                                            pass
+                                    # Some ATSes (Greenhouse, Lever, etc.) commit the autocomplete
+                                    # value to a hidden field and clear the visible input. Track any
+                                    # field whose value disappears after autocomplete selection so the
+                                    # LLM sees it as FILLED and doesn't retry it next step.
+                                    # Track fields where the value disappeared after fill — some ATSes
+                                    # (Greenhouse, Lever, etc.) commit the value to a hidden field and
+                                    # clear the visible input. Mark as filled so LLM doesn't retry.
+                                    await asyncio.sleep(0.5)
+                                    try:
+                                        _ov_id = await el.get_attribute("id") or ""
+                                        _post_fill_val = await el.input_value()
+                                        if not _post_fill_val and _ov_id:
+                                            _forced_filled[_ov_id] = value
+                                            _reason = "after suggestion click" if _clicked_suggestion else "value committed internally"
+                                            print(f"  [LLM] Field #{_ov_id!r}: {_reason}, marked as filled")
+                                    except Exception:
+                                        pass
                 except Exception as exc:
                     exc_str = str(exc)
                     print(f"  [LLM] Fill failed: {exc_str[:200]}")
@@ -3739,19 +3884,14 @@ class OffsiteApplyFlow:
                                         if _llm_sel_texts:
                                             print(f"  [LLM] React Select: asking LLM to pick decline option from {_llm_sel_texts}")
                                             try:
-                                                _llm_sel_resp = await self.llm_client.chat.completions.create(
+                                                _llm_sel_pick = await _call_claude(
+                                                    f"Dropdown options: {_llm_sel_texts}\n"
+                                                    f"Which option best means 'prefer not to disclose' or declining to answer? "
+                                                    f"Reply with ONLY the exact option text from the list.",
                                                     model=self.model,
-                                                    max_tokens=30,
-                                                    messages=[{
-                                                        "role": "user",
-                                                        "content": (
-                                                            f"Dropdown options: {_llm_sel_texts}\n"
-                                                            f"Which option best means 'prefer not to disclose' or declining to answer? "
-                                                            f"Reply with ONLY the exact option text from the list."
-                                                        )
-                                                    }]
+                                                    timeout=20,
                                                 )
-                                                _llm_sel_pick = (_llm_sel_resp.choices[0].message.content or "").strip().strip('"').strip("'")
+                                                _llm_sel_pick = _llm_sel_pick.strip().strip('"').strip("'")
                                                 print(f"  [LLM] React Select: LLM picked {_llm_sel_pick!r}")
                                                 for _oi in range(_sel_count_all):
                                                     try:
@@ -4230,8 +4370,8 @@ class OffsiteApplyFlow:
                 return True
             print(f"  [Auth] Login failed with stored credentials")
 
-        print(f"  [Auth] No valid credentials for {domain} — attempting registration")
-        return await self._try_register(page, domain)
+        print(f"  [Auth] No stored credentials for {domain} — marking failed for manual login")
+        return False
 
     async def _try_login(self, page: Page, email: str, password: str) -> bool:
         """Fill login form and submit. Returns True if URL changed away from login page."""

@@ -1,0 +1,11 @@
+ComplexOnsiteApply||20
+ComplexOnsiteApply|-2|1
+ComplexOnsiteApply|-1|213
+ComplexOnsiteApply|1|103
+OffsiteApply||57
+OffsiteApply|-2|4
+OffsiteApply|-1|786
+OffsiteApply|1|45
+SimpleOnsiteApply||1
+SimpleOnsiteApply|-1|25
+SimpleOnsiteApply|1|8
