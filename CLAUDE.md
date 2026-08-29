@@ -74,7 +74,7 @@ When tickets are created (e.g. by the log-bug-detector agent after a run), follo
 
 All pipeline logic is wrapped as Dagster ops/jobs/schedules in `scripts/dagster_retrievers.py`. The entrypoint for `dagster dev` is `scripts/definitions.py` (declared in `pyproject.toml` under `[tool.dagster]`). Schedules run search every ~4 hours and details enrichment every ~6 hours. An `unscraped_jobs_sensor` triggers detail fetching whenever new unenriched jobs appear.
 
-`scripts/dagster_db_assets.py` and `scripts/dagster_relationships.py` define software-defined assets that reflect the DB tables for lineage tracking. The `no_persist_io_manager` is used so Dagster doesn't write snapshot files to disk.
+`scripts/definitions.py` wires 4 jobs (`search_jobs_only`, `fetch_details_only`, `search_and_fetch_jobs`, `apply_jobs_job`), 3 schedules, and `unscraped_jobs_sensor`. The `no_persist_io_manager` resource keeps op outputs in memory so Dagster doesn't write pickled snapshots to disk.
 
 ### Autonomous apply agent (`apply_jobs.py`, `linkedin_apply.py`, `script_engine.py`)
 
