@@ -57,6 +57,8 @@ import subprocess
 from openai import OpenAI, AsyncOpenAI
 from playwright.async_api import async_playwright
 
+from common import extract_json_object, strip_code_fence
+from common import write_llm_log as _write_llm_log
 from linkedin_apply import EasyApplyFlow, OffsiteApplyFlow, _get_profile_value, _session_llm_state
 from scripts.create_db import (
     BLOCKED_ENTITIES_DDL,
@@ -81,15 +83,7 @@ BLOCKED_COMPANIES = {p for kind, p, _ in BLOCKED_ENTITIES_SEED if kind == "compa
 BLOCKED_DOMAINS = {p for kind, p, _ in BLOCKED_ENTITIES_SEED if kind == "ats_domain"}
 PROFILE_PATH = "user_profile.json"
 LOG_PATH     = "application_log.json"
-LLM_LOG_PATH = "llm_debug.jsonl"
 ACCOUNTS_PATH = "created_accounts.json"
-
-def _write_llm_log(entry: dict):
-    try:
-        with open(LLM_LOG_PATH, "a") as f:
-            f.write(json.dumps(entry) + "\n")
-    except Exception:
-        pass
 
 
 async def _llm_fill_focused(page, llm_client: AsyncOpenAI, llm_model: str, profile: dict):
@@ -589,15 +583,8 @@ Be accurate and concise. Never fabricate information not in the user's profile."
                 _call_ms = int((time.monotonic() - _t0) * 1000)
                 if proc.returncode != 0:
                     raise RuntimeError(f"claude exited {proc.returncode}: {proc.stderr[:200]}")
-                raw = proc.stdout.strip()
-                if raw.startswith("```"):
-                    raw = re.sub(r"^```(?:json)?\s*\n?", "", raw)
-                    raw = re.sub(r"\n?```\s*$", "", raw).strip()
                 # Extract just the JSON object — Haiku may prepend/append prose
-                _start = raw.find("{")
-                _end   = raw.rfind("}") + 1
-                if _start != -1 and _end > _start:
-                    raw = raw[_start:_end]
+                raw = extract_json_object(strip_code_fence(proc.stdout))
                 data = json.loads(raw)
                 relevant = bool(data.get("relevant"))
                 reason   = data.get("reason", "")
