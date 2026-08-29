@@ -1,6 +1,6 @@
 # ── blocked_entities: canonical store for apply-agent blocklist patterns ───────
 # Single source of truth for the DDL — imported by scripts/migrations/002_schema.py
-# and by apply_jobs._ensure_blocklist_table. ``kind`` partitions the patterns:
+# and by apply_jobs._ensure_apply_schema. ``kind`` partitions the patterns:
 #   'company'    — case-insensitive substring match against companies.name
 #   'ats_domain' — substring match against an application/posting domain
 BLOCKED_ENTITIES_DDL = (

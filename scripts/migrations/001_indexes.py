@@ -59,8 +59,10 @@ def migrate(db_path: str | Path = DEFAULT_DB_PATH) -> None:
                 # INDEX_STATEMENTS is the end-state source of truth and may name a
                 # column introduced by a later migration (e.g. idx_jobs_listed now
                 # targets jobs.listed_epoch, added in 002). On a DB that hasn't run
-                # that migration yet the index is simply deferred to it.
-                if "no such column" in str(exc).lower():
+                # that migration yet that one index is deferred to it. Any other
+                # OperationalError — or a missing column on a different index — is
+                # a real failure and must propagate.
+                if name == "idx_jobs_listed" and "no such column" in str(exc).lower():
                     print(
                         f"[001_indexes] index {name}: deferred ({exc}) "
                         "— a later migration owns it"

@@ -656,6 +656,7 @@ def _ensure_apply_schema(cursor):
     no-op. Seed / DDL come from scripts.create_db (bound params — never
     interpolated).
     """
+    # TODO(T19): consolidate with the startup auto-migrator
     cursor.execute(BLOCKED_ENTITIES_DDL)
     cursor.executemany(
         "INSERT OR IGNORE INTO blocked_entities (kind, pattern, reason) VALUES (?, ?, ?)",
