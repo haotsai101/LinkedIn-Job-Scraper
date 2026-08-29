@@ -19,5 +19,11 @@ dependencies = [
     "dagster-webserver>=1.12.18",
 ]
 
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
 [tool.dagster]
 module_name = "scripts.definitions"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
