@@ -22,3 +22,12 @@ SEARCH_KEYWORDS = (
     '"software engineer" OR "machine learning engineer" '
     'OR "AI engineer" OR "data engineer"'
 )
+
+# Fail fast (at import, for both consumers) if the query would corrupt the
+# Voyager query DSL. ValueError, not assert, so `python -O` can't strip it.
+_FORBIDDEN = set(",():")
+if _FORBIDDEN & set(SEARCH_KEYWORDS):
+    raise ValueError(
+        f"SEARCH_KEYWORDS may not contain any of ,():  — these are Voyager query DSL "
+        f"delimiters. Offending: {sorted(_FORBIDDEN & set(SEARCH_KEYWORDS))}"
+    )
