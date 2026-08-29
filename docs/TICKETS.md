@@ -8,12 +8,23 @@ Baseline artifacts captured 2026-08-28 in `docs/baseline/` (application_log snap
 
 | Wave | Tickets | State |
 |---|---|---|
-| 1 | T1 #5, T2 #2, T5 #6, T8 #4, T12 #3 | ✅ **CLOSED** — merged, reviewed, QA passed 2026-08-28 (`docs/qa/wave1-qa.md`) |
-| 2a | T6, T9, T13 | 🔨 in progress |
-| 2b | T4 | blocked on T9 (apply_jobs.py collision) |
-| 2c | T3 | blocked on T4 (common.py) |
-| 3+ | T14, T15, T16, T17 | not started |
-| P3 backlog | T19, T20 | not started |
+| 1 | T1 #5, T2 #2, T5 #6, T8 #4, T12 #3 | ✅ **CLOSED** — QA passed 2026-08-28 (`docs/qa/wave1-qa.md`) |
+| 2 | T6 #9, T13 #8, T9 #10, T4 #11, T23 #12, T3 #13 | ✅ **CLOSED** — QA passed 2026-08-29 (`docs/qa/wave2-qa.md`). T9 shipped a P1 regression (`create_tables()` crash on unmigrated DB); fixed by T23 hotfix. |
+| 3 — Phase 2 | T14 | not started — **unblocked** (T13 ✓ T4 ✓ T3 ✓) |
+| 4 — Phase 3 | T15 | needs T14 |
+| 5 — Phase 4 | T16a/T16b | shape decided by T15 |
+| 6 — Phase 5 | T17 | needs T12 ✓ |
+| Follow-ups | T19 T20 T21 T22 T24 | not started (P2–P3) |
+
+### Follow-up backlog (raised during Waves 1–2)
+
+| # | Sev | Summary |
+|---|---|---|
+| T19 | P2 | Auto-run pending migrations at *every* entrypoint (not just apply). Consolidate `_ensure_apply_schema` / `migrate_db` / `ensure_schema_current`. Add DB backup before migration. |
+| T20 | P3 | `ruff` not in the interpreter that runs the agent — document/bootstrap lint. |
+| T21 | P2 | `fetch_job_details_op` has the same required-config bug T6 fixed for `search_jobs_op` — `details_schedule` is `RUNNING` with no run_config → scheduled enrichment fails every 12h. |
+| T22 | P2 | `blocked_entities.ats_domain` rows are seeded but `run_session` still reads `BLOCKED_DOMAINS` from the Python constant — table not wired for domain blocks. |
+| T24 | P3 | `ensure_schema_current` backfill gate can't distinguish "unparseable" from "not yet done" — a permanently-NULL `listed_epoch` row would re-trigger the full-table backfill every startup. Zero impact on current data. Fold into T19. |
 
 ## Dependency graph
 
@@ -242,6 +253,36 @@ T8's indexes + WAL and T9's schema changes only take effect when the operator ma
 `ruff` is in `[project.optional-dependencies].dev` but the `/opt/anaconda3/bin/python` env that actually runs the agent doesn't have it, so `ruff check .` only works in a fresh venv. Either document that lint runs in the venv, add a `make lint` / `scripts/lint.sh` that bootstraps it, or install it into the anaconda env and note that in `CLAUDE.md`.
 
 **Acceptance:** `ruff check .` runs from the documented dev setup with one obvious command.
+
+---
+
+## T21 — `fetch_job_details_op` required-config bug
+
+**Phase:** follow-up · **Risk:** low · **Deps:** none · Raised by the T6 reviewer.
+
+`scripts/dagster_retrievers.py:fetch_job_details_op` has `config_schema={"max_updates": int, "sleep_time": int}` with both fields required, but `details_schedule` (`default_status=RUNNING`) supplies no `run_config` — so scheduled enrichment fails config validation every 12h (only `unscraped_jobs_sensor` provides config). Same class of bug T6 fixed for `search_jobs_op`. Apply the same `Field(default_value=...)` treatment: `max_updates=25`, `sleep_time=30` (match the existing `.get()` fallbacks + the sensor's values). `search_and_fetch_jobs` (unscheduled) also benefits.
+
+**Acceptance:** `details_schedule` produces a valid run from the launchpad with no config; the sensor path is unaffected.
+
+---
+
+## T22 — Wire `blocked_entities.ats_domain` to `run_session`
+
+**Phase:** follow-up · **Risk:** low · **Deps:** T9 (done) · Raised by the T9 reviewer.
+
+T9 created `blocked_entities` and seeds `ats_domain` rows, but `run_session`'s URL check still reads `BLOCKED_DOMAINS` (derived from the frozen `BLOCKED_ENTITIES_SEED` Python constant), so an operator adding an `ats_domain` row to the table is silently ignored. Have `run_session` load `ats_domain` patterns from the table once per session (mirror the `get_pending_jobs` approach), making the table authoritative for domain blocks too.
+
+**Acceptance:** adding an `ats_domain` row to `blocked_entities` blocks that domain on the next apply session with no code change.
+
+---
+
+## T24 — Backfill re-run gate can't detect permanently-unparseable rows
+
+**Phase:** follow-up (fold into T19) · **Risk:** low · **Occurrence:** 0 in current data · Raised by log-bug-detector during Wave 2 QA.
+
+`ensure_schema_current()` gates the `listed_epoch` backfill behind `SELECT 1 FROM jobs WHERE listed_epoch IS NULL LIMIT 1`. Rows whose `original_listed_time`/`listed_time` are both unparseable stay `NULL` after the `CASE ... ELSE NULL` backfill, so they keep satisfying the probe → the full-table backfill `UPDATE` (scan + write lock) runs on every `ensure_schema_current()` call and never converges. Current `linkedin_jobs.db`: 1263/1263 parse, so zero impact. Fix: narrow the probe to rows the backfill *can* fix (mirror `_epoch_case` conditions), or sentinel-mark unfixable rows. Fold into T19.
+
+**Acceptance:** on a DB with an unparseable-timestamp row, `ensure_schema_current()` runs the backfill at most once.
 
 ---
 
