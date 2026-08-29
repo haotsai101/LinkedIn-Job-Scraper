@@ -1,3 +1,39 @@
+# ── blocked_entities: canonical store for apply-agent blocklist patterns ───────
+# Single source of truth for the DDL — imported by scripts/migrations/002_schema.py
+# and by apply_jobs._ensure_blocklist_table. ``kind`` partitions the patterns:
+#   'company'    — case-insensitive substring match against companies.name
+#   'ats_domain' — substring match against an application/posting domain
+BLOCKED_ENTITIES_DDL = (
+    "CREATE TABLE IF NOT EXISTS blocked_entities ("
+    "kind TEXT NOT NULL, "
+    "pattern TEXT NOT NULL, "
+    "reason TEXT, "
+    "PRIMARY KEY (kind, pattern))"
+)
+
+# Seed rows migrated out of the old apply_jobs.py Python constants
+# (BLOCKED_COMPANIES / BLOCKED_DOMAINS). This is the fallback seed source only —
+# the live blocklist is the blocked_entities table. Patterns are stored lowercase
+# and matched with a parameterized LIKE (never string-interpolated into SQL).
+BLOCKED_ENTITIES_SEED = [
+    ("company", "synergisticit", "paid bootcamp recruiter"),
+    ("company", "ladders", "theladders.com — paid job board, requires Ladders account"),
+    ("ats_domain", "theladders.com", "paid job board"),
+    ("ats_domain", "ed.crossover.com", "Apply with Google/LinkedIn only — no form"),
+    ("ats_domain", "rex.zone", "OAuth-only apply flow"),
+]
+
+
+def seed_blocked_entities(conn, cursor):
+    """Insert the fallback blocklist seed rows. Idempotent (INSERT OR IGNORE)."""
+    cursor.executemany(
+        "INSERT OR IGNORE INTO blocked_entities (kind, pattern, reason) VALUES (?, ?, ?)",
+        BLOCKED_ENTITIES_SEED,
+    )
+    conn.commit()
+    return True
+
+
 def create_tables(conn, cursor):
     cursor.execute('''
           CREATE TABLE IF NOT EXISTS jobs (
@@ -27,9 +63,12 @@ def create_tables(conn, cursor):
           degree TEXT,
           posting_domain TEXT,
           sponsored INTEGER,
-          applied INTEGER DEFAULT NULL
+          applied INTEGER DEFAULT NULL,
+          listed_epoch INTEGER
         );
     ''')
+
+    cursor.execute(BLOCKED_ENTITIES_DDL)
 
     cursor.execute('''
       CREATE TABLE IF NOT EXISTS skills (
@@ -164,6 +203,7 @@ def create_tables(conn, cursor):
 
     conn.commit()
 
+    seed_blocked_entities(conn, cursor)
     create_indexes(conn, cursor)
     enable_wal(conn, cursor)
 
@@ -175,16 +215,57 @@ def create_tables(conn, cursor):
 INDEX_STATEMENTS = {
     "idx_jobs_pending": "CREATE INDEX IF NOT EXISTS idx_jobs_pending ON jobs(applied, scraped)",
     "idx_jobs_company": "CREATE INDEX IF NOT EXISTS idx_jobs_company ON jobs(company_id)",
-    "idx_jobs_listed": "CREATE INDEX IF NOT EXISTS idx_jobs_listed ON jobs(original_listed_time DESC)",
+    # Backs get_pending_jobs: filters `applied IS NULL` and orders by
+    # `listed_epoch DESC`. Composite (applied, listed_epoch DESC) so one index
+    # serves both the predicate and the sort — with plain `(listed_epoch DESC)`
+    # the planner picks idx_jobs_pending for the predicate and still needs a
+    # TEMP B-TREE for the ORDER BY. Migration 002 drops the old idx_jobs_listed
+    # (on the TEXT original_listed_time column) and recreates it here.
+    "idx_jobs_listed": (
+        "CREATE INDEX IF NOT EXISTS idx_jobs_listed ON jobs(applied, listed_epoch DESC)"
+    ),
     "idx_jobs_apptype": "CREATE INDEX IF NOT EXISTS idx_jobs_apptype ON jobs(application_type)",
 }
 
 
+def _epoch_case(col: str) -> str:
+    """SQL CASE arms mapping a TEXT timestamp column to epoch *seconds*.
+
+    ``col`` is a hard-coded column name (never user input) — this builds SQL
+    structure, not interpolated values. Handles the shapes seen / plausible in
+    the ``jobs`` table: 13-digit epoch-millis strings (the live format),
+    10-digit epoch-seconds strings, and ISO-8601 date strings.
+    """
+    return (
+        f"WHEN {col} IS NOT NULL AND {col} <> '' AND {col} NOT GLOB '*[^0-9]*' THEN "
+        f"    CASE WHEN length({col}) >= 12 THEN CAST({col} AS INTEGER) / 1000 "
+        f"         ELSE CAST({col} AS INTEGER) END "
+        f"WHEN {col} LIKE '____-__-__%' THEN CAST(strftime('%s', {col}) AS INTEGER) "
+    )
+
+
+# Backfill jobs.listed_epoch from original_listed_time, falling back to
+# listed_time. Only touches rows where listed_epoch IS NULL, so it is safe to
+# re-run. Shared by scripts/migrations/002_schema.py and
+# apply_jobs._ensure_apply_schema.
+LISTED_EPOCH_BACKFILL_SQL = (
+    "UPDATE jobs SET listed_epoch = CASE "
+    + _epoch_case("original_listed_time")
+    + _epoch_case("listed_time")
+    + "ELSE NULL END "
+    "WHERE listed_epoch IS NULL"
+)
+
+
 def create_indexes(conn, cursor):
     """Create the secondary indexes that back the apply-agent's hot pending-jobs
-    query. Additive and idempotent (CREATE INDEX IF NOT EXISTS)."""
+    query. Additive and idempotent (CREATE INDEX IF NOT EXISTS). Runs ANALYZE so
+    the planner has the stats to choose idx_jobs_listed for the ORDER BY rather
+    than falling back to a TEMP B-TREE sort."""
     for stmt in INDEX_STATEMENTS.values():
         cursor.execute(stmt)
+    conn.commit()
+    cursor.execute("ANALYZE")
     conn.commit()
     return True
 
