@@ -3,10 +3,14 @@
 Covers ``strip_code_fence`` (plain / ```json / bare ``` / surrounding whitespace /
 no fence) and ``extract_json_object`` (clean / prose-wrapped / nested braces /
 malformed / absent). ``write_llm_log`` is exercised for its append + error-swallow
-contract.
+contract. The final block characterizes the *composed* parse pipeline exactly as
+``OffsiteApplyFlow._decide_action`` and ``JobAgent.classify`` run it — this is the
+safety net T14 will lean on when it replaces the salvage code.
 """
 
 import json
+
+import pytest
 
 import common
 
@@ -94,3 +98,46 @@ def test_write_llm_log_swallows_unserializable_entry(tmp_path, monkeypatch):
 def test_write_llm_log_swallows_bad_path(monkeypatch):
     monkeypatch.setattr(common, "LLM_LOG_PATH", "/nonexistent-dir/nope/llm.jsonl")
     common.write_llm_log({"type": "x"})  # must not raise
+
+
+# ── composed parse pipeline (characterization) ────────────────────────────────
+# Mirrors OffsiteApplyFlow._decide_action / JobAgent.classify exactly:
+#   strip_code_fence -> record first-'{' index -> extract_json_object
+#   -> json.loads, with a "first object only" fallback on JSONDecodeError.
+# NOTE: `start` deliberately indexes the *pre-extraction* string, matching the
+# live call sites (see linkedin_apply.py `_decide_action`).
+
+def _parse_like_decide_action(raw):
+    clean = common.strip_code_fence(raw)
+    start = clean.find("{")
+    clean = common.extract_json_object(clean)
+    first_end = clean.find("}", start) + 1
+    try:
+        return json.loads(clean)
+    except json.JSONDecodeError:
+        return json.loads(clean[start:first_end])
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        # plain, no fence
+        ('{"action":"click"}', {"action": "click"}),
+        # ```json fence
+        ('```json\n{"action":"click"}\n```', {"action": "click"}),
+        # bare ``` fence
+        ('```\n{"action":"click"}\n```', {"action": "click"}),
+        # two fenced objects -> multi-object JSONDecodeError fallback takes the first
+        ('```json\n{"a":1}\n```\n```json\n{"b":2}\n```', {"a": 1}),
+        # trailing prose after the fence
+        ('```json\n{"a":1}\n```\n\nNote: done.', {"a": 1}),
+        # leading prose before the fence (no leading-fence guard hit; brace span saves it)
+        ('Here is the action: {"action":"fill","value":"x"}', {"action": "fill", "value": "x"}),
+        # nested object survives intact
+        ('```json\n{"a":"select","o":{"k":"v"}}\n```', {"a": "select", "o": {"k": "v"}}),
+        # CRLF line endings from the CLI
+        ('```json\r\n{"action":"click"}\r\n```', {"action": "click"}),
+    ],
+)
+def test_decide_action_parse_path(raw, expected):
+    assert _parse_like_decide_action(raw) == expected

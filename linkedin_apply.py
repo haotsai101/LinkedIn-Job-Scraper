@@ -2496,6 +2496,9 @@ class OffsiteApplyFlow:
                 _call_ms = int((datetime.now(timezone.utc) - _call_start).total_seconds() * 1000)
                 # Strip markdown fences if present, then isolate the JSON object
                 clean = strip_code_fence(raw)
+                # NOTE: `start` indexes the pre-extraction string; extract_json_object
+                # then trims to [first '{' .. last '}'], so clean[start:first_end]
+                # in the fallback below still points at the first object.
                 start = clean.find("{")
                 clean = extract_json_object(clean)
                 # If the model emitted multiple JSON objects, take only the first one
