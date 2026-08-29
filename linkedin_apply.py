@@ -14,8 +14,18 @@ import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
-from openai import OpenAI, AsyncOpenAI
-from playwright.async_api import Page, BrowserContext
+# Optional heavy deps: only needed when actually running an apply session. Guarded so
+# the module (and its pure helpers like _get_profile_value) can be imported in
+# environments without playwright/openai installed — e.g. the test suite. Behavior is
+# unchanged when the packages are present; the names are used only in type annotations.
+try:
+    from openai import OpenAI, AsyncOpenAI
+except ImportError:  # pragma: no cover
+    OpenAI = AsyncOpenAI = object
+try:
+    from playwright.async_api import Page, BrowserContext
+except ImportError:  # pragma: no cover
+    Page = BrowserContext = object
 
 
 _LLM_LOG_PATH = "llm_debug.jsonl"
