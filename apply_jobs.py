@@ -649,11 +649,11 @@ def _ensure_apply_schema(cursor):
     ``get_pending_jobs`` and the tests reference it.
 
     ``ensure_schema_current`` adds ``jobs.listed_epoch`` + backfills, creates and
-    seeds ``blocked_entities``, and drops a stale ``idx_jobs_listed`` so it gets
-    rebuilt on ``(applied, listed_epoch DESC)`` — everything ``get_pending_jobs``
-    depends on. It does not create indexes itself; the apply path relies on the
-    retriever/Dagster ``create_tables()`` call (or migration 001/002) having
-    built them. ``_has_index`` guards the one place that matters.
+    seeds ``blocked_entities``, and — when it changed the schema — rebuilds every
+    secondary index (so ``idx_jobs_listed`` lands on ``(applied, listed_epoch
+    DESC)`` even on an apply-only clone that never runs a retriever). That makes
+    the ``_has_index`` check in ``get_pending_jobs`` a safety net rather than
+    load-bearing.
     """
     # TODO(T19): consolidate with the startup auto-migrator
     ensure_schema_current(cursor.connection, cursor)

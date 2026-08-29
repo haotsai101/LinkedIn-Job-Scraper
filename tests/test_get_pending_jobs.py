@@ -257,10 +257,14 @@ def test_ensure_schema_current_skips_analyze_when_already_current(tmp_path):
         def __getattr__(self, name):
             return getattr(self._inner, name)
 
-    # Second call on an already-current DB: no schema change -> no ANALYZE.
+    # Second call on an already-current DB: no schema change -> no ANALYZE, no
+    # backfill UPDATE, no index rebuild.
     changed = cdb.ensure_schema_current(conn, RecordingCursor(conn.cursor()))
     assert changed is False
-    assert not any(s.strip().upper().startswith("ANALYZE") for s in executed)
+    upper = [s.strip().upper() for s in executed]
+    assert not any(s.startswith("ANALYZE") for s in upper)
+    assert not any(s.startswith("UPDATE JOBS SET LISTED_EPOCH") for s in upper)
+    assert not any(s.startswith("CREATE INDEX") for s in upper)
     conn.close()
 
 

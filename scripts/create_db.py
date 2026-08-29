@@ -232,17 +232,22 @@ def ensure_schema_current(conn, cursor):
     standalone migrations in ``scripts/migrations/`` predate this consolidation
     and keep their own copies for detailed logging / offline use.
 
-    Idempotent and cheap — on an already-current database every step is a no-op.
+    Idempotent and cheap — on an already-current database every step is a no-op
+    (the backfill is gated behind a ``LIMIT 1`` probe, and index rebuild +
+    ``ANALYZE`` run only when something changed).
     Steps:
       1. ``blocked_entities`` table + seed rows (``INSERT OR IGNORE``).
-      2. ``jobs.listed_epoch INTEGER`` added if absent, then the shared
-         ``LISTED_EPOCH_BACKFILL_SQL`` fills any ``listed_epoch IS NULL`` rows.
+      2. ``jobs.listed_epoch INTEGER`` added if absent; the shared
+         ``LISTED_EPOCH_BACKFILL_SQL`` runs only when the column was just added
+         or a probe finds ``listed_epoch IS NULL`` rows still outstanding.
       3. A stale ``idx_jobs_listed`` (built on the old TEXT
-         ``original_listed_time`` column) is dropped so ``create_indexes()``'s
-         ``CREATE INDEX IF NOT EXISTS`` can rebuild it on
-         ``jobs(applied, listed_epoch DESC)``.
-      4. ``ANALYZE`` — **only** when this call actually changed the schema, so it
-         does not take a write lock on every retriever startup.
+         ``original_listed_time`` column) is dropped.
+      4. On an actual schema change only: ``create_indexes()`` rebuilds every
+         secondary index (``CREATE INDEX IF NOT EXISTS`` — so ``idx_jobs_listed``
+         comes back on ``jobs(applied, listed_epoch DESC)`` even for callers that
+         never go through ``create_tables()``), then ``ANALYZE`` refreshes
+         planner stats. Neither runs on an already-current DB, so this is not a
+         write lock on every retriever startup.
 
     Returns ``True`` if a schema change was applied this call, else ``False``.
     """
@@ -256,18 +261,23 @@ def ensure_schema_current(conn, cursor):
     )
 
     # ── 2. jobs.listed_epoch column + backfill ───────────────────────────────
+    # The backfill (``UPDATE ... WHERE listed_epoch IS NULL``) must NOT run
+    # unconditionally: rows whose timestamps are permanently unparseable stay
+    # NULL and keep matching that predicate, so an unguarded call would take a
+    # write lock and full-scan on every retriever / Dagster startup. Run it only
+    # when the column was just added, or when a cheap ``LIMIT 1`` probe shows
+    # there is still work to do.
     cols = {row[1] for row in cursor.execute("PRAGMA table_info(jobs)").fetchall()}
     if "listed_epoch" not in cols:
         cursor.execute("ALTER TABLE jobs ADD COLUMN listed_epoch INTEGER")
         schema_changed = True
+        cursor.execute(LISTED_EPOCH_BACKFILL_SQL)
+    elif cursor.execute(
+        "SELECT 1 FROM jobs WHERE listed_epoch IS NULL LIMIT 1"
+    ).fetchone():
+        cursor.execute(LISTED_EPOCH_BACKFILL_SQL)
 
-    # Backfill is inherently scoped (``WHERE listed_epoch IS NULL``) and safe to
-    # re-run. Its rowcount is NOT used to decide ``schema_changed``: rows whose
-    # timestamps are permanently unparseable stay NULL and would be re-matched
-    # (and re-"updated" to NULL) on every call, which would fire ANALYZE forever.
-    cursor.execute(LISTED_EPOCH_BACKFILL_SQL)
-
-    # ── 3. drop a stale idx_jobs_listed so create_indexes() rebuilds it ──────
+    # ── 3. drop a stale idx_jobs_listed so it is rebuilt on the new shape ────
     stale = _index_sql(cursor, "idx_jobs_listed")
     if stale is not None and "listed_epoch" not in stale:
         cursor.execute("DROP INDEX IF EXISTS idx_jobs_listed")
@@ -275,8 +285,13 @@ def ensure_schema_current(conn, cursor):
 
     conn.commit()
 
-    # ── 4. refresh planner stats only on an actual schema change ─────────────
+    # ── 4. on an actual schema change: (re)build indexes + refresh stats ────
+    # Recreating the indexes here (not just in create_tables) is what makes this
+    # the single home for schema modernization — an apply-only clone that never
+    # runs a retriever still ends up with idx_jobs_listed on the new shape, so
+    # get_pending_jobs's _has_index() check is a safety net, not load-bearing.
     if schema_changed:
+        create_indexes(conn, cursor)   # CREATE INDEX IF NOT EXISTS — idempotent
         cursor.execute("ANALYZE")
         conn.commit()
 
