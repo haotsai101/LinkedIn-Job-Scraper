@@ -53,7 +53,22 @@ def migrate(db_path: str | Path = DEFAULT_DB_PATH) -> None:
         }
 
         for name, stmt in INDEX_STATEMENTS.items():
-            cursor.execute(stmt)
+            try:
+                cursor.execute(stmt)
+            except sqlite3.OperationalError as exc:
+                # INDEX_STATEMENTS is the end-state source of truth and may name a
+                # column introduced by a later migration (e.g. idx_jobs_listed now
+                # targets jobs.listed_epoch, added in 002). On a DB that hasn't run
+                # that migration yet that one index is deferred to it. Any other
+                # OperationalError — or a missing column on a different index — is
+                # a real failure and must propagate.
+                if name == "idx_jobs_listed" and "no such column" in str(exc).lower():
+                    print(
+                        f"[001_indexes] index {name}: deferred ({exc}) "
+                        "— a later migration owns it"
+                    )
+                    continue
+                raise
             if name in existing:
                 print(f"[001_indexes] index {name}: already present, skipped")
             else:

@@ -58,6 +58,12 @@ from openai import OpenAI, AsyncOpenAI
 from playwright.async_api import async_playwright
 
 from linkedin_apply import EasyApplyFlow, OffsiteApplyFlow, _get_profile_value, _session_llm_state
+from scripts.create_db import (
+    BLOCKED_ENTITIES_DDL,
+    BLOCKED_ENTITIES_SEED,
+    INDEX_STATEMENTS,
+    LISTED_EPOCH_BACKFILL_SQL,
+)
 
 sys.stdout.reconfigure(line_buffering=True)
 
@@ -65,18 +71,14 @@ sys.stdout.reconfigure(line_buffering=True)
 
 DB_PATH      = str(Path(__file__).parent / "linkedin_jobs.db")
 
-# Companies to permanently skip (case-insensitive substring match on company name)
-BLOCKED_COMPANIES = {
-    "synergisticit",
-    "ladders",       # theladders.com — paid job board, requires Ladders account
-}
-
-# Job posting domains that can't be auto-applied (OAuth-only, paid walls, etc.)
-BLOCKED_DOMAINS = {
-    "theladders.com",
-    "ed.crossover.com",  # Apply with Google/LinkedIn only — no form
-    "rex.zone",
-}
+# Blocklist patterns now live in the ``blocked_entities`` SQLite table (migrated
+# by scripts/migrations/002_schema.py). ``scripts.create_db.BLOCKED_ENTITIES_SEED``
+# is the single source of truth for the fallback seed rows; the two sets below are
+# derived from it purely for the in-process URL check in run_session (which does a
+# Python ``in`` test, never SQL interpolation). get_pending_jobs filters against
+# the table with a parameterized NOT EXISTS — it does not read these constants.
+BLOCKED_COMPANIES = {p for kind, p, _ in BLOCKED_ENTITIES_SEED if kind == "company"}
+BLOCKED_DOMAINS = {p for kind, p, _ in BLOCKED_ENTITIES_SEED if kind == "ats_domain"}
 PROFILE_PATH = "user_profile.json"
 LOG_PATH     = "application_log.json"
 LLM_LOG_PATH = "llm_debug.jsonl"
@@ -643,41 +645,107 @@ def migrate_db(conn, cursor):
         print("DB migrated: added 'applied' column.")
 
 
-def get_pending_jobs(cursor, limit=None, apply_type=None, include_failed=False):
-    where_extra = ""
-    if apply_type:
-        types = [f"'{t.strip()}'" for t in apply_type.split(",")]
-        where_extra = f" AND j.application_type IN ({', '.join(types)})"
-    blocked_clause = ""
-    if BLOCKED_COMPANIES:
-        conditions = " AND ".join(
-            f"LOWER(COALESCE(c.name, '')) NOT LIKE '%{co}%'"
-            for co in BLOCKED_COMPANIES
-        )
-        blocked_clause = f" AND ({conditions})"
-    applied_filter = "(j.applied IS NULL OR j.applied = -2)" if include_failed else "j.applied IS NULL"
-    query = f"""
-        SELECT j.job_id, j.title, j.job_posting_url, j.location,
-               j.formatted_experience_level, j.description,
-               COALESCE(c.name, '') AS company_name,
-               j.application_type,
-               COALESCE(j.posting_domain, '') AS posting_domain,
-               COALESCE(j.application_url, '') AS application_url
-        FROM jobs j
-        LEFT JOIN companies c ON j.company_id = c.company_id
-        WHERE j.scraped > 0
-          AND {applied_filter}
-          AND (
-              j.remote_allowed = 1
-              OR LOWER(j.location) LIKE '%remote%'
-              OR LOWER(j.location) LIKE '%utah%'
-              OR LOWER(j.location) LIKE '%, ut%'
-          ){where_extra}{blocked_clause}
-        ORDER BY COALESCE(j.original_listed_time, 0) DESC
+def _ensure_apply_schema(cursor):
+    """Bring an apply-agent DB up to the T9 baseline. Idempotent + cheap.
+
+    ``get_pending_jobs`` sorts on ``jobs.listed_epoch`` and filters against the
+    ``blocked_entities`` table — both introduced by
+    scripts/migrations/002_schema.py. This guard lets the function also work on a
+    database that has not had that migration run yet, and on the bare fixtures
+    used by tests. When the schema is already current every check below is a
+    no-op. Seed / DDL come from scripts.create_db (bound params — never
+    interpolated).
     """
+    # TODO(T19): consolidate with the startup auto-migrator
+    cursor.execute(BLOCKED_ENTITIES_DDL)
+    cursor.executemany(
+        "INSERT OR IGNORE INTO blocked_entities (kind, pattern, reason) VALUES (?, ?, ?)",
+        BLOCKED_ENTITIES_SEED,
+    )
+
+    cols = {row[1] for row in cursor.execute("PRAGMA table_info(jobs)").fetchall()}
+    if "listed_epoch" not in cols:
+        cursor.execute("ALTER TABLE jobs ADD COLUMN listed_epoch INTEGER")
+        cursor.execute(LISTED_EPOCH_BACKFILL_SQL)
+        cursor.execute("DROP INDEX IF EXISTS idx_jobs_listed")
+        cursor.execute(INDEX_STATEMENTS["idx_jobs_listed"])
+        cursor.execute("ANALYZE")
+        print("DB migrated: added 'listed_epoch' column + rebuilt idx_jobs_listed.")
+
+    cursor.connection.commit()
+
+
+def _has_index(cursor, name: str) -> bool:
+    return cursor.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='index' AND name=?", (name,)
+    ).fetchone() is not None
+
+
+def get_pending_jobs(cursor, limit=None, apply_type=None, include_failed=False):
+    """Return pending apply candidates, newest first.
+
+    Every dynamic value is passed as a bound parameter. The pieces of SQL
+    assembled by string concatenation below are fixed fragments chosen by a
+    branch (the ``applied`` predicate, the optional index hint) and an
+    ``IN (?, ?, ...)`` placeholder list (structure, not values) — no caller data
+    is ever interpolated. Blocked companies are filtered via a parameterized
+    NOT EXISTS against the ``blocked_entities`` table rather than interpolated
+    LIKE clauses.
+    """
+    _ensure_apply_schema(cursor)
+
+    params: list = []
+
+    # Fixed fragments — not interpolated values. The no-OR form on the hot
+    # (``--auto``) path lets a single seek on idx_jobs_listed satisfy both the
+    # predicate and the ORDER BY; the OR form used by the interactive path forces
+    # a small TEMP B-TREE sort (only pending + failed rows) and is left unhinted.
+    if include_failed:
+        applied_clause = "(j.applied IS NULL OR j.applied = -2)"
+        index_hint = " "
+    else:
+        applied_clause = "j.applied IS NULL"
+        index_hint = (
+            " INDEXED BY idx_jobs_listed " if _has_index(cursor, "idx_jobs_listed") else " "
+        )
+
+    type_clause = ""
+    if apply_type:
+        types = [t.strip() for t in apply_type.split(",") if t.strip()]
+        if types:
+            type_clause = " AND j.application_type IN (" + ", ".join(["?"] * len(types)) + ")"
+            params.extend(types)
+
+    query = (
+        "SELECT j.job_id, j.title, j.job_posting_url, j.location, "
+        "       j.formatted_experience_level, j.description, "
+        "       COALESCE(c.name, '') AS company_name, "
+        "       j.application_type, "
+        "       COALESCE(j.posting_domain, '') AS posting_domain, "
+        "       COALESCE(j.application_url, '') AS application_url "
+        "FROM jobs j" + index_hint +
+        "LEFT JOIN companies c ON j.company_id = c.company_id "
+        "WHERE j.scraped > 0 "
+        "  AND " + applied_clause + " "
+        "  AND ( "
+        "      j.remote_allowed = 1 "
+        "      OR LOWER(j.location) LIKE '%remote%' "
+        "      OR LOWER(j.location) LIKE '%utah%' "
+        "      OR LOWER(j.location) LIKE '%, ut%' "
+        "  )"
+        + type_clause +
+        "  AND NOT EXISTS ( "
+        "      SELECT 1 FROM blocked_entities be "
+        "      WHERE be.kind = 'company' "
+        "        AND be.pattern <> '' "
+        "        AND LOWER(COALESCE(c.name, '')) LIKE '%' || LOWER(be.pattern) || '%' "
+        "  ) "
+        "ORDER BY j.listed_epoch DESC"
+    )
     if limit:
-        query += f" LIMIT {int(limit)}"
-    cursor.execute(query)
+        query += " LIMIT ?"
+        params.append(int(limit))
+    cursor.execute(query, params)
     return cursor.fetchall()
 
 

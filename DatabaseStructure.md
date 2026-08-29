@@ -1,115 +1,140 @@
 # Database Structure
 
-### JOBS
+<!-- GENERATED FILE — do not edit by hand.
+     Regenerate with:  python scripts/dump_schema.py > DatabaseStructure.md
+     Schema DDL for fresh databases lives in scripts/create_db.py;
+     migrations that evolve an existing database live in scripts/migrations/. -->
 
-| Column | Description |
-| --- | --- |
-| job_id | The job ID as defined by LinkedIn (https://www.linkedin.com/jobs/view/{ job_id }) |
-| company_id | Identifier for the company associated with the job posting (maps to companies.csv) |
-| title | Job title |
-| description | Job description |
-| max_salary | Maximum salary |
-| med_salary | Median salary |
-| min_salary | Minimum salary |
-| pay_period | Pay period for salary (Hourly, Monthly, Yearly) |
-| formatted_work_type | Type of work (Fulltime, Parttime, Contract) |
-| location | Job location |
-| applies | Number of applications that have been submitted |
-| original_listed_time | Original time the job was listed |
-| remote_allowed | Whether job permits remote work |
-| views | Number of times the job posting has been viewed |
-| job_posting_url | URL to the job posting on a platform |
-| application_url | URL where applications can be submitted |
-| application_type | Type of application process (offsite, complex/simple onsite) |
-| expiry | Expiration date or time for the job listing |
-| closed_time | Time to close job listing |
-| formatted_experience_level | Job experience level (entry, associate, executive, etc) |
-| skills_desc | Description detailing required skills for job |
-| listed_time | Time when the job was listed |
-| posting_domain | Domain of the website with application |
-| sponsored | Whether the job listing is sponsored or promoted |
-| work_type | Type of work associated with the job |
-| currency | Currency in which the salary is provided |
-| compensation_type | Type of compensation for the job |
-| scraped | Has been scraped by ```details_retriever``` |
-| inferred_benefits | EMPTY |
-| years_experience | EMPTY |
-| job_region | EMPTY |
-| degree | EMPTY |
+## benefits
 
-### SALARIES
-| Column | Description |
-| --- | --- |
-| salary_id | The salary ID |
-| job_id | The job ID (references jobs table) |
-| max_salary | Maximum salary |
-| med_salary | Median salary |
-| min_salary | Minimum salary |
-| pay_period | Pay period for salary (Hourly, Monthly, Yearly) |
-| currency | Currency in which the salary is provided |
-| compensation_type | Type of compensation for the job (Fixed, Variable, etc) |
+| Column | Type | Not Null | Default | PK |
+| --- | --- | --- | --- | --- |
+| job_id | INTEGER | yes |  | 1 |
+| inferred | INTEGER | yes |  |  |
+| type | TEXT | yes |  | 2 |
 
-### BENEFITS
-| Column | Description |
-| --- | --- |
-| job_id | The job ID |
-| type | Type of benefit provided (401K, Medical Insurance, etc) |
-| inferred | Whether the benefit was explicitly tagged or inferred through text by LinkedIn |
+## blocked_entities
 
-### COMPANIES
-| Column | Description |
-| --- | --- |
-| company_id | The company ID as defined by LinkedIn |
-| name | Company name |
-| description | Company description |
-| company_size | Company grouping based on number of employees (0 Smallest - 7 Largest) |
-| country | Country of company headquarters |
-| state | State of company headquarters |
-| city | City of company headquarters |
-| zip_code | ZIP code of company's headquarters |
-| address | Address of company's headquarters |
-| url | Link to company's LinkedIn page |
+| Column | Type | Not Null | Default | PK |
+| --- | --- | --- | --- | --- |
+| kind | TEXT | yes |  | 1 |
+| pattern | TEXT | yes |  | 2 |
+| reason | TEXT |  |  |  |
 
-### EMPLOYEE_COUNTS
-| Column | Description |
-| --- | --- |
-| company_id | The company ID |
-| employee_count | Number of employees at company |
-| follower_count | Number of company followers on LinkedIn |
-| time_recorded | Unix time of data collection |
+## companies
 
-### SKILLS
-| Column | Description |
-| --- | --- |
-| skill_abr | The skill abbreviation (primary key) |
-| skill_name | The skill name |
+| Column | Type | Not Null | Default | PK |
+| --- | --- | --- | --- | --- |
+| company_id | INTEGER |  |  | 1 |
+| name | TEXT |  |  |  |
+| description | TEXT |  |  |  |
+| company_size | INTEGER |  |  |  |
+| state | TEXT |  |  |  |
+| country | TEXT |  |  |  |
+| city | TEXT |  |  |  |
+| zip_code | TEXT |  |  |  |
+| address | TEXT |  |  |  |
+| url | TEXT |  |  |  |
 
-### JOB_SKILLS
-| Column | Description |
-| --- | --- |
-| job_id | The job ID (references jobs table and primary key) |
-| skill_abr | The skill abbreviation (references skills table) |
+## company_industries
 
-### INDUSTRIES
-| Column | Description |
-| --- | --- |
-| industry_id | The industry ID (primary key) |
-| industry_name | The industry name |
+| Column | Type | Not Null | Default | PK |
+| --- | --- | --- | --- | --- |
+| company_id | INTEGER | yes |  | 1 |
+| industry | INTEGER | yes |  | 2 |
 
-### JOB_INDUSTRIES
-| Column | Description |
-| --- | --- |
-| job_id | The job ID (references jobs table and primary key) |
-| industry_id | The industry ID (references industries table) |
+## company_specialities
 
-### COMPANY_SPECIALITIES
-| Column | Description |
-| --- | --- |
-| company_id | The company ID (references companies table and primary key) |
-| speciality | The speciality ID |
+| Column | Type | Not Null | Default | PK |
+| --- | --- | --- | --- | --- |
+| company_id | INTEGER | yes |  | 1 |
+| speciality | INTEGER | yes |  | 2 |
 
-### COMPANY_INDUSTRIES
-| Column | Description |
-| --- | --- |
-| company_id | The company ID (references companies table and primary key) |
-| industry | The industry ID |
+## employee_counts
+
+| Column | Type | Not Null | Default | PK |
+| --- | --- | --- | --- | --- |
+| company_id | INTEGER | yes |  | 2 |
+| employee_count | INTEGER |  |  | 1 |
+| follower_count | INTEGER |  |  |  |
+| time_recorded | INTEGER | yes |  |  |
+
+## industries
+
+| Column | Type | Not Null | Default | PK |
+| --- | --- | --- | --- | --- |
+| industry_id | INTEGER |  |  | 1 |
+| industry_name | TEXT |  |  |  |
+
+## job_industries
+
+| Column | Type | Not Null | Default | PK |
+| --- | --- | --- | --- | --- |
+| job_id | INTEGER |  |  | 1 |
+| industry_id | INTEGER |  |  | 2 |
+
+## job_skills
+
+| Column | Type | Not Null | Default | PK |
+| --- | --- | --- | --- | --- |
+| job_id | INTEGER |  |  | 1 |
+| skill_abr | TEXT |  |  | 2 |
+
+## jobs
+
+| Column | Type | Not Null | Default | PK |
+| --- | --- | --- | --- | --- |
+| job_id | INTEGER |  |  | 1 |
+| scraped | INTEGER | yes | 0 |  |
+| company_id | INTEGER |  |  |  |
+| work_type | TEXT |  |  |  |
+| formatted_work_type | TEXT |  |  |  |
+| location | TEXT |  |  |  |
+| job_posting_url | TEXT |  |  |  |
+| applies | INTEGER |  |  |  |
+| original_listed_time | TEXT |  |  |  |
+| remote_allowed | INTEGER |  |  |  |
+| application_url | TEXT |  |  |  |
+| application_type | TEXT |  |  |  |
+| expiry | TEXT |  |  |  |
+| inferred_benefits | TEXT |  |  |  |
+| closed_time | TEXT |  |  |  |
+| formatted_experience_level | TEXT |  |  |  |
+| years_experience | INTEGER |  |  |  |
+| description | TEXT |  |  |  |
+| title | TEXT |  |  |  |
+| skills_desc | TEXT |  |  |  |
+| views | INTEGER |  |  |  |
+| job_region | TEXT |  |  |  |
+| listed_time | TEXT |  |  |  |
+| degree | TEXT |  |  |  |
+| posting_domain | TEXT |  |  |  |
+| sponsored | INTEGER |  |  |  |
+| applied | INTEGER |  | NULL |  |
+| listed_epoch | INTEGER |  |  |  |
+
+Indexes:
+- `idx_jobs_apptype` — `CREATE INDEX idx_jobs_apptype ON jobs(application_type)`
+- `idx_jobs_company` — `CREATE INDEX idx_jobs_company ON jobs(company_id)`
+- `idx_jobs_listed` — `CREATE INDEX idx_jobs_listed ON jobs(applied, listed_epoch DESC)`
+- `idx_jobs_pending` — `CREATE INDEX idx_jobs_pending ON jobs(applied, scraped)`
+
+## salaries
+
+| Column | Type | Not Null | Default | PK |
+| --- | --- | --- | --- | --- |
+| salary_id | INTEGER |  |  | 1 |
+| job_id | INTEGER | yes |  |  |
+| max_salary | FLOAT |  |  |  |
+| med_salary | FLOAT |  |  |  |
+| min_salary | FLOAT |  |  |  |
+| pay_period | TEXT |  |  |  |
+| currency | TEXT |  |  |  |
+| compensation_type | TEXT |  |  |  |
+
+## skills
+
+| Column | Type | Not Null | Default | PK |
+| --- | --- | --- | --- | --- |
+| skill_abr | TEXT |  |  | 1 |
+| skill_name | TEXT |  |  |  |
