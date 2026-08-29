@@ -36,4 +36,4 @@ graphify-out/
 media/
 # Claude Code local settings (may contain machine-specific paths)
 .claude/settings.local.json
-.claude/agent-memory//scripts/migrations/__pycache__/
+.claude/agent-memory/

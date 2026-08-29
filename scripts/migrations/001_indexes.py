@@ -20,17 +20,16 @@ import sqlite3
 import sys
 from pathlib import Path
 
+# Allow running as a bare script (python scripts/migrations/001_indexes.py):
+# add the repo root to sys.path so `scripts.create_db` imports.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+# Single source of truth for the index DDL — no local copy to keep in sync.
+from scripts.create_db import INDEX_STATEMENTS  # noqa: E402
+
 DEFAULT_DB_PATH = "linkedin_jobs.db"
-
-# Keep in sync with scripts/create_db.py:INDEX_STATEMENTS
-INDEX_STATEMENTS = (
-    "CREATE INDEX IF NOT EXISTS idx_jobs_pending ON jobs(applied, scraped)",
-    "CREATE INDEX IF NOT EXISTS idx_jobs_company ON jobs(company_id)",
-    "CREATE INDEX IF NOT EXISTS idx_jobs_listed ON jobs(original_listed_time DESC)",
-    "CREATE INDEX IF NOT EXISTS idx_jobs_apptype ON jobs(application_type)",
-)
-
-INDEX_NAMES = ("idx_jobs_pending", "idx_jobs_company", "idx_jobs_listed", "idx_jobs_apptype")
 
 
 def migrate(db_path: str | Path = DEFAULT_DB_PATH) -> None:
@@ -53,7 +52,7 @@ def migrate(db_path: str | Path = DEFAULT_DB_PATH) -> None:
             ).fetchall()
         }
 
-        for stmt, name in zip(INDEX_STATEMENTS, INDEX_NAMES):
+        for name, stmt in INDEX_STATEMENTS.items():
             cursor.execute(stmt)
             if name in existing:
                 print(f"[001_indexes] index {name}: already present, skipped")
@@ -61,17 +60,19 @@ def migrate(db_path: str | Path = DEFAULT_DB_PATH) -> None:
                 print(f"[001_indexes] index {name}: created")
         conn.commit()
 
-        # journal_mode must be set outside an open transaction.
+        # journal_mode must be set outside an open transaction (commit above).
         before = cursor.execute("PRAGMA journal_mode").fetchone()[0]
         after = cursor.execute("PRAGMA journal_mode=WAL").fetchone()[0]
         if before.lower() == "wal":
             print("[001_indexes] journal_mode: already 'wal', unchanged")
-        else:
+        elif after.lower() == "wal":
             print(f"[001_indexes] journal_mode: '{before}' -> '{after}'")
-
-        if after.lower() != "wal":
-            raise SystemExit(
-                f"error: failed to enable WAL journal mode (still '{after}')"
+        else:
+            # Not fatal: the indexes (the substantive change) are already
+            # committed. WAL commonly can't be enabled on network filesystems.
+            print(
+                f"[001_indexes] warning: WAL not enabled (still '{after}') — "
+                "indexes applied successfully; WAL often fails on network filesystems"
             )
     finally:
         conn.close()
