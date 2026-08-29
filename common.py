@@ -22,6 +22,7 @@ LLM_LOG_PATH = "llm_debug.jsonl"
 
 # Directory where the apply flows dump per-step / per-failure PNGs
 # (``linkedin_apply.py`` writes ``debug_screenshots/<session_ts>_...png``).
+# keep in sync with the "debug_screenshots" literal in linkedin_apply.py
 DEBUG_SCREENSHOT_DIR = "debug_screenshots"
 
 
@@ -115,8 +116,19 @@ def prune_debug_screenshots(keep: int = 100, screenshot_dir: str = DEBUG_SCREENS
         files = [p for p in files if os.path.isfile(p)]
         if len(files) <= keep:
             return
-        files.sort(key=os.path.getmtime)
-        for p in files[: len(files) - keep]:
+        # Snapshot mtimes defensively: a concurrent apply run or external cleanup
+        # could unlink a file between listdir and the sort, and a bare
+        # ``key=os.path.getmtime`` would raise mid-sort and abort the prune.
+        stamped = []
+        for p in files:
+            try:
+                stamped.append((os.path.getmtime(p), p))
+            except OSError:
+                pass
+        if len(stamped) <= keep:
+            return
+        stamped.sort()
+        for _, p in stamped[: len(stamped) - keep]:
             try:
                 os.remove(p)
             except OSError:
