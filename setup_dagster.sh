@@ -28,7 +28,7 @@ echo "✓ Created $DAGSTER_HOME/dagster.yaml"
 
 # Test if dependencies are installed
 python -c "import dagster; print(f'✓ Dagster {dagster.__version__} is installed')" 2>/dev/null || {
-    echo "✗ Dagster is not installed. Run: pip install -r requirements.txt"
+    echo "✗ Dagster is not installed. Run: pip install -e '.[dev]'"
     exit 1
 }
 

@@ -26,11 +26,12 @@ python apply_jobs.py --type SimpleOnsiteApply,ComplexOnsiteApply  # EasyApply on
 # Export to CSV
 python to_csv.py --folder <dest> --database linkedin_jobs.db
 
-# Lint
+# Lint / test
 ruff check .
+pytest
 ```
 
-There is no test suite. Linting is configured via ruff (`ruff check .`); config lives in `pyproject.toml`.
+Linting (`ruff`) and tests (`pytest`, under `tests/`) are configured in `pyproject.toml`.
 
 ## Git workflow
 
