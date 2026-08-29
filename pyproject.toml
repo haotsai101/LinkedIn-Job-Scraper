@@ -39,6 +39,7 @@ testpaths = ["tests"]
 [tool.setuptools]
 packages = ["scripts"]
 py-modules = [
+    "config",
     "apply_jobs",
     "linkedin_apply",
     "script_engine",
