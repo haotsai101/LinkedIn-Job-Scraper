@@ -22,7 +22,8 @@ dependencies = [
     "dagster-webserver>=1.12.18",
     "playwright>=1.44.0",
     "httpx>=0.27.0",
-    "openai>=1.0.0",  # deprecated: removed in Phase 2 (T14)
+    "openai>=1.0.0",  # deprecated: still used by the NIM classifier + browser-use paths; removed in T14b
+    "claude-agent-sdk>=0.1.0",  # Easy Apply classifier (subscription auth, no API key) — T14
 ]
 
 [project.optional-dependencies]
@@ -41,6 +42,8 @@ packages = ["scripts"]
 py-modules = [
     "config",
     "common",
+    "llm",
+    "nim_client",
     "apply_jobs",
     "linkedin_apply",
     "script_engine",

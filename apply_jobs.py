@@ -51,14 +51,13 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
 
-import httpx
-import subprocess
-
 from openai import OpenAI, AsyncOpenAI
 from playwright.async_api import async_playwright
 
-from common import extract_json_object, prune_debug_screenshots, rotate_llm_log, strip_code_fence
+import nim_client
+from common import prune_debug_screenshots, rotate_llm_log
 from common import write_llm_log as _write_llm_log
+from llm import ClaudeSession
 from linkedin_apply import EasyApplyFlow, OffsiteApplyFlow, _get_profile_value, _session_llm_state
 from scripts.create_db import BLOCKED_ENTITIES_SEED, ensure_schema_current
 
@@ -204,14 +203,15 @@ def load_env():
     browser_model          = os.environ.get("BROWSER_LLM_MODEL", model).strip()
     browser_fallback_model = os.environ.get("BROWSER_LLM_FALLBACK_MODEL", browser_model).strip()
 
-    classifier_api_key = os.environ.get("CLASSIFIER_LLM_API", api_key).strip()
-    classifier_url     = os.environ.get("CLASSIFIER_LLM_URL", base_url).strip()
-    classifier_model   = os.environ.get("CLASSIFIER_LLM_MODEL", model).strip()
+    # The classifier no longer reads LLM_* / CLASSIFIER_LLM_* here — it resolves
+    # its own config: OffsiteApply → nim_client (config.get_llm_config("classifier"),
+    # which still honours CLASSIFIER_* and the legacy aliases), Easy Apply →
+    # Claude Agent SDK subscription auth. (T14 part 1.)
 
     if not api_key or not base_url:
         sys.exit("Error: LLM_API and LLM_URL must be set (in .env or environment).")
 
-    return api_key, base_url, model, gmail_user, gmail_pass, max_auto_env, browser_api_key, browser_url, browser_model, browser_fallback_model, classifier_api_key, classifier_url, classifier_model
+    return api_key, base_url, model, gmail_user, gmail_pass, max_auto_env, browser_api_key, browser_url, browser_model, browser_fallback_model
 
 
 # ── User profile ────────────────────────────────────────────────────────────────
@@ -510,7 +510,27 @@ def search_accounts(query: str) -> list[dict]:
 # ── LLM classifier ─────────────────────────────────────────────────────────────
 
 class JobAgent:
-    _MODEL = "claude-haiku-4-5"
+    """Job-relevance classifier.
+
+    Routing (``application_type`` is a known DB column, so it is decided before
+    any LLM call):
+
+    * citizenship / clearance keyword in the description  → immediate skip,
+      no LLM call on either backend.
+    * ``application_type == "OffsiteApply"``              → NIM (OpenAI-compatible,
+      ``config.get_llm_config("classifier")`` → llama-3.1-8b @ NVIDIA NIM). Free.
+    * ``SimpleOnsiteApply`` / ``ComplexOnsiteApply`` / anything else
+      → Claude Agent SDK (``llm.ClaudeSession``, subscription auth).
+
+    Both LLM paths use structured output, so the old markdown-fence / prose
+    JSON-salvage ladder is gone. One :class:`~llm.ClaudeSession` is created
+    lazily on the first Easy Apply job and reused for the rest of the session;
+    :meth:`aclose` tears it down (call it from ``run_session``'s ``finally``).
+    """
+
+    # Cheap Claude model for the Agent-SDK classifier path (Easy Apply jobs).
+    _AGENT_MODEL = "claude-haiku-4-5"
+
     _SYSTEM = """You are a job application assistant helping the user review LinkedIn job listings.
 
 User profile:
@@ -519,10 +539,31 @@ User profile:
 Classify whether a job is relevant (software engineering, AI/ML, data engineering/science/analytics).
 Be accurate and concise. Never fabricate information not in the user's profile."""
 
-    def __init__(self, profile: dict):
-        self._system = self._SYSTEM.format(profile=json.dumps(profile, indent=2))
+    # JSON Schema shared by both routes (Agent SDK native structured output +
+    # the prompt hint the NIM json_object mode is steered with).
+    _CLASSIFY_SCHEMA = {
+        "type": "object",
+        "properties": {
+            "relevant": {"type": "boolean"},
+            "reason": {"type": "string"},
+            "citizenship_required": {"type": "boolean"},
+        },
+        "required": ["relevant", "reason", "citizenship_required"],
+        "additionalProperties": False,
+    }
 
-    # Keyword patterns that unambiguously require US citizenship — checked before LLM call
+    _AGENT_PROMPT = (
+        "Review this job posting on two dimensions:\n"
+        "1. Is it related to software engineering, AI/ML, or data (engineering/science/analytics)?\n"
+        "2. Does it explicitly require US citizenship or an active US security clearance "
+        "(e.g. 'must be a US citizen', 'TS/SCI required', 'active Secret clearance')?\n\n"
+        "Title: {title}\n\n"
+        "Description:\n{description}\n\n"
+        'Respond with JSON: {{"relevant": true|false, "reason": "<one sentence>", '
+        '"citizenship_required": true|false}}'
+    )
+
+    # Keyword patterns that unambiguously require US citizenship — checked before any LLM call
     _CITIZENSHIP_KEYWORDS = (
         "must be a u.s. citizen", "must be a us citizen",
         "must be us citizens", "us citizens or us persons",
@@ -538,7 +579,21 @@ Be accurate and concise. Never fabricate information not in the user's profile."
         "active ts clearance",
     )
 
-    def classify(self, title: str, description: str) -> tuple[bool, str, bool]:
+    def __init__(self, profile: dict):
+        self._system = self._SYSTEM.format(profile=json.dumps(profile, indent=2))
+        self._session: ClaudeSession | None = None
+        self._nim_client = None
+        self._nim_model = ""
+
+    async def aclose(self) -> None:
+        """Tear down the Agent SDK session, if one was started. Idempotent."""
+        if self._session is not None:
+            await self._session.aclose()
+            self._session = None
+
+    async def classify(
+        self, title: str, description: str, application_type: str
+    ) -> tuple[bool, str, bool]:
         """Returns (relevant, reason, citizenship_required)."""
         desc = description or ""
 
@@ -547,73 +602,77 @@ Be accurate and concise. Never fabricate information not in the user's profile."
         for kw in self._CITIZENSHIP_KEYWORDS:
             if kw in desc_lower:
                 reason = f"Requires US citizenship or active clearance ({kw})"
-                _write_llm_log({
-                    "ts":      datetime.now(timezone.utc).isoformat(),
-                    "type":    "classifier",
-                    "model":   "keyword",
-                    "title":   title,
-                    "result":  {"relevant": False, "reason": reason, "citizenship_required": True},
-                })
+                self._log(title, "keyword", "keyword", None, None,
+                          {"relevant": False, "reason": reason, "citizenship_required": True})
                 return False, reason, True
 
-        prompt = (
-            "Review this job posting on two dimensions:\n"
-            "1. Is it related to software engineering, AI/ML, or data (engineering/science/analytics)?\n"
-            "2. Does it explicitly require US citizenship or an active US security clearance "
-            "(e.g. 'must be a US citizen', 'TS/SCI required', 'active Secret clearance')?\n\n"
-            f"Title: {title}\n\n"
-            f"Description:\n{desc[:3000]}\n\n"
-            'Respond with JSON: {"relevant": true|false, "reason": "<one sentence>", "citizenship_required": true|false}'
+        if application_type == "OffsiteApply":
+            return await self._classify_nim(title, desc)
+        return await self._classify_agent(title, desc)
+
+    async def _classify_nim(self, title: str, desc: str) -> tuple[bool, str, bool]:
+        if self._nim_client is None:
+            # Raises NimConfigError if no classifier key is resolvable — surfaced
+            # to run_session, which logs it and leaves the job pending.
+            self._nim_client, self._nim_model = nim_client.resolve_classifier()
+        t0 = time.monotonic()
+        data = await asyncio.to_thread(
+            nim_client.classify_via_nim, self._nim_client, self._nim_model, title, desc
         )
-        for attempt in range(3):
-            try:
-                _t0 = time.monotonic()
-                proc = subprocess.run(
-                    ["claude", "--model", self._MODEL, "-p",
-                     self._system + "\n\n" + prompt],
-                    capture_output=True,
-                    text=True,
-                    timeout=90,
-                )
-                _call_ms = int((time.monotonic() - _t0) * 1000)
-                if proc.returncode != 0:
-                    raise RuntimeError(f"claude exited {proc.returncode}: {proc.stderr[:200]}")
-                # Extract just the JSON object — Haiku may prepend/append prose
-                raw = extract_json_object(strip_code_fence(proc.stdout))
-                data = json.loads(raw)
-                relevant = bool(data.get("relevant"))
-                reason   = data.get("reason", "")
-                # If model returned the old single-dimension format (no citizenship_required field),
-                # treat as indeterminate and retry so the full two-dimension prompt is re-sent.
-                if "citizenship_required" not in data:
-                    if attempt < 2:
-                        continue
-                    # Last attempt still missing field — default conservative (assume not required)
-                citizenship_required = bool(data.get("citizenship_required", False))
-                if relevant and ("not relevant" in reason.lower() or "not related" in reason.lower()):
-                    relevant = False
-                if citizenship_required:
-                    relevant = False
-                _write_llm_log({
-                    "ts":           datetime.now(timezone.utc).isoformat(),
-                    "type":         "classifier",
-                    "model":        self._MODEL,
-                    "duration_ms":  _call_ms,
-                    "title":        title,
-                    "prompt":       prompt,
-                    "raw_response": raw,
-                    "result":       {"relevant": relevant, "reason": reason, "citizenship_required": citizenship_required},
-                })
-                return relevant, reason, citizenship_required
-            except subprocess.TimeoutExpired:
-                if attempt < 2:
-                    print(f"\n  [classifier] subprocess timeout — retrying…", end="", flush=True)
-                    time.sleep(5)
-                    print(" retrying.")
-                    continue
-                raise
-            except Exception:
-                raise
+        return self._finalize(title, "nim", self._nim_model,
+                              int((time.monotonic() - t0) * 1000), data)
+
+    async def _classify_agent(self, title: str, desc: str) -> tuple[bool, str, bool]:
+        if self._session is None:
+            self._session = ClaudeSession(
+                model=self._AGENT_MODEL,
+                system=self._system,
+                output_schema=self._CLASSIFY_SCHEMA,
+                log_type="classifier",
+                log_calls=False,  # JobAgent writes the richer telemetry line itself
+            )
+        prompt = self._AGENT_PROMPT.format(title=title, description=desc[:3000])
+        t0 = time.monotonic()
+        data = await self._session.ask_json(prompt, self._CLASSIFY_SCHEMA)
+        return self._finalize(title, "agent_sdk", self._AGENT_MODEL,
+                              int((time.monotonic() - t0) * 1000), data)
+
+    def _finalize(self, title, route, model, duration_ms, data) -> tuple[bool, str, bool]:
+        """Coerce a raw classifier JSON object into the return tuple + log it.
+
+        Shared by both routes so the citizenship override and telemetry shape
+        stay identical.
+        """
+        relevant = bool(data.get("relevant"))
+        reason = str(data.get("reason", ""))
+        citizenship_required = bool(data.get("citizenship_required", False))
+        if relevant and ("not relevant" in reason.lower() or "not related" in reason.lower()):
+            relevant = False
+        if citizenship_required:
+            relevant = False
+        result = {
+            "relevant": relevant,
+            "reason": reason,
+            "citizenship_required": citizenship_required,
+        }
+        self._log(title, route, model, duration_ms, data, result)
+        return relevant, reason, citizenship_required
+
+    @staticmethod
+    def _log(title, route, model, duration_ms, raw, result) -> None:
+        entry = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "type": "classifier",
+            "route": route,
+            "model": model,
+            "title": title,
+            "result": result,
+        }
+        if duration_ms is not None:
+            entry["duration_ms"] = duration_ms
+        if raw is not None:
+            entry["raw_response"] = raw
+        _write_llm_log(entry)
 
 
 # ── Database helpers ────────────────────────────────────────────────────────────
@@ -845,19 +904,12 @@ async def run_session(
     browser_url: str = "",
     browser_model: str = "",
     browser_fallback_model: str = "",
-    classifier_api_key: str = "",
-    classifier_url: str = "",
-    classifier_model: str = "",
     verbose: bool = False,
 ):
+    # JobAgent owns its own classifier backends now (NIM for OffsiteApply, Claude
+    # Agent SDK for Easy Apply). agent.aclose() in the finally block tears the
+    # Agent SDK session down.
     agent = JobAgent(profile)
-
-    classifier_client = OpenAI(
-        api_key=classifier_api_key or api_key,
-        base_url=classifier_url or base_url,
-        timeout=httpx.Timeout(90.0),  # 90s wall-clock per request
-    )
-    _classifier_model = classifier_model or model
 
     inbox = EmailInbox(gmail_user, gmail_pass) if gmail_user and gmail_pass else None
 
@@ -936,7 +988,7 @@ async def run_session(
                 print("  Classifying…", end="", flush=True)
                 try:
                     relevant, reason, citizenship_required = await asyncio.wait_for(
-                        asyncio.to_thread(agent.classify, title or "", description or ""),
+                        agent.classify(title or "", description or "", application_type or ""),
                         timeout=90,
                     )
                 except asyncio.TimeoutError:
@@ -1060,8 +1112,6 @@ async def run_session(
                         company_name=company_name or "",
                         job_title=title or "",
                         job_description=description or "",
-                        classifier_client=classifier_client,
-                        classifier_model=_classifier_model,
                         verbose=verbose,
                         inbox=inbox,
                         fallback_model=browser_llm_fallback,
@@ -1075,8 +1125,6 @@ async def run_session(
                         model=browser_llm_model,
                         auto_mode=auto_mode,
                         callbacks=callbacks,
-                        classifier_client=classifier_client,
-                        classifier_model=_classifier_model,
                         verbose=verbose,
                     )
                     flow._verbose_company = company_name or "unknown"
@@ -1106,8 +1154,6 @@ async def run_session(
                         company_name=company_name or "",
                         job_title=title or "",
                         job_description=description or "",
-                        classifier_client=classifier_client,
-                        classifier_model=_classifier_model,
                         verbose=verbose,
                         inbox=inbox,
                         fallback_model=browser_llm_fallback,
@@ -1273,6 +1319,7 @@ async def run_session(
                 await asyncio.sleep(2)
 
         finally:
+            await agent.aclose()  # kill the Claude Agent SDK subprocess, if any
             conn.close()
             await browser.close()
             print("  Browser closed.")
@@ -1318,7 +1365,7 @@ def main():
     parser.add_argument("--verbose",      action="store_true", help="Print full LLM prompt/response and save screenshots per step.")
     args = parser.parse_args()
 
-    api_key, base_url, model, gmail_user, gmail_pass, max_auto_env, browser_api_key, browser_url, browser_model, browser_fallback_model, classifier_api_key, classifier_url, classifier_model = load_env()
+    api_key, base_url, model, gmail_user, gmail_pass, max_auto_env, browser_api_key, browser_url, browser_model, browser_fallback_model = load_env()
     client = OpenAI(api_key=api_key, base_url=base_url)
 
     conn   = sqlite3.connect(DB_PATH)
@@ -1400,9 +1447,6 @@ def main():
             browser_url=browser_url,
             browser_model=browser_model,
             browser_fallback_model=browser_fallback_model,
-            classifier_api_key=classifier_api_key,
-            classifier_url=classifier_url,
-            classifier_model=classifier_model,
             verbose=args.verbose,
         )
     )
