@@ -54,10 +54,10 @@ from pathlib import Path
 from openai import OpenAI, AsyncOpenAI
 from playwright.async_api import async_playwright
 
+import llm
 import nim_client
 from common import prune_debug_screenshots, rotate_llm_log
 from common import write_llm_log as _write_llm_log
-from llm import ClaudeSession
 from linkedin_apply import EasyApplyFlow, OffsiteApplyFlow, _get_profile_value, _session_llm_state
 from scripts.create_db import BLOCKED_ENTITIES_SEED, ensure_schema_current
 
@@ -519,13 +519,15 @@ class JobAgent:
       no LLM call on either backend.
     * ``application_type == "OffsiteApply"``              → NIM (OpenAI-compatible,
       ``config.get_llm_config("classifier")`` → llama-3.1-8b @ NVIDIA NIM). Free.
-    * ``SimpleOnsiteApply`` / ``ComplexOnsiteApply`` / anything else
-      → Claude Agent SDK (``llm.ClaudeSession``, subscription auth).
+    * ``SimpleOnsiteApply`` / ``ComplexOnsiteApply`` / anything else (incl.
+      ``None``)                                          → Claude Agent SDK
+      (``llm.query_json``, one isolated one-shot session per job, subscription auth).
 
-    Both LLM paths use structured output, so the old markdown-fence / prose
-    JSON-salvage ladder is gone. One :class:`~llm.ClaudeSession` is created
-    lazily on the first Easy Apply job and reused for the rest of the session;
-    :meth:`aclose` tears it down (call it from ``run_session``'s ``finally``).
+    Both LLM paths ask for structured JSON output but still salvage a stray code
+    fence / prose wrapper before giving up. Each LLM call is retried once on a
+    transient failure (:meth:`_run_with_retry`); a hard failure propagates to
+    ``run_session``, which leaves the job pending and only aborts the batch
+    after several classifications fail in a row.
     """
 
     # Cheap Claude model for the Agent-SDK classifier path (Easy Apply jobs).
@@ -579,20 +581,18 @@ Be accurate and concise. Never fabricate information not in the user's profile."
         "active ts clearance",
     )
 
+    # A transient LLM call is retried this many times total before the error
+    # propagates to run_session.
+    _CALL_ATTEMPTS = 2
+    _RETRY_DELAY_S = 2.0
+
     def __init__(self, profile: dict):
         self._system = self._SYSTEM.format(profile=json.dumps(profile, indent=2))
-        self._session: ClaudeSession | None = None
         self._nim_client = None
         self._nim_model = ""
 
-    async def aclose(self) -> None:
-        """Tear down the Agent SDK session, if one was started. Idempotent."""
-        if self._session is not None:
-            await self._session.aclose()
-            self._session = None
-
     async def classify(
-        self, title: str, description: str, application_type: str
+        self, title: str, description: str, application_type: str | None
     ) -> tuple[bool, str, bool]:
         """Returns (relevant, reason, citizenship_required)."""
         desc = description or ""
@@ -610,30 +610,50 @@ Be accurate and concise. Never fabricate information not in the user's profile."
             return await self._classify_nim(title, desc)
         return await self._classify_agent(title, desc)
 
+    async def _run_with_retry(self, factory):
+        """Await ``factory()``, retrying once on a transient failure.
+
+        ``NimConfigError`` is deterministic (missing key) so it is never
+        retried — it propagates immediately.
+        """
+        for attempt in range(1, self._CALL_ATTEMPTS + 1):
+            try:
+                return await factory()
+            except nim_client.NimConfigError:
+                raise
+            except Exception as exc:
+                if attempt >= self._CALL_ATTEMPTS:
+                    raise
+                print(f"\n  [classifier] attempt {attempt} failed ({exc}) — retrying…",
+                      flush=True)
+                await asyncio.sleep(self._RETRY_DELAY_S)
+
     async def _classify_nim(self, title: str, desc: str) -> tuple[bool, str, bool]:
         if self._nim_client is None:
             # Raises NimConfigError if no classifier key is resolvable — surfaced
-            # to run_session, which logs it and leaves the job pending.
+            # to run_session, which leaves the job pending.
             self._nim_client, self._nim_model = nim_client.resolve_classifier()
         t0 = time.monotonic()
-        data = await asyncio.to_thread(
-            nim_client.classify_via_nim, self._nim_client, self._nim_model, title, desc
+        data = await self._run_with_retry(
+            lambda: asyncio.to_thread(
+                nim_client.classify_via_nim,
+                self._nim_client, self._nim_model, title, desc,
+            )
         )
         return self._finalize(title, "nim", self._nim_model,
                               int((time.monotonic() - t0) * 1000), data)
 
     async def _classify_agent(self, title: str, desc: str) -> tuple[bool, str, bool]:
-        if self._session is None:
-            self._session = ClaudeSession(
-                model=self._AGENT_MODEL,
-                system=self._system,
-                output_schema=self._CLASSIFY_SCHEMA,
-                log_type="classifier",
-                log_calls=False,  # JobAgent writes the richer telemetry line itself
-            )
         prompt = self._AGENT_PROMPT.format(title=title, description=desc[:3000])
         t0 = time.monotonic()
-        data = await self._session.ask_json(prompt, self._CLASSIFY_SCHEMA)
+        # One-shot isolated session per job — NOT a persistent client. See
+        # llm.query_json / issue #560.
+        data = await self._run_with_retry(
+            lambda: llm.query_json(
+                prompt, self._CLASSIFY_SCHEMA,
+                model=self._AGENT_MODEL, system=self._system, log_calls=False,
+            )
+        )
         return self._finalize(title, "agent_sdk", self._AGENT_MODEL,
                               int((time.monotonic() - t0) * 1000), data)
 
@@ -906,10 +926,13 @@ async def run_session(
     browser_fallback_model: str = "",
     verbose: bool = False,
 ):
-    # JobAgent owns its own classifier backends now (NIM for OffsiteApply, Claude
-    # Agent SDK for Easy Apply). agent.aclose() in the finally block tears the
-    # Agent SDK session down.
+    # JobAgent owns its own classifier backends: NIM for OffsiteApply, a fresh
+    # one-shot Claude Agent SDK session per job for Easy Apply. Nothing to close.
     agent = JobAgent(profile)
+    # Consecutive classification failures — a transient blip leaves one job
+    # pending and moves on; a run of them means something systemic, so bail.
+    classify_fail_streak = 0
+    _MAX_CLASSIFY_FAIL_STREAK = 3
 
     inbox = EmailInbox(gmail_user, gmail_pass) if gmail_user and gmail_pass else None
 
@@ -988,16 +1011,22 @@ async def run_session(
                 print("  Classifying…", end="", flush=True)
                 try:
                     relevant, reason, citizenship_required = await asyncio.wait_for(
-                        agent.classify(title or "", description or "", application_type or ""),
+                        agent.classify(title or "", description or "", application_type),
                         timeout=90,
                     )
-                except asyncio.TimeoutError:
-                    print(" [timeout] Classifier did not respond in 90s — leaving pending for retry.")
-                    skipped_count += 1
-                    continue
+                    classify_fail_streak = 0
                 except Exception as exc:
-                    print(f"\n  [!] Classification failed after all retries ({exc}) — leaving pending, stopping session.")
-                    break
+                    classify_fail_streak += 1
+                    what = ("did not respond in 90s" if isinstance(exc, asyncio.TimeoutError)
+                            else f"failed ({exc})")
+                    print(f"\n  [!] Classifier {what} — leaving job pending "
+                          f"({classify_fail_streak}/{_MAX_CLASSIFY_FAIL_STREAK}).")
+                    skipped_count += 1
+                    if classify_fail_streak >= _MAX_CLASSIFY_FAIL_STREAK:
+                        print("  [!] Too many consecutive classifier failures — "
+                              "likely systemic; stopping session.")
+                        break
+                    continue
                 await asyncio.sleep(1)  # avoid LLM rate limiting between calls
                 if citizenship_required:
                     tag = "⊘ citizenship required"
@@ -1319,7 +1348,6 @@ async def run_session(
                 await asyncio.sleep(2)
 
         finally:
-            await agent.aclose()  # kill the Claude Agent SDK subprocess, if any
             conn.close()
             await browser.close()
             print("  Browser closed.")

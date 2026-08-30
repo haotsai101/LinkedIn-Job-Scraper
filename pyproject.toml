@@ -23,7 +23,7 @@ dependencies = [
     "playwright>=1.44.0",
     "httpx>=0.27.0",
     "openai>=1.0.0",  # deprecated: still used by the NIM classifier + browser-use paths; removed in T14b
-    "claude-agent-sdk>=0.1.0",  # Easy Apply classifier (subscription auth, no API key) — T14
+    "claude-agent-sdk>=0.2.140,<0.3",  # Easy Apply classifier (subscription auth, no API key) — T14. Pinned <0.3: relies on ClaudeAgentOptions.output_format + one-shot query() session isolation.
 ]
 
 [project.optional-dependencies]

@@ -20,6 +20,7 @@ try:
 except ImportError:  # pragma: no cover - openai is a declared dependency
     OpenAI = None  # type: ignore[assignment, misc]
 
+from common import extract_json_object
 from config import LLMConfig, get_llm_config
 
 # Request-level wall-clock ceiling (seconds). Matches the old
@@ -67,11 +68,12 @@ def resolve_classifier(cfg: LLMConfig | None = None) -> tuple[Any, str]:
 def classify_via_nim(client: Any, model: str, title: str, description: str) -> dict:
     """One classification call. Returns the raw parsed JSON object.
 
-    Uses ``response_format={"type": "json_object"}`` so the reply is guaranteed
-    to be a valid JSON object — no markdown-fence / prose salvage, no retry
-    ladder. Coercion of the result into the ``(relevant, reason,
-    citizenship_required)`` tuple (and the telemetry log line) is the caller's
-    job so both classifier routes share one code path.
+    Asks for ``response_format={"type": "json_object"}``, but NIM's honouring of
+    that for llama-3.1-8b is model-dependent and historically spotty, so the
+    reply is still salvaged (``json.loads`` → first/last-brace extract) before
+    giving up. Coercion into the ``(relevant, reason, citizenship_required)``
+    tuple (and the telemetry log line) is the caller's job so both classifier
+    routes share one code path.
     """
     prompt = _PROMPT_TEMPLATE.format(
         title=title or "", description=(description or "")[:3000]
@@ -84,4 +86,7 @@ def classify_via_nim(client: Any, model: str, title: str, description: str) -> d
         temperature=0,
     )
     content = resp.choices[0].message.content or "{}"
-    return json.loads(content)
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError:
+        return json.loads(extract_json_object(content))
