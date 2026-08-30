@@ -1015,6 +1015,13 @@ async def run_session(
                         timeout=90,
                     )
                     classify_fail_streak = 0
+                except nim_client.NimConfigError as exc:
+                    # Missing / bad CLASSIFIER_API — deterministic, won't fix
+                    # itself, and interleaved EasyApply successes would keep
+                    # resetting the streak while every OffsiteApply job is
+                    # silently skipped. Abort now.
+                    print(f"\n  [!] NIM classifier misconfigured ({exc}) — stopping session.")
+                    break
                 except Exception as exc:
                     classify_fail_streak += 1
                     what = ("did not respond in 90s" if isinstance(exc, asyncio.TimeoutError)

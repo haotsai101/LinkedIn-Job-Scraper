@@ -100,7 +100,7 @@ async def _consume(message_iter: Any) -> tuple[str, Any, str | None]:
                 ):
                     structured = meta["structuredOutput"]
             if (bool(getattr(msg, "is_error", False))
-                    or getattr(msg, "subtype", None) == "error"):
+                    or str(getattr(msg, "subtype", "") or "").startswith("error")):
                 detail = (getattr(msg, "errors", None)
                           or getattr(msg, "api_error_status", None))
                 err = " ".join(
@@ -169,7 +169,11 @@ async def query_json(
             allowed_tools=[],
             max_turns=1,
             setting_sources=[],
-            permission_mode="bypassPermissions",
+            # "dontAsk": deny anything not in an allow rule (allowed_tools=[] ⇒
+            # everything) without prompting. NOT "bypassPermissions" — the
+            # classifier ingests attacker-controlled job text, and max_turns=1
+            # still permits one tool round-trip, so the gate must stay shut.
+            permission_mode="dontAsk",
             output_format={"type": "json_schema", "schema": schema},
         )
         text, structured, err = await _consume(
@@ -253,7 +257,8 @@ class ClaudeSession:
             "system_prompt": self._system,
             "allowed_tools": [],
             "setting_sources": [],
-            "permission_mode": "bypassPermissions",
+            # deny (not bypass) — see query_json. No-hang without opening the gate.
+            "permission_mode": "dontAsk",
         }
         if self._output_schema is not None:
             opts["output_format"] = {

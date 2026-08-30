@@ -222,6 +222,9 @@ def test_query_json_passes_output_format_and_lockdown_options(monkeypatch):
     assert captured["max_turns"] == 1
     assert captured["model"] == "m"
     assert captured["system_prompt"] == "sys"
+    assert captured["setting_sources"] == []
+    # deny, never bypass — the classifier reads attacker-controlled job text
+    assert captured["permission_mode"] == "dontAsk"
 
 
 # ── ClaudeSession (persistent — T14b) ────────────────────────────────────────
