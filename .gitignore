@@ -40,7 +40,7 @@ analysis/
 logs/
 application_log.json
 created_accounts.json
-llm_debug.jsonl
+llm_debug.jsonl*
 debug_screenshots/
 graphify-out/
 media/

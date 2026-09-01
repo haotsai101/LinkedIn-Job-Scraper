@@ -196,7 +196,7 @@ The SDA lineage assets produce a graph nothing consumes.
 **Phase:** 2 · **Risk:** low · **Deps:** T1
 
 - `config.py` reading env (with `.env` load): `CLASSIFIER_MODEL` / `CLASSIFIER_API` / `CLASSIFIER_BASE_URL`, `BROWSER_USE_MODEL` / `BROWSER_USE_API` / `BROWSER_USE_BASE_URL`, `GUIDED_APPLY_MODEL`, plus existing `MAX_AUTO_APPLY`, Gmail vars.
-- Defaults: classifier → `meta/llama-3.1-8b-instruct` @ NIM; browser-use → `deepseek-ai/deepseek-v4-flash-0731` @ NIM (`https://integrate.api.nvidia.com/v1`); `GUIDED_APPLY_MODEL` → `claude-sonnet-5`.
+- Defaults: classifier → `google/gemma-4-31b-it` @ NIM (was `meta/llama-3.1-8b-instruct` — EOL'd, see T25); browser-use → `deepseek-ai/deepseek-v4-flash-0731` @ NIM (`https://integrate.api.nvidia.com/v1`); `GUIDED_APPLY_MODEL` → `claude-sonnet-5`.
 - Typed accessor (`get_llm_config(role: Literal["classifier","browser_use","guided_apply"])`).
 - Update `.env.template` to the new var names; keep reading the old `LLM_*` / `CLASSIFIER_LLM_*` / `BROWSER_LLM_*` names as fallback aliases for one release, with a deprecation note.
 - No behavior change yet — nothing imports it until T14.
@@ -286,6 +286,18 @@ T9 created `blocked_entities` and seeds `ats_domain` rows, but `run_session`'s U
 `ensure_schema_current()` gates the `listed_epoch` backfill behind `SELECT 1 FROM jobs WHERE listed_epoch IS NULL LIMIT 1`. Rows whose `original_listed_time`/`listed_time` are both unparseable stay `NULL` after the `CASE ... ELSE NULL` backfill, so they keep satisfying the probe → the full-table backfill `UPDATE` (scan + write lock) runs on every `ensure_schema_current()` call and never converges. Current `linkedin_jobs.db`: 1263/1263 parse, so zero impact. Fix: narrow the probe to rows the backfill *can* fix (mirror `_epoch_case` conditions), or sentinel-mark unfixable rows. Fold into T19.
 
 **Acceptance:** on a DB with an unparseable-timestamp row, `ensure_schema_current()` runs the backfill at most once.
+
+---
+
+## T25 — NIM classifier model EOL
+
+**Phase:** T14 follow-up · **Risk:** low · **Status:** ✅ fixed (PR pending) · Found during T14 live QA 2026-08-31.
+
+`meta/llama-3.1-8b-instruct` (the `config.py` classifier default + `.env.template` + the `.env`) reached end-of-life on NVIDIA NIM 2026-08-26 → HTTP 410. NVIDIA also purged much of the small-model catalog (many IDs now 410 or 404). Live-tested replacements: `google/gemma-4-31b-it` works (clean `json_object`, correct on all probe cases, ~15s/call free tier); `openai/gpt-oss-20b` is a reasoning model with intermittent `None` content; `deepseek-v4-flash` (the `browser_use` default) never returned in >7 min on the free tier.
+
+**Fix (this PR):** classifier default → `google/gemma-4-31b-it` in `config.py` + `.env.template` + tests. **Operator must also edit `.env`:** `CLASSIFIER_LLM_MODEL=meta/llama-3.1-8b-instruct` → `CLASSIFIER_MODEL=google/gemma-4-31b-it`.
+
+**Open:** the `browser_use` default (`deepseek-v4-flash`) is unverified on the free tier — **T15 (browser-use spike) must confirm it or pick another** before that default is trusted. Also: revisit whether a faster free classifier appears as NVIDIA's catalog stabilizes (gemma-4-31b at ~15s is slower than subscription Haiku).
 
 ---
 

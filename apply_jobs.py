@@ -518,7 +518,7 @@ class JobAgent:
     * citizenship / clearance keyword in the description  → immediate skip,
       no LLM call on either backend.
     * ``application_type == "OffsiteApply"``              → NIM (OpenAI-compatible,
-      ``config.get_llm_config("classifier")`` → llama-3.1-8b @ NVIDIA NIM). Free.
+      ``config.get_llm_config("classifier")`` → google/gemma-4-31b-it @ NVIDIA NIM). Free.
     * ``SimpleOnsiteApply`` / ``ComplexOnsiteApply`` / anything else (incl.
       ``None``)                                          → Claude Agent SDK
       (``llm.query_json``, one isolated one-shot session per job, subscription auth).
