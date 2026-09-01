@@ -219,12 +219,17 @@ def test_query_json_passes_output_format_and_lockdown_options(monkeypatch):
     assert captured["output_format"] == {"type": "json_schema",
                                          "schema": {"type": "object", "x": 1}}
     assert captured["allowed_tools"] == []
-    assert captured["max_turns"] == 1
+    # structured output needs a reasoning turn + an emit turn; max_turns=1
+    # hard-failed ~15-40% of real classifications. Tools stay unavailable via
+    # allowed_tools=[] regardless of turn count.
+    assert captured["max_turns"] == llm._CLASSIFIER_MAX_TURNS
+    assert llm._CLASSIFIER_MAX_TURNS >= 2
     assert captured["model"] == "m"
     assert captured["system_prompt"] == "sys"
     assert captured["setting_sources"] == []
     # deny, never bypass — the classifier reads attacker-controlled job text
     assert captured["permission_mode"] == "dontAsk"
+    assert captured["permission_mode"] != "bypassPermissions"
 
 
 # ── ClaudeSession (persistent — T14b) ────────────────────────────────────────
