@@ -2,7 +2,7 @@
 
 Derived from `docs/ARCHITECTURE_AND_OPTIMIZATION.md` §4. Each ticket ships as its own feature branch → `senior-swe` → `pr-code-reviewer` → QA (`log-bug-detector`). Never merge without a reviewer approval; never close without a passing QA run.
 
-Baseline artifacts captured 2026-08-28 in `docs/baseline/` (application_log snapshot, llm_debug summary, DB state).
+Baseline captured 2026-08-28. `docs/baseline/db_state.baseline.txt` holds the DB-state snapshot; the application-log and llm-debug snapshots were kept only locally (they contain application history) — their headline numbers are quoted inline in the QA docs.
 
 ## Status
 
