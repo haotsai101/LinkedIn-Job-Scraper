@@ -60,7 +60,7 @@ def _patch_agent_sdk(monkeypatch, payload=None, *, calls=None, exc=None):
 
 
 def _patch_nim(monkeypatch, payload=None, *, calls=None, exc=None,
-               model="meta/llama-3.1-8b-instruct"):
+               model="google/gemma-4-31b-it"):
     def resolve(cfg=None):
         return ("NIM_CLIENT", model)
 
@@ -113,7 +113,7 @@ def test_offsite_apply_routes_to_nim(agent, monkeypatch):
         agent.classify("Data Engineer", "Build pipelines", "OffsiteApply")
     )
     assert (relevant, reason, citizenship) == (True, "Data engineering role", False)
-    assert calls[0] == ("NIM_CLIENT", "meta/llama-3.1-8b-instruct", "Data Engineer")
+    assert calls[0] == ("NIM_CLIENT", "google/gemma-4-31b-it", "Data Engineer")
 
 
 def test_offsite_apply_nim_config_error_propagates(agent, monkeypatch):

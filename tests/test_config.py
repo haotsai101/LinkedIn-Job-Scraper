@@ -39,7 +39,7 @@ def _clean_env(monkeypatch):
 
 def test_classifier_defaults():
     cfg = config.get_llm_config("classifier")
-    assert cfg.model == "meta/llama-3.1-8b-instruct"
+    assert cfg.model == "google/gemma-4-31b-it"
     assert cfg.base_url == "https://integrate.api.nvidia.com/v1"
     assert cfg.api_key is None
 
@@ -78,7 +78,7 @@ def test_guided_apply_model_override(monkeypatch):
 
 def test_blank_env_var_falls_through_to_default(monkeypatch):
     monkeypatch.setenv("CLASSIFIER_MODEL", "   ")
-    assert config.get_llm_config("classifier").model == "meta/llama-3.1-8b-instruct"
+    assert config.get_llm_config("classifier").model == "google/gemma-4-31b-it"
 
 
 # ── legacy aliases ─────────────────────────────────────────────────────────────

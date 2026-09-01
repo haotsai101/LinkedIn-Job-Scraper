@@ -69,9 +69,9 @@ def classify_via_nim(client: Any, model: str, title: str, description: str) -> d
     """One classification call. Returns the raw parsed JSON object.
 
     Asks for ``response_format={"type": "json_object"}``, but NIM's honouring of
-    that for llama-3.1-8b is model-dependent and historically spotty, so the
-    reply is still salvaged (``json.loads`` → first/last-brace extract) before
-    giving up. Coercion into the ``(relevant, reason, citizenship_required)``
+    that for smaller / older models is model-dependent and historically spotty,
+    so the reply is still salvaged (``json.loads`` → first/last-brace extract)
+    before giving up. Coercion into the ``(relevant, reason, citizenship_required)``
     tuple (and the telemetry log line) is the caller's job so both classifier
     routes share one code path.
     """
