@@ -60,6 +60,15 @@ _JSON_INSTRUCTION = (
     "surrounding prose or code fence:\n"
 )
 
+# Turn budget for the one-shot classifier call. Structured output empirically
+# costs a turn on top of the reasoning turn; max_turns=1 hard-failed ~15-40% of
+# real classifications with "Reached maximum number of turns" (verified
+# 2026-09-01). 3 gives headroom — extra turns are only consumed if the model
+# uses them, and no tool can run regardless (allowed_tools=[] + no
+# setting_sources → no allow-rule exists to pre-approve one). Bump if
+# error_max_turns recurs during QA.
+_CLASSIFIER_MAX_TURNS = 3
+
 
 class ClaudeAgentSDKError(RuntimeError):
     """Any failure originating from the Claude Agent SDK: a missing package, a
@@ -167,12 +176,13 @@ async def query_json(
             model=model,
             system_prompt=system,
             allowed_tools=[],
-            max_turns=1,
+            max_turns=_CLASSIFIER_MAX_TURNS,  # see the constant's rationale
             setting_sources=[],
-            # "dontAsk": deny anything not in an allow rule (allowed_tools=[] ⇒
-            # everything) without prompting. NOT "bypassPermissions" — the
-            # classifier ingests attacker-controlled job text, and max_turns=1
-            # still permits one tool round-trip, so the gate must stay shut.
+            # "dontAsk": deny anything not in an allow rule without prompting.
+            # NOT "bypassPermissions" — the classifier ingests attacker-
+            # controlled job text. With allowed_tools=[] and no setting_sources,
+            # no allow-rule exists to pre-approve any tool, so no tool can run
+            # regardless of the turn budget.
             permission_mode="dontAsk",
             output_format={"type": "json_schema", "schema": schema},
         )
