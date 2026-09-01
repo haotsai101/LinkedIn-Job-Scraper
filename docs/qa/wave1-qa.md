@@ -17,7 +17,7 @@ Interpreter: /opt/anaconda3/bin/python
 | Dangling refs to deleted code (apply_haiku, dagster_db_assets, dagster_relationships, auto_materialize) outside docs | PASS — none |
 | ruff check . | N/A in anaconda env (ruff not installed there); config valid, verified by reviewers in a venv |
 
-Baseline: docs/baseline/ (application_log, llm_debug summary, db_state).
+Baseline: `docs/baseline/db_state.baseline.txt` (DB state). Application-log / llm-debug snapshots kept local only — headline numbers quoted above.
 Real linkedin_jobs.db NOT migrated — operator runs `python scripts/migrations/001_indexes.py` when ready.
 
 ## Independent verification — log-bug-detector
