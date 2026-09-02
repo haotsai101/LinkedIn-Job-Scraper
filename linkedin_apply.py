@@ -2611,10 +2611,14 @@ class OffsiteApplyFlow:
         """Return a short reason string if the page shows a bot wall this agent
         cannot get past, else ''.
 
-        * a reCAPTCHA / hCaptcha widget — unsolvable in any mode;
-        * a Greenhouse text "security code" challenge — only unsolvable in
-          ``--auto`` (no human to type it); in interactive mode the step loop
-          pauses for the user instead, so this returns '' there.
+        * a reCAPTCHA / hCaptcha widget — unsolvable in any mode, any host;
+        * a Greenhouse text "security code" challenge — only when the page is
+          actually on ``greenhouse.io`` AND we're in ``--auto`` (no human to
+          type it). The host gate matters: ``_GREENHOUSE_SECURITY_SIGNALS``
+          ("verification code", "enter the code", …) overlaps the *legitimate*
+          email-verification step of account-creation offsite flows, which
+          ``run_session`` supports on purpose via ``self.inbox``. In interactive
+          mode the step loop pauses for the user instead, so this returns ''.
 
         Cheap enough (one ``locator().count()`` + one ``innerText`` slice) to run
         before the ScriptApplyEngine / summarize LLM calls so a walled job is
@@ -2625,7 +2629,7 @@ class OffsiteApplyFlow:
                 return "reCAPTCHA widget"
         except Exception:
             pass
-        if self.auto_mode:
+        if self.auto_mode and "greenhouse.io" in urlparse(page.url).netloc.lower():
             try:
                 _txt = (await page.evaluate(
                     "() => (document.body.innerText || '').slice(0, 800)"
