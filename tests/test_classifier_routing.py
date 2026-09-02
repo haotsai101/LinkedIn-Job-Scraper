@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import re
+import time
 from pathlib import Path
 
 import pytest
@@ -60,7 +62,7 @@ def _patch_agent_sdk(monkeypatch, payload=None, *, calls=None, exc=None):
 
 
 def _patch_nim(monkeypatch, payload=None, *, calls=None, exc=None,
-               model="google/gemma-4-31b-it"):
+               model="meta/llama-3.2-11b-vision-instruct"):
     def resolve(cfg=None):
         return ("NIM_CLIENT", model)
 
@@ -113,7 +115,7 @@ def test_offsite_apply_routes_to_nim(agent, monkeypatch):
         agent.classify("Data Engineer", "Build pipelines", "OffsiteApply")
     )
     assert (relevant, reason, citizenship) == (True, "Data engineering role", False)
-    assert calls[0] == ("NIM_CLIENT", "google/gemma-4-31b-it", "Data Engineer")
+    assert calls[0] == ("NIM_CLIENT", "meta/llama-3.2-11b-vision-instruct", "Data Engineer")
 
 
 def test_offsite_apply_nim_config_error_propagates(agent, monkeypatch):
@@ -250,4 +252,191 @@ def test_no_claude_subprocess_or_fence_salvage_in_apply_jobs():
 
 def test_classify_signature_takes_application_type():
     params = list(inspect.signature(apply_jobs.JobAgent.classify).parameters)
-    assert params == ["self", "title", "description", "application_type"]
+    assert params == ["self", "title", "description", "application_type", "prefer_agent_sdk"]
+
+
+# ── T27: per-attempt timeout ────────────────────────────────────────────────
+
+def test_classifier_timeout_is_not_retried(agent, monkeypatch):
+    """A timed-out route fails fast — no second 40s attempt. The circuit breaker
+    falls back to the other route instead of waiting again."""
+    monkeypatch.setattr(apply_jobs.JobAgent, "_ATTEMPT_TIMEOUT_S", 0.05)
+    calls = {"n": 0}
+
+    def slow(client, model, title, description):
+        calls["n"] += 1
+        time.sleep(0.3)  # longer than the per-attempt deadline
+        return _agent_payload()
+
+    monkeypatch.setattr(nim_client, "resolve_classifier", lambda cfg=None: ("C", "m"))
+    monkeypatch.setattr(nim_client, "classify_via_nim", slow)
+
+    with pytest.raises(TimeoutError):
+        asyncio.run(agent.classify("T", "d", "OffsiteApply"))
+    assert calls["n"] == 1  # timeout → no retry
+
+
+def test_transient_error_still_retried_under_per_attempt_deadline(agent, monkeypatch):
+    """A non-timeout transient error IS retried, and attempt 2 gets its own
+    fresh deadline (the wait_for is inside the loop)."""
+    monkeypatch.setattr(apply_jobs.JobAgent, "_ATTEMPT_TIMEOUT_S", 0.5)
+    calls = {"n": 0}
+
+    def flaky(client, model, title, description):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("transient 503")
+        return _agent_payload()
+
+    monkeypatch.setattr(nim_client, "resolve_classifier", lambda cfg=None: ("C", "m"))
+    monkeypatch.setattr(nim_client, "classify_via_nim", flaky)
+
+    out = asyncio.run(agent.classify("T", "d", "OffsiteApply"))
+    assert calls["n"] == 2
+    assert out[0] is True
+
+
+# ── T27: NIM-route circuit breaker ─────────────────────────────────────────
+
+class _FakeAgent:
+    """Stand-in for JobAgent: NIM route always times out, SDK route succeeds."""
+
+    def __init__(self, sdk_result=(True, "ok", False), sdk_exc=None):
+        self.routes: list[str] = []
+        self._sdk_result = sdk_result
+        self._sdk_exc = sdk_exc
+
+    async def classify(self, title, description, application_type, *, prefer_agent_sdk=False):
+        # Mirror JobAgent.classify routing: OffsiteApply → NIM unless forced.
+        route = "nim" if application_type == "OffsiteApply" and not prefer_agent_sdk else "sdk"
+        self.routes.append(route)
+        if route == "nim":
+            raise TimeoutError()
+        if self._sdk_exc is not None:
+            raise self._sdk_exc
+        return self._sdk_result
+
+
+@pytest.fixture(autouse=True)
+def _silence_llm_log(monkeypatch):
+    monkeypatch.setattr(apply_jobs, "_write_llm_log", lambda entry: None)
+
+
+def test_circuit_breaker_routes_to_sdk_after_two_nim_timeouts():
+    agent = _FakeAgent()
+    breaker = apply_jobs._new_classifier_breaker()
+
+    for _ in range(3):
+        out = asyncio.run(apply_jobs.classify_with_circuit_breaker(
+            agent, breaker, "T", "d", "OffsiteApply"))
+        assert out == (True, "ok", False)
+
+    # job1: nim→timeout→sdk ; job2: nim→timeout→sdk (streak hits 2, degraded) ;
+    # job3: sdk only, no wasted nim attempt.
+    assert agent.routes == ["nim", "sdk", "nim", "sdk", "sdk"]
+    assert breaker["nim_route_degraded"] is True
+
+
+def test_circuit_breaker_does_not_trip_on_single_timeout():
+    agent = _FakeAgent()
+    breaker = apply_jobs._new_classifier_breaker()
+
+    out = asyncio.run(apply_jobs.classify_with_circuit_breaker(
+        agent, breaker, "T", "d", "OffsiteApply"))
+    assert out == (True, "ok", False)
+    assert breaker["nim_timeout_streak"] == 1
+    assert breaker["nim_route_degraded"] is False
+
+
+def test_nim_timeout_then_sdk_success_does_not_raise():
+    """So run_session does not count it as a classifier failure / fail-streak."""
+    agent = _FakeAgent(sdk_result=(False, "not a fit", False))
+    breaker = apply_jobs._new_classifier_breaker()
+
+    out = asyncio.run(apply_jobs.classify_with_circuit_breaker(
+        agent, breaker, "T", "d", "OffsiteApply"))
+    assert out == (False, "not a fit", False)
+
+
+def test_circuit_breaker_propagates_when_both_routes_fail():
+    agent = _FakeAgent(sdk_exc=llm.ClaudeAgentSDKError("sdk down"))
+    breaker = apply_jobs._new_classifier_breaker()
+
+    with pytest.raises(llm.ClaudeAgentSDKError):
+        asyncio.run(apply_jobs.classify_with_circuit_breaker(
+            agent, breaker, "T", "d", "OffsiteApply"))
+
+
+def test_circuit_breaker_ignores_easy_apply_jobs():
+    agent = _FakeAgent()
+    breaker = apply_jobs._new_classifier_breaker()
+
+    out = asyncio.run(apply_jobs.classify_with_circuit_breaker(
+        agent, breaker, "T", "d", "SimpleOnsiteApply"))
+    assert out == (True, "ok", False)
+    assert agent.routes == ["sdk"]
+    assert breaker["nim_timeout_streak"] == 0
+
+
+def test_degraded_breaker_still_runs_keyword_fast_path(agent, monkeypatch):
+    """Circuit-breaker degraded + a citizenship keyword in the description →
+    the keyword fast-path decides it, with ZERO calls to either LLM route."""
+    monkeypatch.setattr(nim_client, "resolve_classifier", _boom)
+    monkeypatch.setattr(nim_client, "classify_via_nim", _boom)
+    monkeypatch.setattr(llm, "query_json", _boom)
+
+    breaker = apply_jobs._new_classifier_breaker()
+    breaker["nim_route_degraded"] = True
+
+    relevant, reason, citizenship = asyncio.run(apply_jobs.classify_with_circuit_breaker(
+        agent, breaker,
+        "Software Engineer",
+        "Great team. Must be a US citizen. Relocation offered.",
+        "OffsiteApply",
+    ))
+    assert relevant is False
+    assert citizenship is True
+    assert "citizen" in reason.lower()
+
+
+def test_deferred_jobs_are_not_counted_as_skipped():
+    """run_session's classify except-block must bump deferred_count, never
+    skipped_count, and must not mark_job (job stays pending)."""
+    src = Path(apply_jobs.__file__).read_text()
+    m = re.search(
+        r"NIM classifier misconfigured.*?stopping session.*?\n\s*break\n"
+        r"(\s*except Exception as exc:.*?\n\s*continue\n)",
+        src, re.S,
+    )
+    assert m, "classify except-block not found"
+    # strip comment lines so assertions test code, not prose
+    block = "\n".join(
+        ln for ln in m.group(1).splitlines() if not ln.lstrip().startswith("#")
+    )
+    assert "deferred_count += 1" in block
+    assert "skipped_count += 1" not in block
+    assert "mark_job" not in block
+    # and the two counters are distinct fields in the session report
+    assert '"deferred_count": deferred_count' in src
+    assert '"skipped_count": skipped_count' in src
+
+
+# ── T29 / T28: spam pre-filter ─────────────────────────────────────────────
+
+def test_match_spam_domain_matches_posting_domain_and_url():
+    assert apply_jobs._match_spam_domain("jobright.ai", "") == "jobright.ai"
+    assert apply_jobs._match_spam_domain("", "https://www.dice.com/jobs/x") == "www.dice.com"
+    assert apply_jobs._match_spam_domain("sub.crossover.com", "") == "sub.crossover.com"
+    assert apply_jobs._match_spam_domain("example.com", "") is None
+    assert apply_jobs._match_spam_domain("", "") is None
+
+
+def test_greenhouse_is_not_pre_filtered():
+    joined = " ".join(apply_jobs._OFFSITE_SPAM)
+    assert "greenhouse" not in joined
+    assert "grnh.se" not in apply_jobs._OFFSITE_SPAM
+    assert apply_jobs._match_spam_domain(
+        "job-boards.greenhouse.io",
+        "https://job-boards.greenhouse.io/acme/jobs/1",
+    ) is None
+    assert apply_jobs._match_spam_domain("grnh.se", "") is None

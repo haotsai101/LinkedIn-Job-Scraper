@@ -41,10 +41,13 @@ _NIM_BASE_URL = "https://integrate.api.nvidia.com/v1"
 
 # role -> resolved defaults when no env var (new or legacy) is set
 _DEFAULTS: dict[str, dict[str, Optional[str]]] = {
-    # meta/llama-3.1-8b-instruct hit end-of-life on NIM 2026-08-26 (HTTP 410).
-    # google/gemma-4-31b-it: verified against the live NIM endpoint 2026-08-31 —
-    # clean json_object output, ~15s/call on the free tier. See ticket T25.
-    "classifier": {"model": "google/gemma-4-31b-it", "base_url": _NIM_BASE_URL},
+    # meta/llama-3.1-8b-instruct hit end-of-life on NIM 2026-08-26 (HTTP 410);
+    # google/gemma-4-31b-it replaced it (T25) but started timing out on the free
+    # NIM tier (34-90s, or full timeout) during the T14 live run 2026-09-01.
+    # meta/llama-3.2-11b-vision-instruct validated 2026-09-02: 8/8 correct on the
+    # classification probe set (relevance + citizenship), p50 1.5s, clean
+    # json_object output, 0 rate-limit errors at 10 rapid calls. See ticket T27.
+    "classifier": {"model": "meta/llama-3.2-11b-vision-instruct", "base_url": _NIM_BASE_URL},
     # deepseek-ai/deepseek-v4-flash-0731: in the NIM catalog, but single calls
     # timed out (>7 min) on the free tier during T25 probing — the T15 browser-use
     # spike must confirm it (or pick another) before this default is trusted.

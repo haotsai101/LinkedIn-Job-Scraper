@@ -23,9 +23,12 @@ except ImportError:  # pragma: no cover - openai is a declared dependency
 from common import extract_json_object
 from config import LLMConfig, get_llm_config
 
-# Request-level wall-clock ceiling (seconds). Matches the old
-# ``httpx.Timeout(90.0)`` the classifier OpenAI client used in run_session.
-_TIMEOUT_S = 90.0
+# Request-level wall-clock ceiling (seconds). classify_via_nim runs inside
+# ``asyncio.to_thread`` (uncancellable), and JobAgent wraps each attempt in a
+# ~40s ``asyncio.wait_for``. Keep this just above that per-attempt deadline so a
+# timed-out call's worker thread dies right after we stop waiting on it, instead
+# of orphaning it for the ~50s difference a 90s ceiling would leave.
+_TIMEOUT_S = 45.0
 
 _PROMPT_TEMPLATE = (
     "Review this job posting on two dimensions:\n"
