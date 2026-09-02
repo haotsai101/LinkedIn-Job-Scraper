@@ -671,16 +671,17 @@ Be accurate and concise. Never fabricate information not in the user's profile."
         return await self._classify_agent(title, desc)
 
     async def _run_with_retry(self, factory):
-        """Await ``factory()``, retrying once on a transient failure.
+        """Await ``factory()`` under a per-attempt ``_ATTEMPT_TIMEOUT_S`` deadline,
+        retrying once on a *transient* failure (transport blip / 5xx).
 
-        Each attempt gets its own ``_ATTEMPT_TIMEOUT_S`` deadline — a call that
-        is slow but alive on one attempt still gets a clean retry rather than
-        being starved by a single deadline wrapping both attempts. A timeout on
-        the final attempt propagates as ``TimeoutError`` so the caller can tell
-        it apart from a hard failure.
+        A ``TimeoutError`` is **not** retried: a route that already blew a 40s
+        deadline almost never answers inside a second one, and retrying it just
+        doubles the wall-clock before ``run_session`` can abort a degraded
+        session. It propagates immediately so the caller (the circuit breaker)
+        can fall back to the other route.
 
-        ``NimConfigError`` is deterministic (missing key) so it is never
-        retried — it propagates immediately.
+        ``NimConfigError`` is deterministic (missing key), so it too propagates
+        immediately without a retry.
         """
         for attempt in range(1, self._CALL_ATTEMPTS + 1):
             try:
@@ -688,10 +689,9 @@ Be accurate and concise. Never fabricate information not in the user's profile."
             except nim_client.NimConfigError:
                 raise
             except Exception as exc:
-                if attempt >= self._CALL_ATTEMPTS:
+                if attempt >= self._CALL_ATTEMPTS or isinstance(exc, TimeoutError):
                     raise
-                what = "timed out" if isinstance(exc, TimeoutError) else f"failed ({exc})"
-                print(f"\n  [classifier] attempt {attempt} {what} — retrying…",
+                print(f"\n  [classifier] attempt {attempt} failed ({exc}) — retrying…",
                       flush=True)
                 await asyncio.sleep(self._RETRY_DELAY_S)
 

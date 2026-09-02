@@ -105,6 +105,22 @@ async def _human_type(el, value: str):
 _AUTH_HOSTPATHS = ("/login", "/checkpoint", "/uas/")
 _ACCOUNTS_PATH = "created_accounts.json"
 
+# CSS for reCAPTCHA / hCaptcha widgets the agent cannot solve.
+_CAPTCHA_WIDGET_SELECTOR = (
+    "div.g-recaptcha, iframe[src*='recaptcha'], iframe[title*='recaptcha'], "
+    "input[name='g-recaptcha-response'], textarea[id*='g-recaptcha-response'], "
+    "input[id*='g-recaptcha-response']"
+)
+# Visible-text markers for Greenhouse's text "security code" bot wall (NOT a
+# g-recaptcha widget — a human can type it, so in interactive mode we pause;
+# in --auto there is no one to type it, so we skip).
+_GREENHOUSE_SECURITY_SIGNALS = (
+    "security code", "enter the code", "enter code", "verification code",
+    "please enter the characters", "type the characters", "prove you're human",
+    "prove you are human", "i'm not a robot", "i am not a robot",
+    "are you human", "bot check", "human verification",
+)
+
 # ATS job-listing URL params that appear on company-hosted pages (not the form itself)
 _LISTING_PARAMS = ("gh_jid", "ashby_jid", "jId", "jobId", "job_id", "requisition_id", "req_id", "jobPostingId")
 # Domains where /jobs/<id> WITHOUT /apply in path is a listing page, not the form
@@ -2591,6 +2607,35 @@ class OffsiteApplyFlow:
         except Exception:
             return f"Role: {self.job_title} at {self.company_name}."
 
+    async def _detect_bot_wall(self, page: Page) -> str:
+        """Return a short reason string if the page shows a bot wall this agent
+        cannot get past, else ''.
+
+        * a reCAPTCHA / hCaptcha widget — unsolvable in any mode;
+        * a Greenhouse text "security code" challenge — only unsolvable in
+          ``--auto`` (no human to type it); in interactive mode the step loop
+          pauses for the user instead, so this returns '' there.
+
+        Cheap enough (one ``locator().count()`` + one ``innerText`` slice) to run
+        before the ScriptApplyEngine / summarize LLM calls so a walled job is
+        skipped without burning them.
+        """
+        try:
+            if await page.locator(_CAPTCHA_WIDGET_SELECTOR).count() > 0:
+                return "reCAPTCHA widget"
+        except Exception:
+            pass
+        if self.auto_mode:
+            try:
+                _txt = (await page.evaluate(
+                    "() => (document.body.innerText || '').slice(0, 800)"
+                )).lower()
+                if any(s in _txt for s in _GREENHOUSE_SECURITY_SIGNALS):
+                    return "Greenhouse security-code challenge (no human in --auto)"
+            except Exception:
+                pass
+        return ""
+
     async def _llm_guided_apply(self, page: Page) -> str:
         """
         LLM-guided application loop.
@@ -2753,6 +2798,14 @@ class OffsiteApplyFlow:
         except Exception as _e:
             print(f"  [LLM] Warning: could not read landing page text for expired check ({_e})")
 
+        # Bot-wall pre-check: skip BEFORE the ScriptApplyEngine full-DOM read and
+        # the _summarize_job LLM call — a CAPTCHA-walled job can't be submitted no
+        # matter how good the generated script is.
+        _wall = await self._detect_bot_wall(page)
+        if _wall:
+            print(f"  [LLM] {_wall} on landing form — cannot proceed, skipping")
+            return "skipped"
+
         # Script-generation engine: reads full DOM and generates a complete Playwright
         # script per page. Runs first; falls back to step loop on failure.
         try:
@@ -2777,20 +2830,12 @@ class OffsiteApplyFlow:
         job_summary = await self._summarize_job()
         print(f"  [LLM] Job summary: {job_summary[:120]}{'...' if len(job_summary) > 120 else ''}")
 
-        # reCAPTCHA pre-loop check: if the form already has a CAPTCHA widget before we start,
-        # there is no path to submission without a solver — bail immediately rather than burning
-        # the full 600s session timeout on hopeless LLM steps.
-        try:
-            _recaptcha_els = await page.locator(
-                "div.g-recaptcha, iframe[src*='recaptcha'], iframe[title*='recaptcha'], "
-                "input[name='g-recaptcha-response'], textarea[id*='g-recaptcha-response'], "
-                "input[id*='g-recaptcha-response']"
-            ).count()
-            if _recaptcha_els > 0:
-                print(f"  [LLM] reCAPTCHA detected on landing form — cannot submit without CAPTCHA solver, skipping")
-                return "skipped"
-        except Exception as _rc_e:
-            print(f"  [LLM] Warning: reCAPTCHA pre-check failed ({_rc_e}) — continuing")
+        # Re-run the bot-wall check: the ScriptApplyEngine may have navigated to a
+        # new page (e.g. a CAPTCHA step) since the pre-check above.
+        _wall = await self._detect_bot_wall(page)
+        if _wall:
+            print(f"  [LLM] {_wall} before step loop — cannot submit, skipping")
+            return "skipped"
 
         _session_start = datetime.now(timezone.utc)
         for step in range(30):
@@ -3000,11 +3045,7 @@ class OffsiteApplyFlow:
 
             # Mid-loop reCAPTCHA check: catch forms that load CAPTCHA after the Apply button click
             try:
-                _rc_mid = await page.locator(
-                    "div.g-recaptcha, iframe[src*='recaptcha'], iframe[title*='recaptcha'], "
-                    "textarea[id*='g-recaptcha-response'], input[id*='g-recaptcha-response']"
-                ).count()
-                if _rc_mid > 0:
+                if await page.locator(_CAPTCHA_WIDGET_SELECTOR).count() > 0:
                     print(f"  [LLM] reCAPTCHA detected mid-loop — cannot submit, skipping")
                     return "skipped"
             except Exception:
@@ -3025,26 +3066,27 @@ class OffsiteApplyFlow:
                 except Exception:
                     pass
 
-            # Greenhouse security code: pause and wait for human to solve it
+            # Greenhouse text "security code" bot wall: in --auto there is no one
+            # to type it and a bare input() would block the event loop (and the
+            # outer asyncio.wait_for that guards this whole flow) forever, so
+            # skip. In interactive mode, pause for the human.
             _current_domain = urlparse(page.url).netloc.lower()
             if "greenhouse.io" in _current_domain:
                 try:
                     _gh_text = (await page.evaluate("() => (document.body.innerText || '').slice(0, 800)")).lower()
-                    _security_signals = (
-                        "security code", "enter the code", "enter code", "verification code",
-                        "please enter the characters", "type the characters", "prove you're human",
-                        "prove you are human", "i'm not a robot", "i am not a robot",
-                        "are you human", "bot check", "human verification",
-                    )
-                    if any(s in _gh_text for s in _security_signals):
+                    if any(s in _gh_text for s in _GREENHOUSE_SECURITY_SIGNALS):
+                        if self.auto_mode:
+                            print(f"  [LLM] Greenhouse security challenge at {page.url} — "
+                                  f"cannot solve in --auto, skipping")
+                            return "skipped"
                         print(f"\n  [LLM] ⚠ Greenhouse security check detected at {page.url}")
-                        print(f"  [LLM] Please solve the security challenge in the browser, then press Enter to continue...")
-                        import sys
+                        print("  [LLM] Please solve the security challenge in the browser, "
+                              "then press Enter to continue...")
                         try:
                             input("  Press Enter when done: ")
                         except EOFError:
                             pass
-                        print(f"  [LLM] Resuming after security challenge...")
+                        print("  [LLM] Resuming after security challenge...")
                         await asyncio.sleep(1)
                 except Exception:
                     pass
