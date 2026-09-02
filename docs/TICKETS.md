@@ -196,7 +196,7 @@ The SDA lineage assets produce a graph nothing consumes.
 **Phase:** 2 · **Risk:** low · **Deps:** T1
 
 - `config.py` reading env (with `.env` load): `CLASSIFIER_MODEL` / `CLASSIFIER_API` / `CLASSIFIER_BASE_URL`, `BROWSER_USE_MODEL` / `BROWSER_USE_API` / `BROWSER_USE_BASE_URL`, `GUIDED_APPLY_MODEL`, plus existing `MAX_AUTO_APPLY`, Gmail vars.
-- Defaults: classifier → `google/gemma-4-31b-it` @ NIM (was `meta/llama-3.1-8b-instruct` — EOL'd, see T25); browser-use → `deepseek-ai/deepseek-v4-flash-0731` @ NIM (`https://integrate.api.nvidia.com/v1`); `GUIDED_APPLY_MODEL` → `claude-sonnet-5`.
+- Defaults: classifier → `meta/llama-3.2-11b-vision-instruct` @ NIM (was `google/gemma-4-31b-it` — timing out on the free tier, see T27; originally `meta/llama-3.1-8b-instruct` — EOL'd, see T25); browser-use → `deepseek-ai/deepseek-v4-flash-0731` @ NIM (`https://integrate.api.nvidia.com/v1`); `GUIDED_APPLY_MODEL` → `claude-sonnet-5`.
 - Typed accessor (`get_llm_config(role: Literal["classifier","browser_use","guided_apply"])`).
 - Update `.env.template` to the new var names; keep reading the old `LLM_*` / `CLASSIFIER_LLM_*` / `BROWSER_LLM_*` names as fallback aliases for one release, with a deprecation note.
 - No behavior change yet — nothing imports it until T14.
@@ -297,7 +297,9 @@ T9 created `blocked_entities` and seeds `ats_domain` rows, but `run_session`'s U
 
 **Fix (this PR):** classifier default → `google/gemma-4-31b-it` in `config.py` + `.env.template` + tests. **Operator must also edit `.env`:** `CLASSIFIER_LLM_MODEL=meta/llama-3.1-8b-instruct` → `CLASSIFIER_MODEL=google/gemma-4-31b-it`.
 
-**Open:** the `browser_use` default (`deepseek-v4-flash`) is unverified on the free tier — **T15 (browser-use spike) must confirm it or pick another** before that default is trusted. Also: revisit whether a faster free classifier appears as NVIDIA's catalog stabilizes (gemma-4-31b at ~15s is slower than subscription Haiku).
+**Open:** the `browser_use` default (`deepseek-v4-flash`) is unverified on the free tier — **T15 (browser-use spike) must confirm it or pick another** before that default is trusted.
+
+**Superseded (T27, 2026-09-02):** `google/gemma-4-31b-it` began timing out on the free NIM tier (34–90s, or full timeout) during the T14 live run. Classifier default is now `meta/llama-3.2-11b-vision-instruct` (validated 8/8 on the probe set, p50 1.5s).
 
 ---
 
@@ -310,3 +312,21 @@ T9 created `blocked_entities` and seeds `ats_domain` rows, but `run_session`'s U
 - Drop `selenium` from deps if nothing else uses it.
 
 **Acceptance:** no `while True` in the standalone scripts; `tenacity` wraps the network calls; a discovery run works without launching Selenium when a valid `storage_state.json` exists.
+
+---
+
+## T27 — OffsiteApply per-job loop hardening
+
+**Phase:** T14 follow-up · **Risk:** medium · **Status:** ✅ fixed (PR) · From the T14 live run 2026-09-01 + NIM model survey 2026-09-02. Bundles the classifier-model swap + T28 + T29 (all `run_session` per-job loop).
+
+1. **Classifier model swap.** `google/gemma-4-31b-it` timed out on the free NIM tier (34–90s, or full timeout); ~40 other small models are down/404/EOL. `meta/llama-3.2-11b-vision-instruct` validated 2026-09-02: 8/8 correct (relevance + citizenship), p50 1.5s, 0 rate-limit errors, clean `json_object`. Now the `config.py` classifier default + `.env.template` + the `LLM_MODEL` fallback. **Operator must edit `.env`:** `CLASSIFIER_LLM_MODEL` / `CLASSIFIER_MODEL` → `meta/llama-3.2-11b-vision-instruct`.
+
+2. **Per-attempt timeout + per-route circuit breaker.** `JobAgent._run_with_retry` now gives *each* classify attempt its own 40s deadline (was one 90s `asyncio.wait_for` wrapping both attempts — the retry was useless for slow-but-alive calls). `NimConfigError` still fails fast, never retried. New session-scoped circuit breaker (`classify_with_circuit_breaker`): after 2 consecutive NIM-route timeouts, every remaining `OffsiteApply` job is classified via the Agent SDK for the rest of that session (logged as `classifier_route_degraded`). A bad NIM tier no longer strands the OffsiteApply queue.
+
+3. **Fail-streak per-route fix.** A NIM timeout that the Agent SDK then classifies successfully is no longer a `classify_fail_streak` increment — so interleaved EasyApply successes can't mask a dead NIM route. A genuine failure (both routes fail) still counts and still breaks at 3. Deferred jobs (classifier failed, job left pending, no `mark_job`) are now tracked as `deferred_count`, not `skipped_count` — "Skipped: N" no longer over-reports.
+
+4. **T29 — spam check before classification.** `_OFFSITE_SPAM` / aggregator domains are now matched against `posting_domain` / `application_url` *before* `agent.classify()`. A spam listing costs 0 classifier calls (a jobright.ai job previously burned a 68s call before being spam-skipped).
+
+5. **T28 — narrowed Greenhouse block.** Removed `job-boards.greenhouse.io` / `boards.greenhouse.io` / `grnh.se` from `_OFFSITE_SPAM` entirely (option (a)). `grnh.se` is only a link shortener and `*.greenhouse.io` boards host real per-company forms; the blanket block permanently skipped legitimate direct employers (e.g. MasterControl's "Marketing Operations AI Engineer"). `OffsiteApplyFlow` already has Greenhouse iframe-embed handling plus pre-loop / mid-loop / per-step reCAPTCHA detectors that return `"skipped"` at runtime, so a genuinely CAPTCHA-walled Greenhouse form is still skipped — as a runtime outcome, not a blind pre-filter. No Greenhouse domain is in `linkedin_apply.py`'s runtime block lists.
+
+**Acceptance:** `config.get_llm_config("classifier").model` default is `meta/llama-3.2-11b-vision-instruct`; spam domains skip with 0 classifier calls; a Greenhouse job gets a real apply attempt; circuit-breaker state is session-scoped and resets each `run_session`; `pytest tests/` green.

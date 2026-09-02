@@ -140,7 +140,7 @@ The cost this pays: every call spawns a fresh `node` + Claude Code harness (~1â€
 
 | Env var | Role | Default |
 |---|---|---|
-| `CLASSIFIER_MODEL` + `CLASSIFIER_API` + `CLASSIFIER_BASE_URL` | job relevance (NIM path) | a current NIM model, e.g. `google/gemma-4-31b-it` (see T25) |
+| `CLASSIFIER_MODEL` + `CLASSIFIER_API` + `CLASSIFIER_BASE_URL` | job relevance (NIM path) | a current NIM model, e.g. `meta/llama-3.2-11b-vision-instruct` (see T27; was `google/gemma-4-31b-it`, T25) |
 | `BROWSER_USE_MODEL` + `BROWSER_USE_API` + `BROWSER_USE_BASE_URL` | browser-use agent | `deepseek-ai/deepseek-v4-flash-0731` (NIM) |
 | `GUIDED_APPLY_MODEL` | decomposed `_llm_guided_apply` fallback (Agent SDK) | `claude-sonnet-5` |
 

@@ -50,6 +50,7 @@ from datetime import datetime, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
+from urllib.parse import urlparse
 
 from openai import OpenAI, AsyncOpenAI
 from playwright.async_api import async_playwright
@@ -78,6 +79,51 @@ BLOCKED_DOMAINS = {p for kind, p, _ in BLOCKED_ENTITIES_SEED if kind == "ats_dom
 PROFILE_PATH = "user_profile.json"
 LOG_PATH     = "application_log.json"
 ACCOUNTS_PATH = "created_accounts.json"
+
+# Domains we never open a browser tab for: pure aggregators, contractor-only
+# platforms, assessment mills, and known scam/broker sites. Checked against a
+# job's ``posting_domain`` / ``application_url`` BEFORE the relevance classifier
+# runs (T29) so a spam listing never costs an LLM call.
+#
+# NOTE (T28): Greenhouse domains (job-boards.greenhouse.io / boards.greenhouse.io
+# / grnh.se) are deliberately NOT here. grnh.se is only a link shortener and the
+# *.greenhouse.io boards host real per-company application forms; blanket-blocking
+# them discarded legitimate direct-employer jobs. OffsiteApplyFlow already has
+# Greenhouse iframe-embed handling plus pre-loop / mid-loop / per-step reCAPTCHA
+# detectors that return "skipped" at runtime, so a genuinely CAPTCHA-walled
+# Greenhouse form is still skipped cleanly — as a runtime outcome, not a blind
+# pre-filter.
+_OFFSITE_SPAM = (
+    # Pure spam / aggregator job boards
+    "jobright.ai", "sundayy.com", "scale.jobs", "dice.com",
+    "mercor.com", "remotehunter.com", "haystack.cv", "talentally.com",
+    "micro1.ai", "tenex.ai", "bestjobtool.com", "fetchjobs.co",
+    "alignerr.com", "app.dataannotation.tech",
+    "theladders.com", "hiresome.ai",
+    # Assessment / crossover platforms — not real direct-hire jobs
+    "ed.crossover.com", "crossover.com",
+    # Recruiter broker / broken stub sites
+    "peakperformers.org", "work.mercor.com", "rex.zone",
+    "motionrecruitment.com", "hirecrap.com",
+    "codevertexinnovations.com",                # Scam site
+)
+
+
+def _match_spam_domain(*candidates: str) -> str | None:
+    """Return the first host among *candidates* that matches ``_OFFSITE_SPAM``.
+
+    Accepts bare domains (``posting_domain``) or full URLs (``application_url``);
+    returns ``None`` when nothing matches.
+    """
+    for raw in candidates:
+        value = (raw or "").strip().lower()
+        if not value:
+            continue
+        host = urlparse(value).netloc if "//" in value else value.split("/", 1)[0]
+        host = host.split("@")[-1].split(":")[0]
+        if host and any(host == d or host.endswith("." + d) for d in _OFFSITE_SPAM):
+            return host
+    return None
 
 
 async def _llm_fill_focused(page, llm_client: AsyncOpenAI, llm_model: str, profile: dict):
@@ -518,7 +564,10 @@ class JobAgent:
     * citizenship / clearance keyword in the description  → immediate skip,
       no LLM call on either backend.
     * ``application_type == "OffsiteApply"``              → NIM (OpenAI-compatible,
-      ``config.get_llm_config("classifier")`` → google/gemma-4-31b-it @ NVIDIA NIM). Free.
+      ``config.get_llm_config("classifier")`` → meta/llama-3.2-11b-vision-instruct
+      @ NVIDIA NIM). Free. ``run_session`` may override this to the Agent SDK for
+      the rest of a session once the NIM route trips its circuit breaker
+      (see :func:`classify_with_circuit_breaker`).
     * ``SimpleOnsiteApply`` / ``ComplexOnsiteApply`` / anything else (incl.
       ``None``)                                          → Claude Agent SDK
       (``llm.query_json``, one isolated one-shot session per job, subscription auth).
@@ -585,6 +634,10 @@ Be accurate and concise. Never fabricate information not in the user's profile."
     # propagates to run_session.
     _CALL_ATTEMPTS = 2
     _RETRY_DELAY_S = 2.0
+    # Wall-clock ceiling for ONE classify attempt. Each attempt in
+    # :meth:`_run_with_retry` gets its own deadline, so a slow-but-alive backend
+    # still gets a fresh retry instead of being starved by a single outer wait.
+    _ATTEMPT_TIMEOUT_S = 40.0
 
     def __init__(self, profile: dict):
         self._system = self._SYSTEM.format(profile=json.dumps(profile, indent=2))
@@ -592,9 +645,16 @@ Be accurate and concise. Never fabricate information not in the user's profile."
         self._nim_model = ""
 
     async def classify(
-        self, title: str, description: str, application_type: str | None
+        self, title: str, description: str, application_type: str | None,
+        *, prefer_agent_sdk: bool = False,
     ) -> tuple[bool, str, bool]:
-        """Returns (relevant, reason, citizenship_required)."""
+        """Returns (relevant, reason, citizenship_required).
+
+        ``prefer_agent_sdk`` forces the Claude Agent SDK route even for
+        ``OffsiteApply`` jobs — used by ``run_session`` after the NIM classifier
+        route trips its circuit breaker. The citizenship keyword fast-path still
+        runs first regardless.
+        """
         desc = description or ""
 
         # Fast path: keyword scan on full description before paying for an LLM call
@@ -606,25 +666,32 @@ Be accurate and concise. Never fabricate information not in the user's profile."
                           {"relevant": False, "reason": reason, "citizenship_required": True})
                 return False, reason, True
 
-        if application_type == "OffsiteApply":
+        if application_type == "OffsiteApply" and not prefer_agent_sdk:
             return await self._classify_nim(title, desc)
         return await self._classify_agent(title, desc)
 
     async def _run_with_retry(self, factory):
         """Await ``factory()``, retrying once on a transient failure.
 
+        Each attempt gets its own ``_ATTEMPT_TIMEOUT_S`` deadline — a call that
+        is slow but alive on one attempt still gets a clean retry rather than
+        being starved by a single deadline wrapping both attempts. A timeout on
+        the final attempt propagates as ``TimeoutError`` so the caller can tell
+        it apart from a hard failure.
+
         ``NimConfigError`` is deterministic (missing key) so it is never
         retried — it propagates immediately.
         """
         for attempt in range(1, self._CALL_ATTEMPTS + 1):
             try:
-                return await factory()
+                return await asyncio.wait_for(factory(), self._ATTEMPT_TIMEOUT_S)
             except nim_client.NimConfigError:
                 raise
             except Exception as exc:
                 if attempt >= self._CALL_ATTEMPTS:
                     raise
-                print(f"\n  [classifier] attempt {attempt} failed ({exc}) — retrying…",
+                what = "timed out" if isinstance(exc, TimeoutError) else f"failed ({exc})"
+                print(f"\n  [classifier] attempt {attempt} {what} — retrying…",
                       flush=True)
                 await asyncio.sleep(self._RETRY_DELAY_S)
 
@@ -693,6 +760,80 @@ Be accurate and concise. Never fabricate information not in the user's profile."
         if raw is not None:
             entry["raw_response"] = raw
         _write_llm_log(entry)
+
+
+# ── Classifier circuit breaker ─────────────────────────────────────────────────
+
+# Consecutive NIM-route classify timeouts within one session before every
+# remaining OffsiteApply job is routed through the Agent SDK instead.
+_MAX_NIM_TIMEOUT_STREAK = 2
+_NIM_DEGRADED_MSG = (
+    "NIM classifier route degraded — falling back to Agent SDK for OffsiteApply"
+)
+
+
+def _new_classifier_breaker() -> dict:
+    """Fresh, session-scoped circuit-breaker state. One per ``run_session``."""
+    return {"nim_timeout_streak": 0, "nim_route_degraded": False}
+
+
+async def classify_with_circuit_breaker(
+    agent: "JobAgent", breaker: dict,
+    title: str, description: str, application_type: str | None,
+) -> tuple[bool, str, bool]:
+    """Classify one job, applying the per-session NIM-route circuit breaker.
+
+    ``breaker`` is the mutable dict from :func:`_new_classifier_breaker`; this
+    function updates it in place.
+
+    Behaviour:
+      * Non-OffsiteApply jobs are unaffected — straight to ``agent.classify``
+        (which uses the Agent SDK for them anyway).
+      * OffsiteApply job, route healthy: try NIM. On ``TimeoutError``,
+        bump the streak, classify *this* job via the Agent SDK instead, and — at
+        ``_MAX_NIM_TIMEOUT_STREAK`` consecutive timeouts — flip the route to
+        "degraded" and log it once.
+      * OffsiteApply job, route degraded: straight to the Agent SDK, no wasted
+        NIM attempt.
+
+    A NIM timeout that the Agent SDK then classifies successfully does NOT raise
+    — so the caller does not count it as a classifier failure. Only a genuine
+    failure (Agent SDK also fails, or a non-timeout error) propagates.
+    """
+    is_offsite = (application_type or "") == "OffsiteApply"
+
+    if not is_offsite or breaker["nim_route_degraded"]:
+        return await agent.classify(
+            title, description, application_type, prefer_agent_sdk=is_offsite,
+        )
+
+    try:
+        result = await agent.classify(title, description, application_type)
+    except TimeoutError:
+        breaker["nim_timeout_streak"] += 1
+        streak = breaker["nim_timeout_streak"]
+        just_degraded = (
+            streak >= _MAX_NIM_TIMEOUT_STREAK and not breaker["nim_route_degraded"]
+        )
+        if just_degraded:
+            breaker["nim_route_degraded"] = True
+            _write_llm_log({
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "type": "classifier_route_degraded",
+                "note": _NIM_DEGRADED_MSG,
+                "nim_timeout_streak": streak,
+            })
+        print(
+            f"\n  [!] NIM classifier timed out ({streak}/{_MAX_NIM_TIMEOUT_STREAK}) "
+            f"— classifying this job via the Agent SDK instead."
+            + (f"\n  [!] {_NIM_DEGRADED_MSG}" if just_degraded else "")
+        )
+        return await agent.classify(
+            title, description, application_type, prefer_agent_sdk=True,
+        )
+    else:
+        breaker["nim_timeout_streak"] = 0
+        return result
 
 
 # ── Database helpers ────────────────────────────────────────────────────────────
@@ -933,6 +1074,8 @@ async def run_session(
     # pending and moves on; a run of them means something systemic, so bail.
     classify_fail_streak = 0
     _MAX_CLASSIFY_FAIL_STREAK = 3
+    # NIM-route circuit breaker — session-scoped, resets each run_session.
+    classifier_breaker = _new_classifier_breaker()
 
     inbox = EmailInbox(gmail_user, gmail_pass) if gmail_user and gmail_pass else None
 
@@ -940,6 +1083,9 @@ async def run_session(
     session_date = datetime.now().strftime("%Y-%m-%d")
     applications: list[dict] = []
     applied_count = skipped_count = error_count = 0
+    # Jobs left pending because classification failed/timed out — NOT skipped
+    # (no mark_job), tracked separately so "Skipped: N" does not over-report.
+    deferred_count = 0
 
     # Write a session boundary marker so log-monitor agents can filter to just this run
     _write_llm_log({
@@ -1008,11 +1154,22 @@ async def run_session(
                     print("  Auto-skipped — staff/principal engineer position.")
                     continue
 
+                # Spam / aggregator domains are skipped BEFORE the classifier
+                # runs (T29) — a spam listing must never cost an LLM call.
+                if (application_type or "") == "OffsiteApply":
+                    _spam_host = _match_spam_domain(posting_domain, application_url)
+                    if _spam_host:
+                        print(f"  [skip] Spam/aggregator domain ({_spam_host}) — "
+                              f"skipped before classification.")
+                        mark_job(conn, cursor, job_id, -1)
+                        skipped_count += 1
+                        continue
+
                 print("  Classifying…", end="", flush=True)
                 try:
-                    relevant, reason, citizenship_required = await asyncio.wait_for(
-                        agent.classify(title or "", description or "", application_type),
-                        timeout=90,
+                    relevant, reason, citizenship_required = await classify_with_circuit_breaker(
+                        agent, classifier_breaker,
+                        title or "", description or "", application_type,
                     )
                     classify_fail_streak = 0
                 except nim_client.NimConfigError as exc:
@@ -1023,12 +1180,16 @@ async def run_session(
                     print(f"\n  [!] NIM classifier misconfigured ({exc}) — stopping session.")
                     break
                 except Exception as exc:
+                    # Both classifier routes failed for this job (the circuit
+                    # breaker already tried the Agent SDK fallback on a NIM
+                    # timeout). Leave the job pending — do NOT mark_job, do NOT
+                    # count it as skipped.
                     classify_fail_streak += 1
-                    what = ("did not respond in 90s" if isinstance(exc, asyncio.TimeoutError)
+                    what = ("timed out" if isinstance(exc, TimeoutError)
                             else f"failed ({exc})")
                     print(f"\n  [!] Classifier {what} — leaving job pending "
                           f"({classify_fail_streak}/{_MAX_CLASSIFY_FAIL_STREAK}).")
-                    skipped_count += 1
+                    deferred_count += 1
                     if classify_fail_streak >= _MAX_CLASSIFY_FAIL_STREAK:
                         print("  [!] Too many consecutive classifier failures — "
                               "likely systemic; stopping session.")
@@ -1113,29 +1274,8 @@ async def run_session(
                 print("  Applying via Playwright…")
 
                 if (application_type or "") == "OffsiteApply":
-                    # Skip known spam/aggregator domains before opening any browser tab
-                    _OFFSITE_SPAM = (
-                        # Pure spam / aggregator job boards
-                        "jobright.ai", "sundayy.com", "scale.jobs", "dice.com",
-                        "mercor.com", "remotehunter.com", "haystack.cv", "talentally.com",
-                        "micro1.ai", "tenex.ai", "bestjobtool.com", "fetchjobs.co",
-                        "alignerr.com", "app.dataannotation.tech",
-                        "theladders.com", "hiresome.ai",
-                        # Assessment / crossover platforms — not real direct-hire jobs
-                        "ed.crossover.com", "crossover.com",
-                        # Greenhouse generic redirect boards — reCAPTCHA required, no real form
-                        "job-boards.greenhouse.io", "boards.greenhouse.io", "grnh.se",
-                        # Recruiter broker / broken stub sites
-                        "peakperformers.org", "work.mercor.com", "rex.zone",
-                        "motionrecruitment.com", "hirecrap.com",
-                        "codevertexinnovations.com",                # Scam site
-                    )
-                    _pd = (posting_domain or "").lower().strip()
-                    if _pd and any(_pd == d or _pd.endswith("." + d) for d in _OFFSITE_SPAM):
-                        print(f"  [LLM] Spam/aggregator domain ({_pd}) — skipping")
-                        mark_job(conn, cursor, job_id, -1)
-                        skipped_count += 1
-                        continue
+                    # Spam/aggregator domains were already filtered before the
+                    # classifier call (see _match_spam_domain above).
                     flow = OffsiteApplyFlow(
                         page=page,
                         context=context,
@@ -1368,12 +1508,15 @@ async def run_session(
         "applied_count": applied_count,
         "skipped_count": skipped_count,
         "error_count":   error_count,
+        "deferred_count": deferred_count,
         "auto_mode":     auto_mode,
         "applications":  applications,
     }
 
     print(f"\n{'═' * 64}")
-    print(f"Session complete — Applied: {applied_count}  Skipped: {skipped_count}  Errors: {error_count}")
+    _deferred_note = f"  Deferred: {deferred_count}" if deferred_count else ""
+    print(f"Session complete — Applied: {applied_count}  Skipped: {skipped_count}  "
+          f"Errors: {error_count}{_deferred_note}")
 
     if all_unanswered_fields:
         print(f"\n⚠ Profile gaps — these form fields had no answer from your profile or AI:")
