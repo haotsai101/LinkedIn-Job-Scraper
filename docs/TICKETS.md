@@ -10,12 +10,24 @@ Baseline captured 2026-08-28. `docs/baseline/db_state.baseline.txt` holds the DB
 |---|---|---|
 | 1 | T1 #5, T2 #2, T5 #6, T8 #4, T12 #3 | ✅ **CLOSED** — QA passed 2026-08-28 (`docs/qa/wave1-qa.md`) |
 | 2 | T6 #9, T13 #8, T9 #10, T4 #11, T23 #12, T3 #13 | ✅ **CLOSED** — QA passed 2026-08-29 (`docs/qa/wave2-qa.md`). T9 shipped a P1 regression (`create_tables()` crash on unmigrated DB); fixed by T23 hotfix. |
-| 3 — Phase 2 | T14 (part 1) #15 | 🟡 **MERGED, pending live QA** (`f36f0a6`). Offline QA passed (112 tests). Classifier live path unverified — needs `claude-agent-sdk` installed + `claude` login + NIM key. Checklist: `docs/qa/t14-live-qa.md`. |
-| 3 — Phase 2 | T14b — browser-agent `_call_claude` → `ClaudeSession` | blocked on T14 live QA |
-| 4 — Phase 3 | T15 | needs T14 + T14b |
+| 3 — Phase 2 | T14 #15, T26 #19, T27 #20 (bundles T28+T29) | ✅ **CLOSED** — QA passed 2026-09-01/02. Agent SDK classifier migration + routing, validated with **2 real job applications** (`docs/qa/t14-live-qa.md`). T26 fixed `max_turns=1` (~15-40% classifier failures). T27 fixed the NIM tier going bad: model → `meta/llama-3.2-11b-vision-instruct`, per-attempt timeout, NIM→Agent-SDK circuit breaker, spam-check reorder, Greenhouse un-blocked. |
+| 3 — Phase 2 | T14b — browser-agent `_call_claude` → `ClaudeSession` | **not started** — next up |
+| 4 — Phase 3 | T15 — browser-use spike | needs T14b; **also blocked**: `deepseek-v4-flash` (planned browser_use model) is down on free NIM — needs a working model first |
 | 5 — Phase 4 | T16a/T16b | shape decided by T15 |
 | 6 — Phase 5 | T17 | needs T12 ✓ |
 | Follow-ups | T19 T20 T21 T22 T24 | not started (P2–P3) |
+
+**⚠️ Operator action for T27:** `.env` still has `CLASSIFIER_LLM_MODEL=google/gemma-4-31b-it` (the timing-out model). The legacy alias overrides the new default — change it to `CLASSIFIER_MODEL=meta/llama-3.2-11b-vision-instruct` for T27 to take effect.
+
+**Optional (T28):** the ~42 rows commit `76cc97e` pre-skipped as Greenhouse are still `applied=-1`. To reconsider them:
+```sql
+UPDATE jobs SET applied = NULL
+WHERE applied = -1
+  AND (posting_domain LIKE '%greenhouse.io' OR application_url LIKE '%grnh.se%'
+       OR application_url LIKE '%greenhouse.io%');
+```
+
+**T14 was split**: part 1 (#15) = Agent SDK wrapper (`llm.py`) + classifier routing + classifier-side OpenAI plumbing removal. **T14b** = `linkedin_apply._call_claude` / `script_engine._call_claude` → `ClaudeSession` + remove remaining OpenAI plumbing. Part 1's review caught [claude-agent-sdk#560](https://github.com/anthropics/claude-agent-sdk-python/issues/560) (persistent client doesn't isolate context) — classifier uses one-shot `query()`.
 
 **T14 was split** during implementation: part 1 (#15, this) = Agent SDK wrapper (`llm.py`) + classifier routing (NIM ↔ Agent SDK by `application_type`) + classifier-side OpenAI plumbing removal. **T14b** = migrate `linkedin_apply._call_claude` / `script_engine._call_claude` to `ClaudeSession` + remove the remaining OpenAI plumbing. Part 1's review found and fixed a real bug: the persistent Agent SDK client does not isolate context ([claude-agent-sdk#560](https://github.com/anthropics/claude-agent-sdk-python/issues/560)) — the classifier now uses one-shot `query()`.
 
