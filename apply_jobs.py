@@ -7,19 +7,22 @@ deterministic Playwright flows to fill and submit applications without any
 human intervention (--auto mode). A session summary is written to
 application_log.json and emailed via Gmail when the run finishes.
 
+LLM configuration lives in config.py (get_llm_config). Roles:
+    classifier    - job relevance scoring; OffsiteApply -> NVIDIA NIM
+                    (CLASSIFIER_* env), Easy Apply -> Claude Agent SDK.
+    guided_apply  - the browser agent (OffsiteApplyFlow / EasyApplyFlow /
+                    ScriptApplyEngine) via the Claude Agent SDK. Subscription
+                    auth: no API key, requires a `claude` CLI login. (T14b)
+
 Environment variables (put in a .env file or export before running):
-    LLM_API             - API key for the LLM endpoint
-    LLM_URL             - Base URL of the OpenAI-compatible API
-    LLM_MODEL           - Model name
+    CLASSIFIER_API / CLASSIFIER_BASE_URL / CLASSIFIER_MODEL - NIM classifier
     GMAIL_USER          - Gmail address to send summary emails from/to
     GMAIL_APP_PASSWORD  - 16-char Google App Password (needs 2FA enabled)
     MAX_AUTO_APPLY      - Default daily cap (default: 10)
-
-    # Optional: separate model/endpoint just for the browser agent
-    BROWSER_LLM_API             - API key (defaults to LLM_API)
-    BROWSER_LLM_URL             - Base URL (defaults to LLM_URL)
-    BROWSER_LLM_MODEL           - Model name (defaults to LLM_MODEL)
-    BROWSER_LLM_FALLBACK_MODEL  - Faster fallback model used after 2 consecutive LLM timeouts (defaults to LLM_MODEL)
+    LLM_API / LLM_URL / LLM_MODEL - OPTIONAL. Only the legacy OpenAI-backed
+                    profile-setup interview (--setup) still reads them; every
+                    other path resolves its own config. Also accepted as
+                    deprecated aliases by config.py for one more release.
 
 Usage:
     python apply_jobs.py                      # Semi-auto: confirm before each submit
@@ -52,14 +55,15 @@ from email.mime.text import MIMEText
 from pathlib import Path
 from urllib.parse import urlparse
 
-from openai import OpenAI, AsyncOpenAI
+from openai import OpenAI
 from playwright.async_api import async_playwright
 
+import config
 import llm
 import nim_client
 from common import prune_debug_screenshots, rotate_llm_log
 from common import write_llm_log as _write_llm_log
-from linkedin_apply import EasyApplyFlow, OffsiteApplyFlow, _get_profile_value, _session_llm_state
+from linkedin_apply import EasyApplyFlow, OffsiteApplyFlow, _get_profile_value
 from scripts.create_db import BLOCKED_ENTITIES_SEED, ensure_schema_current
 
 sys.stdout.reconfigure(line_buffering=True)
@@ -126,8 +130,12 @@ def _match_spam_domain(*candidates: str) -> str | None:
     return None
 
 
-async def _llm_fill_focused(page, llm_client: AsyncOpenAI, llm_model: str, profile: dict):
-    """LLM-fill whichever input field is currently focused in the browser."""
+async def _llm_fill_focused(page, profile: dict):
+    """LLM-fill whichever input field is currently focused in the browser.
+
+    Interactive-only helper (the semi-auto ``[f]`` command). Uses a short-lived
+    Claude Agent SDK session — this path fires at most a handful of times per
+    session, so a per-call subprocess is fine."""
     field = await page.evaluate("""() => {
         const el = document.activeElement;
         if (!el || el === document.body || el === document.documentElement) return null;
@@ -154,22 +162,26 @@ async def _llm_fill_focused(page, llm_client: AsyncOpenAI, llm_model: str, profi
             f"yrs={profile.get('years_experience')} auth={profile.get('work_authorization')} "
             f"needs_sponsorship={profile.get('need_sponsorship')}"
         )
+        session = llm.ClaudeSession(
+            model=config.get_llm_config("guided_apply").model, log_calls=False,
+        )
         try:
-            resp = await llm_client.chat.completions.create(
-                model=llm_model,
-                messages=[{"role": "user", "content":
+            answer = await asyncio.wait_for(
+                session.ask(
                     f"Job application form field.\nLabel: {label!r}\nType: {kind}\n"
                     f"Profile: {profile_line}\n\n"
                     "Reply with ONLY the value to fill in this field. No explanation. "
                     "CRITICAL: Never fabricate URLs, social media handles, or info not in the profile. "
-                    "For URL/link fields not in the profile (Twitter, Instagram, blog, etc.), reply with empty string."}],
-                max_tokens=100,
-                timeout=30,
+                    "For URL/link fields not in the profile (Twitter, Instagram, blog, etc.), reply with empty string."
+                ),
+                timeout=40,
             )
-            value = (resp.choices[0].message.content or "").strip()
+            value = (answer or "").strip()
         except Exception as e:
             print(f"  [f] LLM error: {e}")
             return
+        finally:
+            await session.aclose()
 
     if not value:
         print(f"  [f] No value determined for '{label}' — leaving blank.")
@@ -244,20 +256,17 @@ def load_env():
     gmail_pass   = os.environ.get("GMAIL_APP_PASSWORD", "").strip()
     max_auto_env = int(os.environ.get("MAX_AUTO_APPLY", "10"))
 
-    browser_api_key        = os.environ.get("BROWSER_LLM_API", api_key).strip()
-    browser_url            = os.environ.get("BROWSER_LLM_URL", base_url).strip()
-    browser_model          = os.environ.get("BROWSER_LLM_MODEL", model).strip()
-    browser_fallback_model = os.environ.get("BROWSER_LLM_FALLBACK_MODEL", browser_model).strip()
-
-    # The classifier no longer reads LLM_* / CLASSIFIER_LLM_* here — it resolves
-    # its own config: OffsiteApply → nim_client (config.get_llm_config("classifier"),
-    # which still honours CLASSIFIER_* and the legacy aliases), Easy Apply →
-    # Claude Agent SDK subscription auth. (T14 part 1.)
-
-    if not api_key or not base_url:
-        sys.exit("Error: LLM_API and LLM_URL must be set (in .env or environment).")
-
-    return api_key, base_url, model, gmail_user, gmail_pass, max_auto_env, browser_api_key, browser_url, browser_model, browser_fallback_model
+    # No LLM_* / LLM_URL hard requirement any more (T14b). Each LLM role resolves
+    # its own config:
+    #   * classifier   — OffsiteApply → nim_client (config.get_llm_config("classifier"),
+    #                    honours CLASSIFIER_* + legacy aliases); Easy Apply → Claude
+    #                    Agent SDK subscription auth.
+    #   * browser agent (OffsiteApplyFlow / EasyApplyFlow / ScriptApplyEngine) →
+    #                    Claude Agent SDK subscription auth (config "guided_apply").
+    # LLM_API / LLM_URL / LLM_MODEL are now optional — read here only for the
+    # legacy OpenAI-backed profile-setup interview (build_profile_interactively),
+    # which degrades to raw answers when they are unset.
+    return api_key, base_url, model, gmail_user, gmail_pass, max_auto_env
 
 
 # ── User profile ────────────────────────────────────────────────────────────────
@@ -1050,10 +1059,6 @@ async def run_session(
     jobs,
     total,
     profile,
-    client,
-    model,
-    api_key,
-    base_url,
     conn,
     cursor,
     *,
@@ -1061,10 +1066,6 @@ async def run_session(
     max_apply: int = 10,
     gmail_user: str = "",
     gmail_pass: str = "",
-    browser_api_key: str = "",
-    browser_url: str = "",
-    browser_model: str = "",
-    browser_fallback_model: str = "",
     verbose: bool = False,
 ):
     # JobAgent owns its own classifier backends: NIM for OffsiteApply, a fresh
@@ -1095,19 +1096,6 @@ async def run_session(
         "total_jobs": total,
     })
     all_unanswered_fields: list[str] = []
-
-    browser_llm_client = AsyncOpenAI(
-        api_key=browser_api_key or api_key,
-        base_url=browser_url or base_url,
-        timeout=190.0,  # hard HTTP timeout; AsyncOpenAI is native asyncio so asyncio.wait_for can cancel it
-        max_retries=0,  # we handle retries ourselves in _ask_llm_action
-    )
-    browser_llm_model = browser_model or model
-    browser_llm_fallback = browser_fallback_model or browser_llm_model
-
-    # Reset circuit-breaker state for this session
-    _session_llm_state["timeout_streak"] = 0
-    _session_llm_state["model_switched"] = False
 
     # Skip LinkedIn login when every job in the queue is OffsiteApply —
     # those jobs navigate directly to the company ATS via application_url.
@@ -1253,14 +1241,14 @@ async def run_session(
                                 outcome_ref["status"] = "skipped"
                                 return "skipped"
                             if choice == "f":
-                                await _llm_fill_focused(page, browser_llm_client, browser_model, profile)
+                                await _llm_fill_focused(page, profile)
                                 continue
                             outcome_ref["status"] = "applied"
                             return "applied"
                     return ready_to_submit
 
                 async def _fill_focused_cb():
-                    await _llm_fill_focused(page, browser_llm_client, browser_model, profile)
+                    await _llm_fill_focused(page, profile)
 
                 callbacks = {
                     "ready_to_submit":  _make_ready_to_submit(outcome, title or "Unknown"),
@@ -1280,8 +1268,6 @@ async def run_session(
                         page=page,
                         context=context,
                         profile=profile,
-                        llm_client=browser_llm_client,
-                        model=browser_llm_model,
                         auto_mode=auto_mode,
                         callbacks=callbacks,
                         generated_password=_generate_password(),
@@ -1290,15 +1276,12 @@ async def run_session(
                         job_description=description or "",
                         verbose=verbose,
                         inbox=inbox,
-                        fallback_model=browser_llm_fallback,
                         application_url=application_url or "",
                     )
                 else:
                     flow = EasyApplyFlow(
                         page=page,
                         profile=profile,
-                        llm_client=browser_llm_client,
-                        model=browser_llm_model,
                         auto_mode=auto_mode,
                         callbacks=callbacks,
                         verbose=verbose,
@@ -1322,8 +1305,6 @@ async def run_session(
                         page=page,
                         context=context,
                         profile=profile,
-                        llm_client=browser_llm_client,
-                        model=browser_llm_model,
                         auto_mode=auto_mode,
                         callbacks=callbacks,
                         generated_password=_generate_password(),
@@ -1332,7 +1313,6 @@ async def run_session(
                         job_description=description or "",
                         verbose=verbose,
                         inbox=inbox,
-                        fallback_model=browser_llm_fallback,
                         application_url=application_url or "",
                     )
                     try:
@@ -1414,7 +1394,7 @@ async def run_session(
                                             break
                                     except Exception:
                                         continue
-                                await _llm_fill_focused(_active_pg, browser_llm_client, browser_model, profile)
+                                await _llm_fill_focused(_active_pg, profile)
                                 continue
                             if fail_choice == "r" and isinstance(flow, OffsiteApplyFlow):
                                 try:
@@ -1543,7 +1523,7 @@ def main():
     parser.add_argument("--verbose",      action="store_true", help="Print full LLM prompt/response and save screenshots per step.")
     args = parser.parse_args()
 
-    api_key, base_url, model, gmail_user, gmail_pass, max_auto_env, browser_api_key, browser_url, browser_model, browser_fallback_model = load_env()
+    api_key, base_url, model, gmail_user, gmail_pass, max_auto_env = load_env()
     client = OpenAI(api_key=api_key, base_url=base_url)
 
     conn   = sqlite3.connect(DB_PATH)
@@ -1615,16 +1595,11 @@ def main():
 
     asyncio.run(
         run_session(
-            jobs, total, profile, client, model,
-            api_key, base_url, conn, cursor,
+            jobs, total, profile, conn, cursor,
             auto_mode=args.auto,
             max_apply=max_apply,
             gmail_user=gmail_user,
             gmail_pass=gmail_pass,
-            browser_api_key=browser_api_key,
-            browser_url=browser_url,
-            browser_model=browser_model,
-            browser_fallback_model=browser_fallback_model,
             verbose=args.verbose,
         )
     )

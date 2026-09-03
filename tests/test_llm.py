@@ -299,3 +299,34 @@ def test_session_aclose_safe_before_use(monkeypatch):
     session = llm.ClaudeSession(model="claude-sonnet-5", log_calls=False)
     asyncio.run(session.aclose())
     assert fake.ClaudeSDKClient.created == []
+
+
+def test_session_reuses_one_client_across_many_calls(monkeypatch):
+    """T14b browser agent fires many prompts through one session/subprocess."""
+    fake = _make_fake_sdk(result="ok")
+    _install(monkeypatch, fake)
+    session = llm.ClaudeSession(model="claude-sonnet-5", log_calls=False)
+
+    async def _many():
+        for i in range(5):
+            await session.ask(f"q{i}")
+
+    asyncio.run(_many())
+    assert len(fake.ClaudeSDKClient.created) == 1
+    assert fake.ClaudeSDKClient.created[0].queries == [f"q{i}" for i in range(5)]
+
+
+def test_session_aclose_idempotent_after_use(monkeypatch):
+    """Two aclose() calls after use disconnect the subprocess exactly once —
+    flows call it from a ``finally`` that can run after run() already closed."""
+    fake = _make_fake_sdk(result="hi")
+    _install(monkeypatch, fake)
+    session = llm.ClaudeSession(model="claude-sonnet-5", log_calls=False)
+
+    async def _go():
+        await session.ask("one")
+        await session.aclose()
+        await session.aclose()
+
+    asyncio.run(_go())
+    assert fake.ClaudeSDKClient.created[0].disconnect_calls == 1

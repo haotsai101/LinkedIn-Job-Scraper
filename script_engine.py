@@ -1,37 +1,29 @@
 """
 script_engine.py — Script-generation engine for job application forms.
 
-Uses any OpenAI-compatible LLM to read the full DOM and generate a complete
-Playwright Python script that fills all fields and submits the form in one shot.
+Reads the full DOM and asks the Claude Agent SDK (subscription auth, T14b) to
+generate a complete Playwright Python script that fills all fields and submits
+the form in one shot.
 
 Usage (called from OffsiteApplyFlow._llm_guided_apply):
-    engine = ScriptApplyEngine(profile, context, company_name, job_title,
-                               llm_client, model)
+    engine = ScriptApplyEngine(profile, context, company_name, job_title)
     result = await engine.apply(page)  # returns "applied" | "skipped" | "failed"
+
+The engine holds one llm.ClaudeSession — one persistent ``claude`` subprocess,
+one shared conversation — for the pages of a single job, and closes it when
+apply() returns.
 """
 
 import asyncio
 import os
 import re
-import subprocess
 from datetime import datetime, timezone
 
-from openai import AsyncOpenAI
 from playwright.async_api import Page, BrowserContext
 
+import config
+import llm
 from common import write_llm_log as _write_llm_log
-
-
-async def _call_claude(prompt: str, model: str = "claude-haiku-4-5", timeout: float = 175) -> str:
-    def _run():
-        proc = subprocess.run(
-            ["claude", "--model", model, "-p", prompt],
-            capture_output=True, text=True, timeout=int(timeout),
-        )
-        if proc.returncode != 0:
-            raise RuntimeError(f"claude exited {proc.returncode}: {proc.stderr[:300]}")
-        return proc.stdout.strip()
-    return await asyncio.to_thread(_run)
 
 
 # ---------------------------------------------------------------------------
@@ -86,8 +78,8 @@ class ScriptApplyEngine:
     """
     Generate and execute a complete Playwright Python script per form page.
 
-    Works with any OpenAI-compatible LLM — pass the same client and model
-    used for the rest of the browser agent.
+    Uses the Claude Agent SDK (subscription auth) via a single reused
+    llm.ClaudeSession for the pages of one job.
     """
 
     _MAX_PAGES = 7
@@ -98,15 +90,36 @@ class ScriptApplyEngine:
         context: BrowserContext,
         company_name: str,
         job_title: str,
-        llm_client: AsyncOpenAI,
-        model: str,
     ):
         self.profile = profile
         self.context = context
         self.company_name = company_name
         self.job_title = job_title
-        self.client = llm_client
-        self.model = model
+        # Kept for log attribution only — the session model is fixed.
+        self.model = config.get_llm_config("guided_apply").model
+        self._session = None  # lazily-created llm.ClaudeSession
+
+    async def _claude_ask(self, prompt: str, *, timeout: float | None = None) -> str:
+        """One prompt through the reused session. With ``timeout``, a slow call
+        raises :class:`asyncio.TimeoutError` after tearing the session down (a
+        cancelled ``receive_response`` can desync the persistent client)."""
+        if self._session is None:
+            self._session = llm.ClaudeSession(
+                model=self.model, log_type="agent", log_calls=False,
+            )
+        if timeout is None:
+            return await self._session.ask(prompt)
+        try:
+            return await asyncio.wait_for(self._session.ask(prompt), timeout)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            await self._aclose()
+            raise
+
+    async def _aclose(self) -> None:
+        session = self._session
+        self._session = None
+        if session is not None:
+            await session.aclose()
 
     async def _get_viewport_snapshot(self, page: Page) -> tuple[str, list]:
         """Return (visible_text, elements) for what is currently in the viewport."""
@@ -183,8 +196,15 @@ class ScriptApplyEngine:
     async def apply(self, page: Page) -> str:
         """
         Drive a job application form using LLM-generated Playwright scripts.
-        Returns "applied" | "skipped" | "failed".
+        Returns "applied" | "skipped" | "failed". Closes the shared Claude
+        session on the way out.
         """
+        try:
+            return await self._apply(page)
+        finally:
+            await self._aclose()
+
+    async def _apply(self, page: Page) -> str:
         completed_pages: list[str] = []
         same_url_count: dict[str, int] = {}
 
@@ -470,10 +490,7 @@ Output the completed script only — no markdown, no explanation."""
     async def _call_llm(self, prompt: str, page_url: str, element_count: int) -> str | None:
         _t0 = datetime.now(timezone.utc)
         try:
-            script = await asyncio.wait_for(
-                _call_claude(prompt, model=self.model, timeout=175),
-                timeout=180,
-            )
+            script = await self._claude_ask(prompt, timeout=180)
             script = (script or "").strip()
 
             # Strip markdown fences if the LLM added them despite instructions
