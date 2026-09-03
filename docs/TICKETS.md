@@ -10,14 +10,22 @@ Baseline captured 2026-08-28. `docs/baseline/db_state.baseline.txt` holds the DB
 |---|---|---|
 | 1 | T1 #5, T2 #2, T5 #6, T8 #4, T12 #3 | ✅ **CLOSED** — QA passed 2026-08-28 (`docs/qa/wave1-qa.md`) |
 | 2 | T6 #9, T13 #8, T9 #10, T4 #11, T23 #12, T3 #13 | ✅ **CLOSED** — QA passed 2026-08-29 (`docs/qa/wave2-qa.md`). T9 shipped a P1 regression (`create_tables()` crash on unmigrated DB); fixed by T23 hotfix. |
-| 3 — Phase 2 | T14 #15, T26 #19, T27 #20 (bundles T28+T29) | ✅ **CLOSED** — QA passed 2026-09-01/02. Agent SDK classifier migration + routing, validated with **2 real job applications** (`docs/qa/t14-live-qa.md`). T26 fixed `max_turns=1` (~15-40% classifier failures). T27 fixed the NIM tier going bad: model → `meta/llama-3.2-11b-vision-instruct`, per-attempt timeout, NIM→Agent-SDK circuit breaker, spam-check reorder, Greenhouse un-blocked. |
-| 3 — Phase 2 | T14b — browser-agent `_call_claude` → `ClaudeSession` | **not started** — next up |
-| 4 — Phase 3 | T15 — browser-use spike | needs T14b; **also blocked**: `deepseek-v4-flash` (planned browser_use model) is down on free NIM — needs a working model first |
+| 3 — Phase 2 | T14 #15, T26 #19, T27 #20, T14b #22 | ✅ **CLOSED** 2026-09-03. **The entire LLM stack is off the `claude` subprocess.** T14: Agent SDK wrapper + classifier routing (validated with 2 real applications). T26: `max_turns` fix. T27: NIM-tier hardening (model → `meta/llama-3.2-11b-vision-instruct`, circuit breaker, spam reorder, Greenhouse un-block; bundled T28+T29). T14b: browser agent (`_llm_guided_apply`, EEO pickers, `ScriptApplyEngine`) → one-shot `llm.query`/`query_json`; all dead `AsyncOpenAI` plumbing + the `load_env` `LLM_API` hard-exit removed. 154 tests. |
+| 4 — Phase 3 | T15 — browser-use spike | **blocked**: `deepseek-v4-flash` (planned `browser_use` model) is down on free NIM — needs a working model. `meta/llama-3.2-11b-vision-instruct` works but is small for agentic browser work. |
 | 5 — Phase 4 | T16a/T16b | shape decided by T15 |
 | 6 — Phase 5 | T17 | needs T12 ✓ |
-| Follow-ups | T19 T20 T21 T22 T24 | not started (P2–P3) |
+| Follow-ups | T19 T20 T21 T22 T24 T30 T31 T32 | not started (P2–P3) |
 
-**⚠️ Operator action for T27:** `.env` still has `CLASSIFIER_LLM_MODEL=google/gemma-4-31b-it` (the timing-out model). The legacy alias overrides the new default — change it to `CLASSIFIER_MODEL=meta/llama-3.2-11b-vision-instruct` for T27 to take effect.
+### Follow-ups from the T27/T14b live apply runs (2026-09-01/02)
+
+| # | Sev | Summary |
+|---|---|---|
+| T30 | P2 | New classifier `meta/llama-3.2-11b-vision-instruct` returned non-JSON ~1/3 of NIM-route calls in the real flow, and was 8-12s (not the ~1.5s probe). Contained (deferred, not lost) but the NIM route's value (free) is thin vs Agent SDK (reliable, same latency). Watch; revisit routing. |
+| T31 | P2 | Agent fills free-text "Rate your experience (1-10)" fields with prose (`"I would rate my experience at an 8 out of 10…"`) instead of a number. |
+| T32 | P2 | Agent answered "years of Data Engineering experience = 0" for a data-focused applicant (undersells). Also a Playwright tab crash mid-fill → `applied=-2` auto-fail (browser stability). |
+| — | P3 | (T14b reviewer note) Watch for orphaned `claude` processes after timeout-heavy runs — `asyncio.wait_for` on `llm.query` cancels the SDK generator mid-iteration; subprocess cleanup then depends on the SDK's `GeneratorExit` handling. |
+
+**T27 .env:** classifier model must be `meta/llama-3.2-11b-vision-instruct` (via `CLASSIFIER_MODEL` or the legacy `CLASSIFIER_LLM_MODEL`) — done 2026-09-02.
 
 **Optional (T28):** the ~42 rows commit `76cc97e` pre-skipped as Greenhouse are still `applied=-1`. To reconsider them:
 ```sql
