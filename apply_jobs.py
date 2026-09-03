@@ -133,9 +133,8 @@ def _match_spam_domain(*candidates: str) -> str | None:
 async def _llm_fill_focused(page, profile: dict):
     """LLM-fill whichever input field is currently focused in the browser.
 
-    Interactive-only helper (the semi-auto ``[f]`` command). Uses a short-lived
-    Claude Agent SDK session — this path fires at most a handful of times per
-    session, so a per-call subprocess is fine."""
+    Interactive-only helper (the semi-auto ``[f]`` command). One-shot
+    ``llm.query`` on the guided_apply model, same as the flows."""
     field = await page.evaluate("""() => {
         const el = document.activeElement;
         if (!el || el === document.body || el === document.documentElement) return null;
@@ -162,26 +161,20 @@ async def _llm_fill_focused(page, profile: dict):
             f"yrs={profile.get('years_experience')} auth={profile.get('work_authorization')} "
             f"needs_sponsorship={profile.get('need_sponsorship')}"
         )
-        session = llm.ClaudeSession(
-            model=config.get_llm_config("guided_apply").model, log_calls=False,
-        )
         try:
-            answer = await asyncio.wait_for(
-                session.ask(
-                    f"Job application form field.\nLabel: {label!r}\nType: {kind}\n"
-                    f"Profile: {profile_line}\n\n"
-                    "Reply with ONLY the value to fill in this field. No explanation. "
-                    "CRITICAL: Never fabricate URLs, social media handles, or info not in the profile. "
-                    "For URL/link fields not in the profile (Twitter, Instagram, blog, etc.), reply with empty string."
-                ),
+            answer = await llm.query(
+                f"Job application form field.\nLabel: {label!r}\nType: {kind}\n"
+                f"Profile: {profile_line}\n\n"
+                "Reply with ONLY the value to fill in this field. No explanation. "
+                "CRITICAL: Never fabricate URLs, social media handles, or info not in the profile. "
+                "For URL/link fields not in the profile (Twitter, Instagram, blog, etc.), reply with empty string.",
+                model=config.get_llm_config("guided_apply").model,
                 timeout=40,
             )
             value = (answer or "").strip()
         except Exception as e:
             print(f"  [f] LLM error: {e}")
             return
-        finally:
-            await session.aclose()
 
     if not value:
         print(f"  [f] No value determined for '{label}' — leaving blank.")
@@ -283,7 +276,7 @@ def save_profile(profile: dict):
     print(f"Profile saved to {PROFILE_PATH}")
 
 
-def build_profile_interactively(client: OpenAI, model: str) -> dict:
+def build_profile_interactively(client: "OpenAI | None", model: str) -> dict:
     print("\n── Profile Setup ─────────────────────────────────────────────────────")
     print("Answer the questions below. Your profile is stored locally and used")
     print("only to fill application forms on your behalf.\n")
@@ -291,6 +284,15 @@ def build_profile_interactively(client: OpenAI, model: str) -> dict:
     raw_answers: dict[str, str] = {}
     for key, prompt in PROFILE_QUESTIONS:
         raw_answers[key] = input(f"  {prompt}:\n  > ").strip()
+
+    if client is None or not model:
+        print(
+            "\n  LLM_API / LLM_URL / LLM_MODEL not set — storing your raw answers "
+            "as-is. Configure them in .env and re-run `--setup` to have the "
+            "profile structured (skills list, education object, etc.)."
+        )
+        save_profile(raw_answers)
+        return raw_answers
 
     print("\n  Structuring profile with LLM…", end="", flush=True)
 
@@ -312,7 +314,9 @@ def build_profile_interactively(client: OpenAI, model: str) -> dict:
             response_format={"type": "json_object"},
         )
         profile = json.loads(resp.choices[0].message.content)
-    except Exception:
+    except Exception as _exc:
+        print(f" failed ({_exc}). Storing raw answers — re-run `--setup` after "
+              "checking LLM_API / LLM_URL / LLM_MODEL.")
         profile = raw_answers
 
     print(" done.")
@@ -1524,7 +1528,6 @@ def main():
     args = parser.parse_args()
 
     api_key, base_url, model, gmail_user, gmail_pass, max_auto_env = load_env()
-    client = OpenAI(api_key=api_key, base_url=base_url)
 
     conn   = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
@@ -1570,7 +1573,16 @@ def main():
 
     profile = load_profile()
     if profile is None or args.setup:
-        profile = build_profile_interactively(client, model)
+        # The profile-structuring interview is the only path that still uses the
+        # legacy OpenAI-compatible LLM_* endpoint; build the client lazily here
+        # so a missing LLM_API / LLM_URL never blocks --stats / --auto runs.
+        setup_client = None
+        if api_key and base_url:
+            try:
+                setup_client = OpenAI(api_key=api_key, base_url=base_url)
+            except Exception as _oc_exc:
+                print(f"  [setup] Could not init LLM client ({_oc_exc}).")
+        profile = build_profile_interactively(setup_client, model)
 
     ineligible = skip_ineligible_jobs(conn, cursor)
     if ineligible:

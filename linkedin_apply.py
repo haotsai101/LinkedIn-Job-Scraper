@@ -31,53 +31,12 @@ from common import write_llm_log as _write_llm_log
 # Session timestamp prefix for screenshot filenames — ensures cross-run uniqueness
 _SESSION_TS = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 
-
-class _ClaudeAgentMixin:
-    """Lazily-created, reused Claude Agent SDK session for one apply (ticket T14b).
-
-    One :class:`llm.ClaudeSession` — hence one persistent ``claude`` subprocess
-    and one shared conversation — per flow instance. Created on first use,
-    closed by :meth:`_aclose_claude` in the flow's ``finally``. The model is
-    fixed to ``config.get_llm_config("guided_apply").model`` (``claude-sonnet-5``,
-    subscription auth): one model per session (see :class:`llm.ClaudeSession`).
-    The EEO option-pickers used to pass a separate ``classifier_model`` to the
-    old subprocess helper; they are rare and cheap, so they share this one
-    session rather than justifying a second subprocess.
-
-    Call sites keep doing their own rich ``_write_llm_log`` with per-step
-    context, so the session itself is created with ``log_calls=False``.
-    """
-
-    _claude_session = None  # type: ignore[assignment]
-
-    async def _claude_ask(self, prompt: str, *, timeout: float | None = None) -> str:
-        """Send one prompt through the shared session; raises
-        :class:`llm.ClaudeAgentSDKError` on any SDK/transport/limit failure.
-
-        With ``timeout`` set, a slow call raises :class:`asyncio.TimeoutError`
-        and the session is torn down first — a cancelled ``receive_response``
-        can desync the persistent ``ClaudeSDKClient``, so the next call starts a
-        fresh subprocess (mirrors the old per-call subprocess kill)."""
-        if self._claude_session is None:
-            self._claude_session = llm.ClaudeSession(
-                model=config.get_llm_config("guided_apply").model,
-                log_type="agent",
-                log_calls=False,
-            )
-        if timeout is None:
-            return await self._claude_session.ask(prompt)
-        try:
-            return await asyncio.wait_for(self._claude_session.ask(prompt), timeout)
-        except (asyncio.TimeoutError, asyncio.CancelledError):
-            await self._aclose_claude()
-            raise
-
-    async def _aclose_claude(self) -> None:
-        """Best-effort, idempotent teardown of the ``claude`` subprocess."""
-        session = self._claude_session
-        self._claude_session = None
-        if session is not None:
-            await session.aclose()
+# The browser agent's LLM: the Claude Agent SDK on subscription auth (ticket
+# T14b). Every call site here builds a fully self-contained prompt (profile +
+# job context + progress recap + page snapshot + rules, re-sent each call), so
+# each goes through ``llm.query`` — a fresh one-shot session per call, no shared
+# conversation history to accumulate. Model is ``self.model`` on the flow /
+# engine (``config.get_llm_config("guided_apply").model``).
 
 
 def _css_id(el_id: str) -> str:
@@ -811,10 +770,9 @@ def _get_profile_value(profile: dict, label: str, kind: str = "text") -> str | N
 
 # ── Shared helpers ─────────────────────────────────────────────────────────────
 
-async def _ask_llm(ask, model: str, profile: dict, field: dict) -> str | None:
-    """Fill one form field via the LLM. ``ask`` is an async callable
-    ``(prompt, *, timeout) -> str`` — the owning flow's
-    :meth:`_ClaudeAgentMixin._claude_ask`. ``model`` is log attribution only."""
+async def _ask_llm(model: str, profile: dict, field: dict) -> str | None:
+    """Fill one form field via a one-shot ``llm.query`` call (self-contained
+    prompt — profile + field descriptor). ``model`` is the guided_apply model."""
     label = field.get("label", "")
     # Fall back to field name/id as label hint when label is missing
     if not label:
@@ -859,7 +817,7 @@ async def _ask_llm(ask, model: str, profile: dict, field: dict) -> str | None:
         )
     _t = 70 if is_long_form else 50
     try:
-        raw_answer = await ask(prompt, timeout=_t)
+        raw_answer = await llm.query(prompt, model=model, timeout=_t)
         answer = raw_answer.strip().strip('"').strip("'")
         _write_llm_log({
             "ts":           datetime.now(timezone.utc).isoformat(),
@@ -1158,7 +1116,7 @@ async def _fill_field(page: Page, field: dict, value: str):
 
 # ── EasyApplyFlow ──────────────────────────────────────────────────────────────
 
-class EasyApplyFlow(_ClaudeAgentMixin):
+class EasyApplyFlow:
     """
     Drives the LinkedIn Easy Apply modal deterministically.
 
@@ -1178,8 +1136,8 @@ class EasyApplyFlow(_ClaudeAgentMixin):
     ):
         self.page = page
         self.profile = profile
-        # Browser-agent LLM is the Claude Agent SDK on subscription auth (T14b);
-        # ``model`` is kept only for log attribution.
+        # Browser-agent LLM: the Claude Agent SDK on subscription auth (T14b).
+        # Every LLM call here is a one-shot ``llm.query`` on this model.
         self.model = model or config.get_llm_config("guided_apply").model
         self.auto_mode = auto_mode
         self.callbacks = callbacks
@@ -1189,12 +1147,6 @@ class EasyApplyFlow(_ClaudeAgentMixin):
 
     async def run(self, job_url: str) -> str:
         """Returns: 'applied' | 'expired' | 'already_applied' | 'skipped' | 'failed'"""
-        try:
-            return await self._run(job_url)
-        finally:
-            await self._aclose_claude()
-
-    async def _run(self, job_url: str) -> str:
         job_url = _clean_linkedin_url(job_url)
         try:
             await self.page.goto(job_url, wait_until="domcontentloaded", timeout=20000)
@@ -1574,7 +1526,7 @@ class EasyApplyFlow(_ClaudeAgentMixin):
                     if value.lower() not in opts_lower:
                         value = None
             if value is None:
-                value = await _ask_llm(self._claude_ask, self.model, self.profile, field)
+                value = await _ask_llm(self.model, self.profile, field)
             if value:
                 print(f"  [EasyApply] Filling '{label}' = {str(value)[:40]!r}")
                 confirmed = await _fill_field(self.page, field, value)
@@ -1860,7 +1812,7 @@ class EasyApplyFlow(_ClaudeAgentMixin):
 
 # ── OffsiteApplyFlow ───────────────────────────────────────────────────────────
 
-class OffsiteApplyFlow(_ClaudeAgentMixin):
+class OffsiteApplyFlow:
     """
     Drives an external company career site application.
 
@@ -1889,8 +1841,8 @@ class OffsiteApplyFlow(_ClaudeAgentMixin):
         self.page = page
         self.context = context
         self.profile = profile
-        # Browser-agent LLM is the Claude Agent SDK on subscription auth (T14b);
-        # ``model`` is kept only for log attribution.
+        # Browser-agent LLM: the Claude Agent SDK on subscription auth (T14b).
+        # Every LLM call here is a one-shot ``llm.query`` on this model.
         self.model = model or config.get_llm_config("guided_apply").model
         self.application_url = application_url
         self.auto_mode = auto_mode
@@ -1925,18 +1877,9 @@ class OffsiteApplyFlow(_ClaudeAgentMixin):
             except Exception:
                 continue
         print(f"  [Retry] Resuming from: {target.url}")
-        try:
-            return await self._llm_guided_apply(target)
-        finally:
-            await self._aclose_claude()
+        return await self._llm_guided_apply(target)
 
     async def run(self, job_url: str) -> str:
-        try:
-            return await self._run(job_url)
-        finally:
-            await self._aclose_claude()
-
-    async def _run(self, job_url: str) -> str:
         # Fast path: navigate directly to the ATS application URL from DB,
         # skipping LinkedIn entirely (avoids Premium wall / Apply button click)
         if self.application_url and "linkedin.com" not in self.application_url:
@@ -2521,7 +2464,7 @@ class OffsiteApplyFlow(_ClaudeAgentMixin):
         for _attempt in range(3):
             try:
                 _call_start = datetime.now(timezone.utc)
-                raw = await self._claude_ask(prompt, timeout=120)
+                raw = await llm.query(prompt, model=self.model, timeout=120)
                 _call_ms = int((datetime.now(timezone.utc) - _call_start).total_seconds() * 1000)
                 # Strip markdown fences if present, then isolate the JSON object
                 clean = strip_code_fence(raw)
@@ -2610,7 +2553,7 @@ class OffsiteApplyFlow(_ClaudeAgentMixin):
             f"Description:\n{self.job_description[:3000]}"
         )
         try:
-            return await self._claude_ask(prompt, timeout=30)
+            return await llm.query(prompt, model=self.model, timeout=30)
         except Exception:
             return f"Role: {self.job_title} at {self.company_name}."
 
@@ -3640,10 +3583,11 @@ class OffsiteApplyFlow(_ClaudeAgentMixin):
                                             if _llm_opts_texts:
                                                 print(f"  [LLM] React Select fill: asking LLM to pick decline option from {_llm_opts_texts}")
                                                 try:
-                                                    _llm_picked = await self._claude_ask(
+                                                    _llm_picked = await llm.query(
                                                         f"Dropdown options: {_llm_opts_texts}\n"
                                                         f"Which option best means 'prefer not to disclose' or declining to answer? "
                                                         f"Reply with ONLY the exact option text from the list.",
+                                                        model=self.model,
                                                         timeout=25,
                                                     )
                                                     _llm_picked = _llm_picked.strip().strip('"').strip("'")
@@ -3934,10 +3878,11 @@ class OffsiteApplyFlow(_ClaudeAgentMixin):
                                         if _llm_sel_texts:
                                             print(f"  [LLM] React Select: asking LLM to pick decline option from {_llm_sel_texts}")
                                             try:
-                                                _llm_sel_pick = await self._claude_ask(
+                                                _llm_sel_pick = await llm.query(
                                                     f"Dropdown options: {_llm_sel_texts}\n"
                                                     f"Which option best means 'prefer not to disclose' or declining to answer? "
                                                     f"Reply with ONLY the exact option text from the list.",
+                                                    model=self.model,
                                                     timeout=25,
                                                 )
                                                 _llm_sel_pick = _llm_sel_pick.strip().strip('"').strip("'")

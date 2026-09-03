@@ -6,18 +6,27 @@ OpenAI-compatible endpoint for this path (see
 ``config.get_llm_config("guided_apply")`` — ``api_key`` / ``base_url`` are
 ``None`` by design).
 
-Two entry points, deliberately different tools for different jobs:
+Entry points, deliberately different tools for different jobs:
 
 * :func:`query_json` — a **fresh, fully isolated session per call**, built on the
-  Agent SDK's one-shot ``query()`` function. Used by ``apply_jobs.JobAgent`` to
-  classify each job posting independently. See the docstring for why this is
-  *not* a persistent client.
+  Agent SDK's one-shot ``query()`` function. Structured (JSON-schema) output.
+  Used by ``apply_jobs.JobAgent`` to classify each job posting independently.
+
+* :func:`query` — the same fresh-session-per-call foundation, returning free
+  text. Used by the T14b offsite/EasyApply browser agent
+  (``linkedin_apply`` / ``script_engine``): every one of those call sites
+  builds a fully self-contained prompt (profile + job context + progress recap
+  + page snapshot + rules, re-sent each call), so there is nothing for a shared
+  conversation to add — only redundant history, latency, and subscription
+  usage burn.
 
 * :class:`ClaudeSession` — **one persistent ``ClaudeSDKClient``** (hence one
-  ``claude`` subprocess) reused across calls that are meant to share
-  conversation history: the offsite browser-reasoning agent in T14b, which
-  drives a single multi-step form-fill as one conversation. Not for
-  independent per-item calls (see #560 note below).
+  ``claude`` subprocess) reused across calls that genuinely need shared
+  conversation history. **Currently unused** — every call site turned out to be
+  self-contained (see #560 note below for why per-``session_id`` isolation on
+  one client is not an option). Kept because it is the right tool if a truly
+  incremental call site ever appears; do not route self-contained prompts
+  through it.
 
 The ``claude_agent_sdk`` package is imported **lazily** inside each entry point
 so that ``import llm`` (hence ``import apply_jobs``) succeeds where the SDK is
@@ -34,6 +43,7 @@ salvage; a non-JSON reply raises :class:`ClaudeAgentSDKError`.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from datetime import UTC, datetime
@@ -218,7 +228,75 @@ async def query_json(
     return data
 
 
-# ── persistent session (T14b browser agent) ─────────────────────────────────
+async def query(
+    prompt: str,
+    *,
+    model: str,
+    system: str | None = None,
+    timeout: float | None = None,
+    log_type: str = "agent",
+    log_calls: bool = False,
+) -> str:
+    """One free-text Agent SDK call in a **fresh, isolated session**.
+
+    Same one-shot ``query()`` foundation and lockdown as :func:`query_json`
+    (``allowed_tools=[]``, ``permission_mode="dontAsk"``, ``setting_sources=[]``
+    — no tool can run) but returns the assistant's plain text. For the T14b
+    browser agent's call sites (``linkedin_apply._ask_llm`` /
+    ``_ask_llm_action`` / ``_summarize_job`` / the EEO pickers,
+    ``script_engine`` script generation): each builds a fully self-contained
+    prompt, so a shared conversation would only add redundant history, latency,
+    and subscription-usage burn.
+
+    ``timeout`` (seconds), when set, bounds the whole call with
+    ``asyncio.wait_for``; a slow call raises :class:`asyncio.TimeoutError`
+    **unwrapped** so callers can distinguish it from an SDK error.
+    """
+    sdk = _import_sdk()
+
+    t0 = time.monotonic()
+    try:
+        options = sdk.ClaudeAgentOptions(
+            model=model,
+            system_prompt=system,
+            allowed_tools=[],
+            setting_sources=[],
+            # deny, never bypass — see query_json.
+            permission_mode="dontAsk",
+        )
+        consume = _consume(sdk.query(prompt=prompt, options=options))
+        if timeout is not None:
+            text, _structured, err = await asyncio.wait_for(consume, timeout)
+        else:
+            text, _structured, err = await consume
+    except ClaudeAgentSDKError:
+        raise
+    except (TimeoutError, asyncio.CancelledError):
+        raise
+    except TypeError as exc:
+        raise ClaudeAgentSDKError(
+            f"ClaudeAgentOptions rejected a kwarg ({exc}); check the "
+            f"claude-agent-sdk version pin in pyproject.toml"
+        ) from exc
+    except Exception as exc:
+        raise ClaudeAgentSDKError(f"Agent SDK query failed: {exc}") from exc
+    duration_ms = int((time.monotonic() - t0) * 1000)
+
+    if err is not None:
+        raise ClaudeAgentSDKError(f"Agent SDK returned an error result: {err}")
+
+    if log_calls:
+        write_llm_log({
+            "ts": datetime.now(UTC).isoformat(),
+            "type": log_type,
+            "model": model,
+            "duration_ms": duration_ms,
+            "result": text,
+        })
+    return text
+
+
+# ── persistent session (kept for a future genuinely-incremental call site) ───
 
 class ClaudeSession:
     """A persistent Claude Agent SDK conversation.

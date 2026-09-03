@@ -24,7 +24,8 @@ import llm
 
 
 def _make_fake_sdk(*, result=None, structured=None, is_error=False, subtype=None,
-                   errors=None, text_blocks=None, connect_exc=None, query_exc=None):
+                   errors=None, text_blocks=None, connect_exc=None, query_exc=None,
+                   query_delay=0.0):
     """Build a stand-in ``claude_agent_sdk`` module.
 
     ``mod._query_calls`` / ``mod.ClaudeSDKClient.created`` let tests inspect what
@@ -60,6 +61,8 @@ def _make_fake_sdk(*, result=None, structured=None, is_error=False, subtype=None
 
     async def query(*, prompt, options=None):
         mod._query_calls.append(prompt)
+        if query_delay:
+            await asyncio.sleep(query_delay)
         if query_exc is not None:
             raise query_exc
         for msg in _messages():
@@ -232,7 +235,109 @@ def test_query_json_passes_output_format_and_lockdown_options(monkeypatch):
     assert captured["permission_mode"] != "bypassPermissions"
 
 
-# ── ClaudeSession (persistent — T14b) ────────────────────────────────────────
+# ── query (free-text one-shot — the T14b browser agent) ─────────────────────
+
+def test_query_returns_result_text(monkeypatch):
+    fake = _make_fake_sdk(result="United States")
+    _install(monkeypatch, fake)
+    out = asyncio.run(llm.query("pick a country", model="claude-sonnet-5"))
+    assert out == "United States"
+    assert fake.ClaudeSDKClient.created == []  # one-shot query(), never the client
+
+
+def test_query_joins_assistant_text_when_no_result(monkeypatch):
+    fake = _make_fake_sdk(result=None, text_blocks=["one ", "two"])
+    _install(monkeypatch, fake)
+    assert asyncio.run(llm.query("q", model="m")) == "one two"
+
+
+def test_query_each_call_is_a_fresh_isolated_query(monkeypatch):
+    fake = _make_fake_sdk(result="ok")
+    _install(monkeypatch, fake)
+
+    async def _two():
+        await llm.query("STEP_ALPHA", model="m")
+        await llm.query("STEP_BETA", model="m")
+
+    asyncio.run(_two())
+    assert fake._query_calls == ["STEP_ALPHA", "STEP_BETA"]  # no history threaded
+    assert fake.ClaudeSDKClient.created == []
+
+
+def test_query_passes_lockdown_options(monkeypatch):
+    captured: dict = {}
+    fake = _make_fake_sdk(result="ok")
+    _orig = fake.ClaudeAgentOptions
+
+    def _spy(**kw):
+        captured.update(kw)
+        return _orig(**kw)
+
+    fake.ClaudeAgentOptions = _spy
+    _install(monkeypatch, fake)
+    asyncio.run(llm.query("q", model="m", system="sys"))
+    assert captured["allowed_tools"] == []
+    assert captured["setting_sources"] == []
+    assert captured["permission_mode"] == "dontAsk"
+    assert captured["permission_mode"] != "bypassPermissions"
+    assert captured["model"] == "m"
+    assert captured["system_prompt"] == "sys"
+    assert "output_format" not in captured  # free text, not structured
+
+
+def test_query_wraps_transport_exception(monkeypatch):
+    fake = _make_fake_sdk(query_exc=RuntimeError("connection reset"))
+    _install(monkeypatch, fake)
+    with pytest.raises(llm.ClaudeAgentSDKError):
+        asyncio.run(llm.query("q", model="m"))
+
+
+def test_query_error_result_raises(monkeypatch):
+    fake = _make_fake_sdk(result="quota", is_error=True, errors=["usage_limit"])
+    _install(monkeypatch, fake)
+    with pytest.raises(llm.ClaudeAgentSDKError) as excinfo:
+        asyncio.run(llm.query("q", model="m"))
+    assert "usage_limit" in str(excinfo.value)
+
+
+def test_query_missing_sdk_package(monkeypatch):
+    monkeypatch.setitem(sys.modules, "claude_agent_sdk", None)
+    with pytest.raises(llm.ClaudeAgentSDKError):
+        asyncio.run(llm.query("q", model="m"))
+
+
+def test_query_timeout_propagates_unwrapped(monkeypatch):
+    """A slow call raises asyncio.TimeoutError (not ClaudeAgentSDKError) so
+    callers like _ask_llm_action can branch on it."""
+    fake = _make_fake_sdk(result="late", query_delay=10.0)
+    _install(monkeypatch, fake)
+    with pytest.raises((asyncio.TimeoutError, TimeoutError)):
+        asyncio.run(llm.query("q", model="m", timeout=0.01))
+
+
+def test_query_logs_when_enabled(monkeypatch):
+    fake = _make_fake_sdk(result="hi")
+    _install(monkeypatch, fake)
+    logged: list = []
+    monkeypatch.setattr(llm, "write_llm_log", logged.append)
+    asyncio.run(llm.query("q", model="claude-sonnet-5", log_type="agent",
+                          log_calls=True))
+    assert len(logged) == 1
+    assert logged[0]["type"] == "agent"
+    assert logged[0]["result"] == "hi"
+    assert logged[0]["model"] == "claude-sonnet-5"
+
+
+def test_query_no_log_by_default(monkeypatch):
+    fake = _make_fake_sdk(result="hi")
+    _install(monkeypatch, fake)
+    logged: list = []
+    monkeypatch.setattr(llm, "write_llm_log", logged.append)
+    asyncio.run(llm.query("q", model="m"))
+    assert logged == []
+
+
+# ── ClaudeSession (persistent — kept, currently unused) ─────────────────────
 
 def test_session_reuses_one_client_across_calls(monkeypatch):
     fake = _make_fake_sdk(result="ok")
@@ -302,7 +407,8 @@ def test_session_aclose_safe_before_use(monkeypatch):
 
 
 def test_session_reuses_one_client_across_many_calls(monkeypatch):
-    """T14b browser agent fires many prompts through one session/subprocess."""
+    """The abstraction that would matter for a genuinely incremental call
+    site: N asks, one subprocess."""
     fake = _make_fake_sdk(result="ok")
     _install(monkeypatch, fake)
     session = llm.ClaudeSession(model="claude-sonnet-5", log_calls=False)
@@ -330,3 +436,23 @@ def test_session_aclose_idempotent_after_use(monkeypatch):
 
     asyncio.run(_go())
     assert fake.ClaudeSDKClient.created[0].disconnect_calls == 1
+
+
+def test_session_aclose_swallows_disconnect_error(monkeypatch):
+    """aclose() must return (not raise / not hang) even if the underlying
+    disconnect blows up — it runs from callers' cleanup paths."""
+    fake = _make_fake_sdk(result="hi")
+
+    async def _boom(self):
+        raise RuntimeError("subprocess already dead")
+
+    fake.ClaudeSDKClient.disconnect = _boom
+    _install(monkeypatch, fake)
+    session = llm.ClaudeSession(model="claude-sonnet-5", log_calls=False)
+
+    async def _go():
+        await session.ask("one")
+        await session.aclose()
+
+    asyncio.run(asyncio.wait_for(_go(), timeout=5))
+    assert session._client is None
