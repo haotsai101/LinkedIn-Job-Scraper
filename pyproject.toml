@@ -22,8 +22,8 @@ dependencies = [
     "dagster-webserver>=1.12.18",
     "playwright>=1.44.0",
     "httpx>=0.27.0",
-    "openai>=1.0.0",  # deprecated: still used by the NIM classifier + browser-use paths; removed in T14b
-    "claude-agent-sdk>=0.2.140,<0.3",  # Easy Apply classifier (subscription auth, no API key) — T14. Pinned <0.3: relies on ClaudeAgentOptions.output_format + one-shot query() session isolation.
+    "openai>=1.0.0",  # NIM classifier + browser-use (T15) OpenAI-compatible paths (nim_client.py)
+    "claude-agent-sdk>=0.2.140,<0.3",  # Easy Apply classifier + browser agent (subscription auth, no API key) — T14/T14b. Pinned <0.3: relies on ClaudeAgentOptions.output_format + one-shot query() session isolation.
 ]
 
 [project.optional-dependencies]

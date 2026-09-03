@@ -5,9 +5,9 @@ NVIDIA NIM endpoint resolved from ``config.get_llm_config("classifier")``; Easy
 Apply jobs go through the Claude Agent SDK instead (``llm.ClaudeSession``).
 Routing lives in ``apply_jobs.JobAgent.classify``.
 
-``openai`` is still a project dependency (removed in T14b) so the import is only
-soft-guarded — enough that ``import nim_client`` does not explode in a stripped
-environment, not a real fallback.
+``openai`` stays a project dependency for this NIM path (and the T15 browser-use
+route); the import is soft-guarded only so ``import nim_client`` does not explode
+in a stripped environment — not a real fallback.
 """
 
 from __future__ import annotations
