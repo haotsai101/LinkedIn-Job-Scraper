@@ -87,7 +87,7 @@ Reads jobs where `scraped=1 AND applied IS NULL` (filtered to remote/Utah). For 
 2. **Playwright browser** logs into LinkedIn and runs one of two flows:
    - `EasyApplyFlow` — LinkedIn's native in-modal multi-step form (`SimpleOnsiteApply`, `ComplexOnsiteApply`)
    - `OffsiteApplyFlow` — external company career site; tries `ScriptApplyEngine` (generates a complete Playwright script per page) first, then falls back to a step-by-step LLM loop. Can auto-create accounts (saved to `created_accounts.json`).
-3. `jobs.applied` is set to: `1`=applied, `-1`=skipped/irrelevant, `-2`=auto-failed.
+3. `jobs.applied` is set to: `1`=applied, `-1`=skipped/irrelevant, `-2`=auto-failed, `-3`=blocked (un-automatable ATS / login wall — needs a human, not in the `--reset-failed` retry pool).
 
 The agent supports three separate LLM endpoints: `LLM_*` (default), `CLASSIFIER_LLM_*` (relevance scoring), `BROWSER_LLM_*` (form filling). All default to the same endpoint if not specified. Any OpenAI-compatible API works (NVIDIA NIM, OpenRouter, etc.).
 
@@ -95,7 +95,7 @@ The agent supports three separate LLM endpoints: `LLM_*` (default), `CLASSIFIER_
 
 Single database file. Key `jobs` columns:
 - `scraped`: 0 = discovered only, >0 = fully enriched
-- `applied`: NULL = pending, 1 = applied, -1 = skipped, -2 = auto-failed
+- `applied`: NULL = pending, 1 = applied, -1 = skipped, -2 = auto-failed, -3 = blocked (needs a human; excluded from `--reset-failed`)
 - `application_type`: `SimpleOnsiteApply`, `ComplexOnsiteApply`, `OffsiteApply`
 - `remote_allowed`, `location`: used to filter apply candidates (remote or Utah)
 

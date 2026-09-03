@@ -95,6 +95,42 @@ def test_only_pending_scraped_jobs(conn):
     assert got == {1, 4}
 
 
+def test_blocked_status_minus_3_is_never_a_candidate(conn):
+    """T33: applied = -3 ("blocked — needs a human") must be excluded from both
+    the default queue and the --reset-failed (include_failed) queue, so a
+    Workday / applytojob.com job does not churn every run."""
+    _add_job(conn, 1, listed_epoch=10, applied=None, scraped=1)
+    _add_job(conn, 2, listed_epoch=20, applied=-3, scraped=1)     # blocked
+    _add_job(conn, 3, listed_epoch=30, applied=-2, scraped=1)     # auto-failed
+    conn.commit()
+    assert [r[0] for r in apply_jobs.get_pending_jobs(conn.cursor())] == [1]
+    got = {r[0] for r in apply_jobs.get_pending_jobs(conn.cursor(), include_failed=True)}
+    assert got == {1, 3}  # -2 comes back, -3 does not
+
+
+def test_reset_failed_sql_leaves_blocked_rows_alone(conn):
+    """The --reset-failed UPDATE targets applied = -2 only."""
+    _add_job(conn, 1, listed_epoch=10, applied=-2, scraped=1)
+    _add_job(conn, 2, listed_epoch=20, applied=-3, scraped=1)
+    conn.commit()
+    cur = conn.cursor()
+    cur.execute("UPDATE jobs SET applied = NULL WHERE applied = -2")
+    conn.commit()
+    rows = dict(conn.execute("SELECT job_id, applied FROM jobs").fetchall())
+    assert rows == {1: None, 2: -3}
+
+
+def test_print_stats_counts_blocked(conn, capsys):
+    _add_job(conn, 1, listed_epoch=10, applied=-3, scraped=1)
+    _add_job(conn, 2, listed_epoch=20, applied=-3, scraped=1)
+    _add_job(conn, 3, listed_epoch=30, applied=1, scraped=1)
+    conn.commit()
+    apply_jobs.print_stats(conn.cursor())
+    out = capsys.readouterr().out
+    assert "Blocked: 2" in out
+    assert "Applied: 1" in out
+
+
 def test_blocked_company_excluded_via_table(conn):
     _add_company(conn, 100, "SynergisticIT Inc")     # matches seeded 'synergisticit'
     _add_company(conn, 101, "Acme Robotics")

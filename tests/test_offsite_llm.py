@@ -164,6 +164,30 @@ def test_ask_llm_action_rate_limit_is_retried(monkeypatch):
     assert calls["n"] == 2
 
 
+# ── T33: blocked-domain jobs end as "blocked", not "failed" ────────────────
+
+class _UrlOnlyPage:
+    def __init__(self, url):
+        self.url = url
+
+
+def test_blocked_ats_landing_domain_returns_blocked(monkeypatch):
+    """A landing on an un-automatable ATS (Workday etc.) short-circuits to
+    'blocked' before any LLM/browser work — run_session maps that to applied=-3
+    so --reset-failed never brings it back."""
+    _install(monkeypatch, _QueryStub())
+    flow = _offsite(company_name="ACME", job_title="Dev")
+    out = asyncio.run(flow._llm_guided_apply(_UrlOnlyPage("https://acme.myworkdayjobs.com/en-US/careers/job/123")))
+    assert out == "blocked"
+
+
+def test_spam_aggregator_landing_domain_still_returns_skipped(monkeypatch):
+    _install(monkeypatch, _QueryStub())
+    flow = _offsite(company_name="ACME", job_title="Dev")
+    out = asyncio.run(flow._llm_guided_apply(_UrlOnlyPage("https://jobright.ai/jobs/123")))
+    assert out == "skipped"
+
+
 # ── ScriptApplyEngine script generation ────────────────────────────────────
 
 def test_script_engine_call_llm_uses_query_and_sanitizes(monkeypatch):

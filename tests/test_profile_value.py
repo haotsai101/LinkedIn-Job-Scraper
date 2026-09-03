@@ -18,6 +18,7 @@ works even when those packages are absent.
 import linkedin_apply as la
 
 _gpv = la._get_profile_value
+_coerce = la._coerce_numeric_answer
 
 
 # A synthetic profile shaped like ``user_profile.json`` (see PROFILE_QUESTIONS in
@@ -102,11 +103,58 @@ def test_preferred_name_vs_first_name():
 def test_numbers_experience_and_salary():
     assert _gpv(PROFILE, "Years of experience", "number") == "10"
     assert _gpv(PROFILE, "How many years of experience do you have?", "number") == "10"
+    # T32: an unmapped "years with <specific skill>" question must NOT return "0"
+    # for a plausible adjacent skill — that reads as "no experience" and gets the
+    # applicant auto-filtered. Capped at 2, never above the profile total.
+    de = _gpv(PROFILE, "How many years of Data Engineering experience do you have?", "text")
+    assert de != "0" and de == "2"
+    # A recognised data/AI skill still routes through the AI-skills branch ("1").
+    assert _gpv(PROFILE, "How many years of machine learning experience?", "text") == "1"
+    # No profile years_experience at all -> conservative "2", still not "0".
+    assert _gpv({}, "How many years of Rust experience do you have?", "text") == "2"
     # Salary stored as a range -> upper bound is returned for single-value fields.
     assert _gpv(PROFILE, "Desired salary", "text") == "180000"
     assert _gpv(PROFILE, "Expected compensation", "text") == "180000"
     # Plain single-value salary is returned verbatim.
     assert _gpv({"preferred_salary": "150000"}, "Desired salary", "text") == "150000"
+
+
+# ── T31: numeric / scale field coercion ───────────────────────────────────────
+
+def test_coerce_numeric_answer_reduces_prose_to_integer():
+    # A "Rate (1-10)" free-text field that the LLM answered with a sentence.
+    assert _coerce(
+        "Rate your experience with Python (1-10)",
+        "I would rate my experience at an 8 out of 10.",
+        "text",
+    ) == "8"
+    # "How many years of X" prose -> the leading integer.
+    assert _coerce("How many years of experience with Kubernetes?",
+                   "About 3 years.", "text") == "3"
+    # type=number with prose.
+    assert _coerce("Experience level", "I'd say 5", "number") == "5"
+
+
+def test_coerce_numeric_answer_clamps_to_stated_range():
+    assert _coerce("On a scale of 1-5, rate your SQL", "9", "text") == "5"
+    assert _coerce("Rate 1 to 10", "0", "text") == "1"
+
+
+def test_coerce_numeric_answer_falls_back_when_no_digit():
+    # "years" question, no digit in the answer -> profile years_experience.
+    assert _coerce("How many years of Go experience?", "several", "text",
+                   {"years_experience": "4"}) == "4"
+    # scale question, no digit -> midpoint.
+    assert _coerce("Rate your Python skill (1-10)", "pretty good", "text") == "5"
+
+
+def test_coerce_numeric_answer_leaves_free_text_and_choices_untouched():
+    prose = "I have led three teams building distributed systems."
+    assert _coerce("Describe your leadership experience", prose, "textarea") == prose
+    # A select/radio value is never touched even if the label says "rate".
+    assert _coerce("Rate your experience", "Advanced", "select") == "Advanced"
+    # Already a bare number -> unchanged.
+    assert _coerce("How many years?", "7", "text") == "7"
 
 
 # ── work authorization / visa / citizenship ───────────────────────────────────

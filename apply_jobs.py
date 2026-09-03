@@ -204,7 +204,8 @@ def _check_recent_session_health() -> bool:
         if len(sessions) < 3:
             return True
         def _error_rate(s):
-            total = s.get("error_count", 0) + s.get("applied_count", 0) + s.get("skipped_count", 0)
+            total = (s.get("error_count", 0) + s.get("applied_count", 0)
+                     + s.get("skipped_count", 0) + s.get("blocked_count", 0))
             return s.get("error_count", 0) / total if total > 0 else 0
         return sum(1 for s in sessions if _error_rate(s) > 0.8) < 3
     except Exception:
@@ -954,7 +955,7 @@ def get_pending_jobs(cursor, limit=None, apply_type=None, include_failed=False):
 
 
 def mark_job(conn, cursor, job_id: int, status: int):
-    """status: 1=applied, -1=skipped, -2=auto-failed."""
+    """status: 1=applied, -1=skipped, -2=auto-failed, -3=blocked (no auto-retry)."""
     cursor.execute("UPDATE jobs SET applied = ? WHERE job_id = ?", (status, job_id))
     conn.commit()
 
@@ -981,13 +982,14 @@ def print_stats(cursor):
             SUM(CASE WHEN applied IS NULL AND scraped > 0 THEN 1 ELSE 0 END),
             SUM(CASE WHEN applied =  1 THEN 1 ELSE 0 END),
             SUM(CASE WHEN applied = -1 THEN 1 ELSE 0 END),
-            SUM(CASE WHEN applied = -2 THEN 1 ELSE 0 END)
+            SUM(CASE WHEN applied = -2 THEN 1 ELSE 0 END),
+            SUM(CASE WHEN applied = -3 THEN 1 ELSE 0 END)
         FROM jobs
     """)
-    pending, applied, skipped, failed = cursor.fetchone()
+    pending, applied, skipped, failed, blocked = cursor.fetchone()
     print(
         f"\nStats — Pending: {pending or 0}  Applied: {applied or 0}  "
-        f"Skipped: {skipped or 0}  Auto-failed: {failed or 0}"
+        f"Skipped: {skipped or 0}  Auto-failed: {failed or 0}  Blocked: {blocked or 0}"
     )
 
 
@@ -1091,6 +1093,10 @@ async def run_session(
     # Jobs left pending because classification failed/timed out — NOT skipped
     # (no mark_job), tracked separately so "Skipped: N" does not over-report.
     deferred_count = 0
+    # Jobs on a blocked ATS / login wall — marked applied=-3 ("we chose not to
+    # try, don't auto-retry"). Distinct from -2 auto-fails so --reset-failed
+    # leaves them alone and the error-rate circuit breaker doesn't trip on them.
+    blocked_count = 0
 
     # Write a session boundary marker so log-monitor agents can filter to just this run
     _write_llm_log({
@@ -1372,6 +1378,14 @@ async def run_session(
                     skipped_count += 1
                     print("  [-] Skipped.")
 
+                elif status == "blocked":
+                    # Blocked ATS / login wall / dead-end domain. -3 keeps it out
+                    # of the --reset-failed retry pool (unlike -2) — a human has
+                    # to apply manually.
+                    mark_job(conn, cursor, job_id, -3)
+                    blocked_count += 1
+                    print("  [~] Blocked — needs a manual apply, will not auto-retry.")
+
                 else:  # "failed"
                     if not auto_mode:
                         # Browser tab is still open — let user interact before moving on
@@ -1429,6 +1443,11 @@ async def run_session(
                                     skipped_count += 1
                                     print("  [-] Skipped.")
                                     break
+                                elif status == "blocked":
+                                    mark_job(conn, cursor, job_id, -3)
+                                    blocked_count += 1
+                                    print("  [~] Blocked — needs a manual apply, will not auto-retry.")
+                                    break
                                 else:
                                     print("  [!] Retry also failed — choose again.")
                                     continue
@@ -1458,8 +1477,9 @@ async def run_session(
                         mark_job(conn, cursor, job_id, -2)
                         error_count += 1
                         print("  [!] Auto-apply failed — marked as auto-failed.")
-                    if error_count >= 5 and error_count > 2 * (applied_count + skipped_count):
-                        print(f"\n  [!] Error rate too high ({error_count} errors vs {applied_count + skipped_count} successes) — stopping session early.")
+                    _progress = applied_count + skipped_count + blocked_count
+                    if error_count >= 5 and error_count > 2 * _progress:
+                        print(f"\n  [!] Error rate too high ({error_count} errors vs {_progress} handled) — stopping session early.")
                         break
 
                 # Close any new tabs opened during apply
@@ -1492,6 +1512,7 @@ async def run_session(
         "applied_count": applied_count,
         "skipped_count": skipped_count,
         "error_count":   error_count,
+        "blocked_count": blocked_count,
         "deferred_count": deferred_count,
         "auto_mode":     auto_mode,
         "applications":  applications,
@@ -1499,8 +1520,9 @@ async def run_session(
 
     print(f"\n{'═' * 64}")
     _deferred_note = f"  Deferred: {deferred_count}" if deferred_count else ""
+    _blocked_note = f"  Blocked: {blocked_count}" if blocked_count else ""
     print(f"Session complete — Applied: {applied_count}  Skipped: {skipped_count}  "
-          f"Errors: {error_count}{_deferred_note}")
+          f"Errors: {error_count}{_blocked_note}{_deferred_note}")
 
     if all_unanswered_fields:
         print(f"\n⚠ Profile gaps — these form fields had no answer from your profile or AI:")
@@ -1539,6 +1561,8 @@ def main():
         return
 
     if args.reset_failed:
+        # Only -2 (auto-failed) is retryable. -3 (blocked ATS / login wall) is
+        # deliberately left alone — those need a human, not another agent run.
         cursor.execute("SELECT COUNT(*) FROM jobs WHERE applied = -2")
         count = cursor.fetchone()[0]
         cursor.execute("UPDATE jobs SET applied = NULL WHERE applied = -2")
