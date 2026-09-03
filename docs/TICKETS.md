@@ -11,10 +11,13 @@ Baseline captured 2026-08-28. `docs/baseline/db_state.baseline.txt` holds the DB
 | 1 | T1 #5, T2 #2, T5 #6, T8 #4, T12 #3 | ✅ **CLOSED** — QA passed 2026-08-28 (`docs/qa/wave1-qa.md`) |
 | 2 | T6 #9, T13 #8, T9 #10, T4 #11, T23 #12, T3 #13 | ✅ **CLOSED** — QA passed 2026-08-29 (`docs/qa/wave2-qa.md`). T9 shipped a P1 regression (`create_tables()` crash on unmigrated DB); fixed by T23 hotfix. |
 | 3 — Phase 2 | T14 #15, T26 #19, T27 #20, T14b #22 | ✅ **CLOSED** 2026-09-03. **The entire LLM stack is off the `claude` subprocess.** T14: Agent SDK wrapper + classifier routing (validated with 2 real applications). T26: `max_turns` fix. T27: NIM-tier hardening (model → `meta/llama-3.2-11b-vision-instruct`, circuit breaker, spam reorder, Greenhouse un-block; bundled T28+T29). T14b: browser agent (`_llm_guided_apply`, EEO pickers, `ScriptApplyEngine`) → one-shot `llm.query`/`query_json`; all dead `AsyncOpenAI` plumbing + the `load_env` `LLM_API` hard-exit removed. 154 tests. |
-| 4 — Phase 3 | T15 — browser-use spike | **blocked**: `deepseek-v4-flash` (planned `browser_use` model) is down on free NIM — needs a working model. `meta/llama-3.2-11b-vision-instruct` works but is small for agentic browser work. |
-| 5 — Phase 4 | T16a/T16b | shape decided by T15 |
-| 6 — Phase 5 | T17 | needs T12 ✓ |
-| Follow-ups | T19 T20 T21 T22 T24 T30 T31 T32 | not started (P2–P3) |
+| 4 — Phase 3 | ~~T15 browser-use spike~~ | **DROPPED** 2026-09-03 (owner: "skip all NIM-specific tasks, keep going with Agent SDK"). browser-use needs a working free NIM model; the whole tier is unreliable. `verify_submission` unification (T15's non-NIM half) folds into T33. |
+| 4/5 | **T33** — OffsiteApply flow reliability | **next** — unified `verify_submission` (fix Rippling `/jobs?page=0` false-negative), blocked-domain jobs → skip not auto-fail, T31 (prose in numeric fields), T32 (undersold answers). |
+| 5 — Phase 4 | **T16b** — decompose `_llm_guided_apply` on the Agent SDK (primary OffsiteApply path) + retire `ScriptApplyEngine` | after T33 |
+| 6 — Phase 5 | T17 — scraper cleanup | needs T12 ✓ |
+| Follow-ups | T19 T20 T21 T22 T24 · T30 **parked** (NIM — owner: leave it, circuit breaker handles bad days) | not started (P2–P3) |
+
+**Direction change (2026-09-03):** T14b live-QA runs confirmed the Agent SDK classifier is 100% reliable where NIM's model isn't (T30), but NIM stays for OffsiteApply classification with the circuit breaker as the safety net. The browser-use spike (T15) is dropped — the free NIM tier can't host an agentic browser model reliably. Remaining apply-agent work goes straight to hardening + decomposing `_llm_guided_apply` on the Agent SDK.
 
 ### Follow-ups from the T27/T14b live apply runs (2026-09-01/02)
 
@@ -253,9 +256,28 @@ The SDA lineage assets produce a graph nothing consumes.
 
 ---
 
-## T16a / T16b — Phase 4 (shape TBD by T15)
+## T33 — OffsiteApply flow reliability
 
-Ticket written after T15 reports. **16a (go):** browser-use = OffsiteApply primary, fallback to a *lightly* decomposed `_llm_guided_apply` (5 seams: `page_snapshot` / `decide_action` / `execute_action` / `detect_terminal_state` / `handle_auth`), triggers = {error|timeout|max-steps w/o verified submission} ∪ {NIM 429 after N retries} ∪ {claimed success but `verify_submission` false}; retire `ScriptApplyEngine`. **16b (no-go):** full decomposition of `_llm_guided_apply` as primary; browser-use shelved; retire `ScriptApplyEngine`.
+**Phase:** 4 · **Risk:** medium · **Deps:** T14b ✓ · From the T14b live-QA runs (2026-09-01/03).
+
+The Agent-SDK apply flow fills forms well (résumé upload, React Select, EEO decline all worked live) but loses jobs to bad end-state handling:
+
+1. **Unified `verify_submission(page, job_or_url) -> (bool, str)`** — pull the two `_check_submission_result` impls (`linkedin_apply.py:1779` EasyApply, `:4157` OffsiteApply) into one place. **Fix the Rippling false-negative:** the agent fills + submits, Rippling redirects to `.../jobs?page=0`, and `:4197` returns `"URL changed but no confirmation text or success URL pattern"` → `applied=-2`. That redirect-to-listing IS the success signal for Rippling (and several ATSes) — recognize it, or re-check the application state. 3 likely false-negatives across the QA runs (Aalyria ×3).
+2. **Blocked-domain jobs → skip, not auto-fail.** `linkedin_apply.py:2695` marks Workday / `applytojob.com` / other un-automatable ATSes `applied=-2` ("marking failed for manual retry"). `-2` is in the `--reset-failed` retry pool, so they churn forever. Give them `applied=-1` (or a distinct `-3` "blocked, needs human") so they don't retry automatically. Same for the `_dead_end_domains` / login-wall cases (`:2889`).
+3. **T31 — numeric fields get prose.** "Rate your experience (1-10) …" gets `"I would rate my experience at an 8 out of 10…"` instead of `8`. Detect numeric/range fields in `_fill_field` / `_get_profile_value` and coerce the LLM answer to just the number.
+4. **T32 — undersold answers.** "years of Data Engineering experience = 0" filled for a data-focused applicant. The profile has `years_experience: "4"` and data skills — the fallback for an unmapped "years of X" field should use the general experience figure or a sensible floor, not `0`. Review the `_get_profile_value` "years of <skill>" branch.
+
+**Acceptance:** `verify_submission` unit-tested with the Rippling redirect case + a real confirmation case; a Workday job ends `-1`/`-3` not `-2`; a "Rate 1-10" field gets a bare number; no `= 0` for a skill the applicant plausibly has.
+
+---
+
+## T16b — Decompose `_llm_guided_apply` on the Agent SDK
+
+**Phase:** 4 · **Risk:** medium-high · **Deps:** T33 · (T15 browser-use spike dropped — this is now the OffsiteApply primary, not a fallback.)
+
+Split the ~1,500-line `_llm_guided_apply` into testable seams: `page_snapshot` · `decide_action` (the `llm.query` call) · `execute_action` · `detect_terminal_state` (applied / dead-end / needs-human — uses `verify_submission` from T33) · `handle_auth` (login + account creation + `EmailInbox` verification). Retire `ScriptApplyEngine` (the LLM-writes-a-Playwright-script path) — the step loop is the single OffsiteApply engine. Page representation → accessibility-tree / structured field list where practical (fewer tokens than raw DOM).
+
+**Acceptance:** each seam independently unit-tested; `ScriptApplyEngine` gone; a live OffsiteApply run against 5 known-failing jobs completes without the old function.
 
 ---
 
