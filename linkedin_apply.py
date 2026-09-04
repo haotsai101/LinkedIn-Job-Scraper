@@ -566,8 +566,19 @@ def _get_profile_value(profile: dict, label: str, kind: str = "text") -> str | N
     )) and kind in ("text", "number"):
         return "1"
     if any(k in l for k in ("how many years", "how many months")) and kind in ("text", "number"):
-        # Default to 0 for technology-specific year questions we can't match
-        return "0"
+        # Unmapped technology-specific "years with <X>" question (T32). "0" reads
+        # as "no experience at all" and gets the applicant auto-filtered; for a
+        # plausible adjacent skill a conservative real figure is safer. Cap an
+        # unrecognised skill at 2 years and never exceed the applicant's overall
+        # experience — and fall back to "1" (matching the recognised-AI/ML branch
+        # above) when the profile has no usable total, so an *unrecognised* skill
+        # never claims MORE than a recognised one. Does not fabricate expertise;
+        # just stops "0 years of Data Engineering" for a data-focused applicant.
+        try:
+            _tot_years = int(float(str(p.get("years_experience", "")).strip() or 0))
+        except (TypeError, ValueError):
+            _tot_years = 0
+        return str(min(_tot_years, 2)) if _tot_years > 0 else "1"
     # "Are you currently on OPT or STEM OPT?" → Yes if profile work_authorization is OPT/STEM
     if any(k in l for k in ("opt or stem", "opt/stem", "stem opt", "currently on opt")) \
             and kind in ("select", "select-one", "radio"):
@@ -770,6 +781,330 @@ def _get_profile_value(profile: dict, label: str, kind: str = "text") -> str | N
 
 # ── Shared helpers ─────────────────────────────────────────────────────────────
 
+# Numeric / 1-N scale field detection for T31. If a *free-text* field is really
+# asking for a number, an LLM prose answer ("I'd rate myself an 8 out of 10…")
+# must be reduced to the bare integer before it is typed in.
+_NUMERIC_LABEL_HINTS = (
+    "how many years", "how many months", "number of years", "years of experience",
+    "years experience", "(1-10)", "(1 to 10)", "1 to 10", "1-10", "1 - 10",
+    "scale of 1", "on a scale", "rate your", "rate the", "how would you rate",
+    "years of", "how many",
+)
+
+
+def _coerce_numeric_answer(label: str, answer: str, kind: str = "text",
+                           profile: dict | None = None) -> str:
+    """Reduce a prose answer to a bare integer when the field is numeric/scale (T31).
+
+    Genuine free-text fields (and every select/radio/checkbox) pass through
+    untouched. For a numeric field:
+
+    * the first ``\\d+`` in the answer wins, clamped to a range stated in the
+      label (e.g. ``(1-10)``, ``1 to 5``);
+    * no digit anywhere → a sensible fallback: the profile's ``years_experience``
+      for a "years"/"months" question, the midpoint of a stated scale otherwise,
+      and finally the answer unchanged.
+    """
+    if not answer or not isinstance(answer, str):
+        return answer
+    # Never touch a genuine long-form field. "textarea"/"contenteditable" is the
+    # guided-apply fill branch's only guard (it has no ``is_long_form`` check),
+    # so keeping them here makes the helper safe to call unconditionally.
+    if kind in ("select", "select-one", "select-multiple", "radio", "checkbox",
+                "textarea", "contenteditable"):
+        return answer
+    lab = re.sub(r"\s+", " ", (label or "").lower()).strip()
+    is_numeric = (
+        kind == "number"
+        or any(h in lab for h in _NUMERIC_LABEL_HINTS)
+        or bool(re.search(r"\brate\b|\brating\b", lab))
+    )
+    if not is_numeric:
+        return answer
+
+    s = answer.strip()
+    rng = re.search(r"(\d+)\s*(?:-|–|to)\s*(\d+)", lab)
+    lo, hi = (int(rng.group(1)), int(rng.group(2))) if rng else (None, None)
+
+    m = re.search(r"\d+", s)
+    if m:
+        n = int(m.group())
+        if lo is not None and hi is not None and lo <= hi:
+            n = max(lo, min(hi, n))
+        return str(n)
+
+    # No digit in the answer at all.
+    # An explicit "I don't have this" must stay 0 — don't bump a truthful
+    # negative up to a fabricated number.
+    if re.search(r"\b(none|no experience|no exp|never|n/?a|zero|not at all|no prior)\b",
+                 s.lower()):
+        return "0"
+    # Otherwise fall back rather than type prose.
+    if "year" in lab or "month" in lab:
+        if profile is not None:
+            yrs = str(profile.get("years_experience", "")).strip()
+            _mm = re.search(r"\d+", yrs)
+            if _mm:
+                return _mm.group()
+        return "1"
+    if lo is not None and hi is not None and lo <= hi:
+        return str((lo + hi) // 2)
+    return answer
+
+
+# ── Submission verification (shared by EasyApplyFlow + OffsiteApplyFlow) ────────
+
+# Confirmation text — the strongest success signal, valid whether or not the page
+# navigated. The OffsiteApply flow checks the full union against the whole
+# post-submit page; EasyApply keeps its stricter historical subset
+# (_EASYAPPLY_CONFIRM_PHRASES) because it reads the entire LinkedIn job-view DOM,
+# which carries "you applied" chrome for *other* ("similar") jobs.
+_SUBMIT_CONFIRM_PHRASES = (
+    "your application was sent", "application submitted", "application was submitted",
+    "successfully applied", "you've applied", "you applied", "application sent",
+    "application was sent", "thank you for applying", "thank you for your application",
+    "application received", "application is complete", "application complete",
+    "successfully submitted", "has been submitted", "we received your application",
+    "we'll be in touch", "we will be in touch", "you have applied",
+    "submission received", "we received your",
+)
+_EASYAPPLY_CONFIRM_PHRASES = (
+    "your application was sent", "application submitted", "application was submitted",
+    "successfully applied", "you've applied", "you applied", "application sent",
+    "application was sent",
+)
+
+# "You have already applied" — a prior application is on file. Retrying is
+# pointless and the rest of the agent already treats this as applied.
+_ALREADY_APPLIED_PHRASES = (
+    "you have already applied", "already applied to this", "already submitted an application",
+    "application already on file", "you already applied",
+)
+
+# Content substrings that mark a post-submit page as NOT a success.
+_SUBMIT_FAIL_PHRASES = (
+    "sign in", "log in", "login", "create an account", "create account", "register",
+    "something went wrong", "page not found", "404 error", "session expired",
+    "please try again", "an error occurred", "no longer accepting applications",
+)
+
+# A post-submit redirect whose URL contains one of these is a failure.
+_SUBMIT_FAIL_URL_WORDS = ("login", "signin", "sign-in", "register", "/error", "404", "/auth")
+# Path segments (matched against urlparse(url).path, NOT the whole URL — bare
+# substrings gave false positives: "sent" in /consent, "complete" in
+# /application-incomplete, "confirm" in /confirm-email) that confirm success.
+_SUBMIT_SUCCESS_PATH_SEGMENTS = (
+    "/confirmation", "/success", "/thank", "/applied", "/application-complete",
+    "/application-received", "/submitted", "/done",
+)
+# Landing paths that mean the ATS bounced us back to a listing / careers / home
+# page. For Rippling, Greenhouse, Ashby and Lever that redirect can BE the
+# success signal (T33 — was a false negative), but only with corroboration:
+# a submit was actually clicked AND there is no error banner AND no application
+# submit button remains.
+_ATS_LISTING_PATH_HINTS = (
+    "/jobs", "/careers", "/opportunities", "/openings", "/positions", "/postings", "/board",
+)
+
+_ERROR_CONTAINER_SELECTORS = (
+    '[role="alert"]', '.error', '.field-error', '.field_error', '.form-error',
+    '.errors', '.error-message', '.alert-danger', '.alert-error', '.usa-alert--error',
+)
+# Text that identifies a *form submit* CTA (not a job-board "Apply" link).
+_SUBMIT_CTA_TEXTS = (
+    "submit application", "submit your application", "submit my application",
+    "submit this application", "complete application", "complete your application",
+    "send application", "finish application", "review your application",
+)
+
+
+def _registrable_host(netloc: str) -> str | None:
+    """Best-effort eTLD+1 for the "same ATS?" check in submission verification.
+
+    Deliberately partial — this list only covers suffixes we actually see. A
+    host it cannot confidently reduce returns ``None``, and the caller MUST
+    treat ``None`` as "different site" (fail closed), because this function only
+    ever gates a *success* verdict.
+    """
+    host = (netloc or "").split(":")[0].lower().strip(".")
+    if not host or host.replace(".", "").isdigit():   # empty or bare IP
+        return None
+    parts = host.split(".")
+    if len(parts) < 2:
+        return None
+    # Two-label public suffixes (partial): ccTLD second levels + platform
+    # pseudo-suffixes where every subdomain is a different owner.
+    _two_label_suffixes = {
+        "co.uk", "org.uk", "ac.uk", "gov.uk", "com.au", "co.nz", "co.jp",
+        "com.br", "co.in", "com.sg", "co.za", "com.mx", "co.il", "co.kr",
+        "com.cn",
+        "github.io", "vercel.app", "netlify.app", "pages.dev", "web.app",
+        "workers.dev", "onrender.com", "herokuapp.com",
+    }
+    if len(parts) >= 3 and ".".join(parts[-2:]) in _two_label_suffixes:
+        return ".".join(parts[-3:])
+    return ".".join(parts[-2:])
+
+
+async def _page_has_error_banner(page: Page) -> bool:
+    """True if the page shows a visible, non-empty error container."""
+    for sel in _ERROR_CONTAINER_SELECTORS:
+        try:
+            loc = page.locator(sel)
+            for i in range(min(await loc.count(), 5)):
+                el = loc.nth(i)
+                if await el.is_visible() and (await el.inner_text()).strip():
+                    return True
+        except Exception:
+            continue
+    return False
+
+
+async def _page_has_active_submit_cta(page: Page) -> bool:
+    """True if a visible, enabled *application submit* button is still on the page
+    (i.e. we are still on / bounced back to the form, not a confirmation)."""
+    try:
+        loc = page.locator(
+            'button:not([disabled]), input[type="submit"]:not([disabled]), [role="button"]'
+        )
+        for i in range(min(await loc.count(), 40)):
+            el = loc.nth(i)
+            try:
+                if not await el.is_visible():
+                    continue
+                txt = ((await el.inner_text()) or "").strip().lower()
+            except Exception:
+                continue
+            if any(c in txt for c in _SUBMIT_CTA_TEXTS):
+                return True
+    except Exception:
+        return True   # can't tell → assume still on the form → fail closed
+    return False
+
+
+async def verify_submission(
+    page: Page,
+    *,
+    url_before: str | None = None,
+    modal_open: bool | None = None,
+    submit_attempted: bool = True,
+    confirm_phrases: tuple[str, ...] | None = None,
+) -> tuple[bool, str]:
+    """Decide whether a just-submitted application actually went through.
+
+    Shared by ``EasyApplyFlow`` (pass ``modal_open`` from ``_is_modal_open()``,
+    leave ``url_before`` unset — Easy Apply never navigates) and
+    ``OffsiteApplyFlow`` (pass ``url_before``; ``modal_open`` stays ``None``;
+    pass ``submit_attempted=False`` when the LLM claimed "done" without a submit
+    click actually having happened).
+
+    Returns ``(success, signal)`` — ``signal`` names which rule fired so the
+    caller can log it. Strongly conservative: a wrong ``True`` here is
+    unrecoverable (``applied=1`` is not in the ``--reset-failed`` pool), so every
+    ambiguous end-state returns ``False`` and the job is retried.
+    """
+    _confirm = confirm_phrases or _SUBMIT_CONFIRM_PHRASES
+    try:
+        content = (await page.content()).lower()
+    except Exception as exc:
+        return False, f"verification error: could not read page ({exc})"
+
+    # 1. Confirmation text — strongest signal, independent of navigation.
+    for phrase in _confirm:
+        if phrase in content:
+            return True, f"confirmation text {phrase!r}"
+    # "Already applied" is a success state offsite (an application is on file).
+    # Skipped for Easy Apply: LinkedIn's job-view DOM carries this text for other
+    # ("similar") jobs, and EasyApplyFlow already detects it pre-submit.
+    if modal_open is None:
+        for phrase in _ALREADY_APPLIED_PHRASES:
+            if phrase in content:
+                return True, f"already-applied text {phrase!r} — an application is on file"
+
+    # 2. Easy Apply modal semantics (no URL navigation inside the modal).
+    if modal_open is False:
+        return True, "modal closed after submit"
+    # The green "Applied" pill is a LinkedIn Easy Apply signal ONLY. On a company
+    # careers page "Applied" matches Applied Materials / Applied Intuition / an
+    # "Applied" filter chip — never trust it off LinkedIn.
+    if modal_open is not None:
+        try:
+            for sel in ('[aria-label*="Applied"]', 'button:has-text("Applied")'):
+                if await page.locator(sel).count() > 0:
+                    return True, "page shows the Easy Apply 'Applied' indicator"
+        except Exception:
+            pass
+
+    # 3. URL-change analysis (OffsiteApply).
+    try:
+        url_after = page.url or ""
+    except Exception:
+        url_after = ""
+    if url_before is not None and url_after and url_after != url_before:
+        new_url = url_after.lower()
+        before_l = url_before.lower()
+        _after_path_only = urlparse(new_url).path
+
+        if any(k in new_url for k in _SUBMIT_FAIL_URL_WORDS):
+            return False, f"redirected to an auth/error URL -> {url_after[:100]}"
+        if any(p in content for p in _SUBMIT_FAIL_PHRASES):
+            return False, f"post-submit page shows a failure signal -> {url_after[:100]}"
+        if await _page_has_error_banner(page):
+            return False, f"post-submit page shows an error banner -> {url_after[:100]}"
+        if any(seg in _after_path_only for seg in _SUBMIT_SUCCESS_PATH_SEGMENTS):
+            return True, f"success URL path -> {url_after[:100]}"
+
+        # Not normalised-equal → a real navigation happened.
+        if new_url.rstrip("/") != before_l.rstrip("/"):
+            _before_host = urlparse(before_l).netloc
+            _after_host = urlparse(new_url).netloc
+            _after_path = _after_path_only.rstrip("/")
+            _before_path = urlparse(before_l).path.rstrip("/")
+            _rh_before = _registrable_host(_before_host)
+            _rh_after = _registrable_host(_after_host)
+            _same_site = _rh_before is not None and _rh_before == _rh_after
+            _looks_like_listing = (
+                _after_path in ("", "/")
+                or any(h in _after_path for h in _ATS_LISTING_PATH_HINTS)
+                # Navigated "up" to an ancestor of the form path (e.g. the form
+                # was …/jobs/<id>/apply and we landed on …/jobs or …/<company>).
+                or (bool(_after_path) and _before_path.startswith(_after_path))
+            )
+            _left_the_form = _after_path != _before_path and len(_after_path) <= len(_before_path)
+            # "Redirected back to a listing" is success ONLY with corroboration:
+            # a submit was actually clicked, no error banner (checked above), and
+            # no application submit button still on the page. A bare nav to a
+            # listing (stray LLM nav, premature "done") is NOT success.
+            if _same_site and _looks_like_listing and _left_the_form:
+                if not submit_attempted:
+                    return False, (
+                        f"navigated to a listing page ({_after_host}) but no submit "
+                        f"was ever clicked -> not a submission"
+                    )
+                if await _page_has_active_submit_cta(page):
+                    return False, (
+                        f"landed on {_after_host} but an application submit button is "
+                        f"still present -> not submitted"
+                    )
+                return True, (
+                    f"submit clicked, then the ATS redirected to its listing/careers "
+                    f"page on {_after_host} with no error -> success"
+                )
+            return False, f"URL changed to an ambiguous destination -> {url_after[:100]}"
+
+    # 4. Same page (or normalised-equal) — look for validation errors.
+    error_clues = [p for p in ("required", "please complete", "please fill", "missing",
+                               "invalid email", "invalid phone") if p in content]
+    if error_clues:
+        return False, f"form still showing validation errors: {error_clues[:2]}"
+    if await _page_has_error_banner(page):
+        return False, "form still showing an error banner after submit"
+
+    if modal_open is True:
+        return False, "modal still open after submit — form may not have submitted"
+    return False, "no confirmation signal found after submit"
+
+
 async def _ask_llm(model: str, profile: dict, field: dict) -> str | None:
     """Fill one form field via a one-shot ``llm.query`` call (self-contained
     prompt — profile + field descriptor). ``model`` is the guided_apply model."""
@@ -819,6 +1154,10 @@ async def _ask_llm(model: str, profile: dict, field: dict) -> str | None:
     try:
         raw_answer = await llm.query(prompt, model=model, timeout=_t)
         answer = raw_answer.strip().strip('"').strip("'")
+        # T31: a numeric / 1-N-scale free-text field must get a bare integer,
+        # never the model's prose ("I'd rate my experience an 8 out of 10…").
+        if not is_long_form:
+            answer = _coerce_numeric_answer(label, answer, kind, profile)
         _write_llm_log({
             "ts":           datetime.now(timezone.utc).isoformat(),
             "type":         "field_fill",
@@ -1777,37 +2116,20 @@ class EasyApplyFlow:
         return "skipped"
 
     async def _check_submission_result(self) -> tuple[bool, str]:
-        """Check whether LinkedIn accepted the Easy Apply submission."""
+        """Check whether LinkedIn accepted the Easy Apply submission.
+
+        Thin wrapper over the shared ``verify_submission`` helper — Easy Apply
+        never navigates, so the only extra signal it contributes is whether the
+        modal is still open.
+        """
         try:
-            page = self.page
-            content = (await page.content()).lower()
-
-            # Confirmation text is the strongest signal (modal may still be open showing it)
-            for phrase in ("your application was sent", "application submitted",
-                           "application was submitted", "successfully applied",
-                           "you've applied", "you applied", "application sent",
-                           "application was sent"):
-                if phrase in content:
-                    return True, f"found '{phrase}' on page"
-
-            # Modal closed without error = success
             modal_open = await self._is_modal_open()
-            if not modal_open:
-                return True, "modal closed after submit"
-
-            # Check if the Easy Apply button changed to "Applied"
-            for sel in ('[aria-label*="Applied"]', 'button:has-text("Applied")'):
-                if await page.locator(sel).count() > 0:
-                    return True, "page shows 'Applied' indicator"
-
-            # Modal still open — look for validation errors
-            error_clues = [p for p in ("required", "please complete", "please fill",
-                                       "missing", "invalid email", "invalid phone") if p in content]
-            if error_clues:
-                return False, f"modal open with validation errors: {error_clues[:2]}"
-            return False, "modal still open after submit — form may not have submitted"
-        except Exception as exc:
-            return False, f"verification error: {exc}"
+        except Exception:
+            modal_open = None
+        return await verify_submission(
+            self.page, modal_open=modal_open,
+            confirm_phrases=_EASYAPPLY_CONFIRM_PHRASES,
+        )
 
 
 # ── OffsiteApplyFlow ───────────────────────────────────────────────────────────
@@ -2608,6 +2930,7 @@ class OffsiteApplyFlow:
         context_notes: list[str] = []   # per-step observations from the LLM, accumulated as running context
         prev_url = ""
         unchanged_steps = 0
+        _submit_clicked = False  # a real submit-type button has been clicked at least once
         last_action_type = None  # used to not penalize fill/select/upload for not changing URL
         consecutive_duplicates = 0  # consecutive duplicate-fill guard firings without URL change
         _selector_attempts: dict[str, int] = {}  # per-selector retry count; skip after 3 failures
@@ -2692,8 +3015,9 @@ class OffsiteApplyFlow:
             print(f"  [LLM] Spam/aggregator domain ({_landing_domain}) — skipping")
             return "skipped"
         if any(_domain_matches(_landing_domain, d) for d in _blocked_auto_apply_domains):
-            print(f"  [LLM] Blocked auto-apply domain ({_landing_domain}) — marking failed for manual retry")
-            return "failed"
+            print(f"  [LLM] Blocked auto-apply domain ({_landing_domain}) — needs a human, "
+                  f"marking blocked (no auto-retry)")
+            return "blocked"
 
         # Lever listing-page fast-path: jobs.lever.co/<company>/<id> is a listing page with no form.
         # Append /apply to navigate directly to the application form, skipping a wasted ScriptEngine call.
@@ -2841,16 +3165,18 @@ class OffsiteApplyFlow:
             # e.g. /joinroot/ should NOT match /join; /signup-flow should NOT match /signup
             _url_domain = urlparse(current_url.lower()).netloc
             if any(dead in _url_domain for dead in _dead_end_domains):
-                print(f"  [LLM] Landed on dead-end domain ({_url_domain}) — skipping")
-                return "skipped"
+                print(f"  [LLM] Landed on dead-end domain ({_url_domain}) — needs a human, "
+                      f"marking blocked (no auto-retry)")
+                return "blocked"
 
             # Mid-flow redirect to blocked domain (e.g. Dynatrace → SuccessFactors)
             if any(_domain_matches(_url_domain, d) for d in _spam_domains):
                 print(f"  [LLM] Redirected to spam/aggregator domain mid-flow ({_url_domain}) — skipping")
                 return "skipped"
             if any(_domain_matches(_url_domain, d) for d in _blocked_auto_apply_domains):
-                print(f"  [LLM] Redirected to blocked ATS mid-flow ({_url_domain}) — marking failed for manual review")
-                return "failed"
+                print(f"  [LLM] Redirected to blocked ATS mid-flow ({_url_domain}) — needs a human, "
+                      f"marking blocked (no auto-retry)")
+                return "blocked"
 
             # SSO / Identity Provider redirect — hand off to dedicated sign-in flow instead of LLM
             _sso_domains = (
@@ -2886,8 +3212,9 @@ class OffsiteApplyFlow:
                 ok = await self._handle_auth_page(page)
                 if not ok:
                     _auth_domain = urlparse(page.url).netloc.lower()
-                    print(f"  [LLM] Login wall on {_auth_domain} — marking failed for manual retry")
-                    return "failed"
+                    print(f"  [LLM] Login wall on {_auth_domain} — needs a human, "
+                          f"marking blocked (no auto-retry)")
+                    return "blocked"
                 await asyncio.sleep(2)
                 continue
 
@@ -3102,6 +3429,21 @@ class OffsiteApplyFlow:
             selector = action.get("selector", "")
             text = action.get("text", "")
             value = action.get("value", "")
+            # T31: if the LLM is filling a numeric / 1-N-scale field with prose,
+            # reduce it to the bare integer. Resolve the target field from the
+            # snapshot by matching its id/name against the selector.
+            if action_type == "fill" and value and selector:
+                _tgt = next(
+                    (f for f in snapshot.get("fields", [])
+                     if (f.get("id") and f["id"] in selector)
+                     or (f.get("name") and f["name"] in selector)),
+                    None,
+                )
+                if _tgt:
+                    value = _coerce_numeric_answer(
+                        _tgt.get("label") or "", value,
+                        _tgt.get("type", "text"), self.profile,
+                    )
             # Capture per-step observation and append to running context
             update = action.get("update", "").strip()
             if update:
@@ -3212,7 +3554,8 @@ class OffsiteApplyFlow:
                         return "failed"
 
             if action_type == "done":
-                confirmed, conf_reason = await self._check_submission_result(page, prev_url)
+                confirmed, conf_reason = await self._check_submission_result(
+                    page, prev_url, submit_attempted=_submit_clicked)
                 if confirmed:
                     print("  [LLM] Application confirmed complete!")
                     return "applied"
@@ -4027,6 +4370,10 @@ class OffsiteApplyFlow:
                         is_submit_btn = False
 
                 if is_submit_btn:
+                    # Record that a submit was attempted — verify_submission uses
+                    # this to distinguish a real post-submit redirect from a
+                    # stray nav / premature "done".
+                    _submit_clicked = True
                     # Route submit-type buttons through ready_to_submit callback.
                     # If the button is aria-disabled (e.g. Rippling), JS-click it to trigger
                     # client-side validation errors instead — then let the LLM loop continue
@@ -4154,56 +4501,21 @@ class OffsiteApplyFlow:
             print(f"  [Offsite] ⚠ Submit {action} but {msg}")
             return "failed"
 
-    async def _check_submission_result(self, page: Page, url_before: str) -> tuple[bool, str]:
-        """Returns (success, description). Used to verify a form submission went through."""
-        _CONFIRM_PHRASES = (
-            "thank you for applying", "thank you for your application",
-            "application submitted", "application received", "application is complete",
-            "successfully submitted", "has been submitted", "we received your application",
-            "we'll be in touch", "we will be in touch", "your application was sent",
-            "application was sent", "you have applied", "you've applied",
-            "you applied", "submission received", "we received your",
+    async def _check_submission_result(
+        self, page: Page, url_before: str, submit_attempted: bool = True,
+    ) -> tuple[bool, str]:
+        """Returns (success, description). Verifies a form submission went through.
+
+        Delegates to the shared ``verify_submission`` helper. The T33 fix lives
+        there: an ATS that redirects the tab back to its own listing / careers
+        page after a submit (Rippling ``…/jobs?page=0``, and similar for
+        Greenhouse / Ashby / Lever) counts as success — but only with
+        corroboration (``submit_attempted`` true, no error banner, no submit
+        button left), not on the redirect alone.
+        """
+        return await verify_submission(
+            page, url_before=url_before, submit_attempted=submit_attempted,
         )
-        _FAIL_PHRASES = (
-            "sign in", "log in", "login", "create an account", "register",
-            "error", "something went wrong", "page not found", "404",
-            "session expired", "please try again",
-        )
-        try:
-            content = (await page.content()).lower()
-
-            # Definite success — confirmation text present
-            for phrase in _CONFIRM_PHRASES:
-                if phrase in content:
-                    return True, f"found '{phrase}' on page"
-
-            # URL changed — check if destination looks like success or failure
-            if page.url != url_before:
-                new_url = page.url.lower()
-                # Known failure destinations
-                if any(k in new_url for k in ("login", "signin", "sign-in", "register", "error", "404")):
-                    return False, f"URL changed to failure page → {page.url[:80]}"
-                # Redirected back to same listing or very similar path — not a success
-                if new_url.rstrip("/") == url_before.lower().rstrip("/"):
-                    return False, f"URL unchanged after normalisation → {page.url[:80]}"
-                # Check content of new page for failure signals
-                if any(p in content for p in _FAIL_PHRASES[:4]):  # sign in / log in / login / create account
-                    return False, f"redirected to auth/error page → {page.url[:80]}"
-                # URL path has explicit success keywords — strong signal
-                _success_url_words = ("confirm", "success", "thank", "applied", "complete", "submitted", "done", "sent")
-                if any(k in new_url for k in _success_url_words):
-                    return True, f"URL changed to success path → {page.url[:80]}"
-                # URL changed to ambiguous destination — require confirmation text too
-                return False, f"URL changed but no confirmation text or success URL pattern → {page.url[:80]}"
-
-            # Check for form validation errors on same page
-            error_clues = [p for p in ("required", "please complete", "please fill",
-                                       "missing", "invalid email") if p in content]
-            if error_clues:
-                return False, f"form showing validation errors: {error_clues[:2]}"
-            return False, "URL unchanged and no confirmation text found"
-        except Exception as exc:
-            return False, f"verification error: {exc}"
 
     # ── Authentication helpers ─────────────────────────────────────────────────
 
