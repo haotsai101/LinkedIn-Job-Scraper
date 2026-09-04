@@ -305,13 +305,16 @@ def apply_jobs_op(context) -> dict:
     context.add_output_metadata({
         "applied": MetadataValue.int(report.get("applied_count", 0)),
         "skipped": MetadataValue.int(report.get("skipped_count", 0)),
+        "blocked": MetadataValue.int(report.get("blocked_count", 0)),
         "errors":  MetadataValue.int(report.get("error_count", 0)),
         "date":    MetadataValue.text(report.get("date", "")),
     })
 
     logger.info(
         f"Session complete — applied: {report.get('applied_count', 0)}, "
-        f"skipped: {report.get('skipped_count', 0)}, errors: {report.get('error_count', 0)}"
+        f"skipped: {report.get('skipped_count', 0)}, "
+        f"blocked: {report.get('blocked_count', 0)}, "
+        f"errors: {report.get('error_count', 0)}"
     )
     return report
 

@@ -110,8 +110,9 @@ def test_numbers_experience_and_salary():
     assert de != "0" and de == "2"
     # A recognised data/AI skill still routes through the AI-skills branch ("1").
     assert _gpv(PROFILE, "How many years of machine learning experience?", "text") == "1"
-    # No profile years_experience at all -> conservative "2", still not "0".
-    assert _gpv({}, "How many years of Rust experience do you have?", "text") == "2"
+    # No profile years_experience at all -> "1", matching the AI/ML branch so an
+    # *unrecognised* skill never claims more than a recognised one (still not "0").
+    assert _gpv({}, "How many years of Rust experience do you have?", "text") == "1"
     # Salary stored as a range -> upper bound is returned for single-value fields.
     assert _gpv(PROFILE, "Desired salary", "text") == "180000"
     assert _gpv(PROFILE, "Expected compensation", "text") == "180000"
@@ -153,8 +154,22 @@ def test_coerce_numeric_answer_leaves_free_text_and_choices_untouched():
     assert _coerce("Describe your leadership experience", prose, "textarea") == prose
     # A select/radio value is never touched even if the label says "rate".
     assert _coerce("Rate your experience", "Advanced", "select") == "Advanced"
+    # textarea is in the passthrough set — a "how many years… and rate your depth"
+    # essay field must keep its prose, not get truncated to one int.
+    long_answer = "I have 4 years with Kubernetes; I'd rate my depth a 7/10 overall."
+    assert _coerce("How many years with Kubernetes, and rate your depth (1-10)?",
+                   long_answer, "textarea") == long_answer
     # Already a bare number -> unchanged.
     assert _coerce("How many years?", "7", "text") == "7"
+
+
+def test_coerce_numeric_answer_keeps_an_explicit_negative_at_zero():
+    # A truthful "I don't have this" must NOT be bumped to a fabricated number.
+    assert _coerce("How many years of COBOL experience?", "None, I haven't used it.",
+                   "text", {"years_experience": "10"}) == "0"
+    assert _coerce("Years of experience with Fortran", "n/a", "text",
+                   {"years_experience": "10"}) == "0"
+    assert _coerce("How many years with Haskell?", "never", "text") == "0"
 
 
 # ── work authorization / visa / citizenship ───────────────────────────────────

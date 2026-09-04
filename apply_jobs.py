@@ -350,6 +350,7 @@ def send_session_email(gmail_user: str, app_password: str, report: dict):
     applied = report.get("applied_count", 0)
     skipped = report.get("skipped_count", 0)
     errors  = report.get("error_count", 0)
+    blocked = report.get("blocked_count", 0)
     date    = report.get("date", "")
     apps    = report.get("applications", [])
 
@@ -381,6 +382,7 @@ def send_session_email(gmail_user: str, app_password: str, report: dict):
 <p>
   <b>Applied:</b> {applied} &nbsp;|&nbsp;
   <b>Skipped:</b> {skipped} &nbsp;|&nbsp;
+  <b>Blocked (needs manual apply):</b> {blocked} &nbsp;|&nbsp;
   <b>Errors:</b> {errors}
 </p>
 <h3>Applications submitted:</h3>
