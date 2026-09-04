@@ -189,3 +189,41 @@ def test_login_wall_with_failing_stored_credentials_stays_failed(monkeypatch):
     flow = _offsite()
     out = asyncio.run(flow._llm_guided_apply(page))
     assert out == "failed"
+
+
+# ── 4)-5) T35 — pre-flight login-path check (:3212-3217), not the mid-loop
+#            password-field check above. Reached when the page URL's *path*
+#            matches a known login route (e.g. "/login") rather than via a
+#            password field appearing mid-flow — this is the call site that
+#            routes through ``_handle_auth_page`` itself, whose "credentials
+#            exist but login failed" branch used to fall through into the
+#            same ``return False`` as the true no-credentials branch,
+#            collapsing both into "blocked" (-3, non-retryable). ────────────
+
+def test_preflight_login_wall_with_no_stored_credentials_returns_blocked(monkeypatch):
+    """No stored/discoverable credentials for the domain at all — still a
+    genuine dead end, must stay -3."""
+    _install_common(monkeypatch)
+    monkeypatch.setattr(linkedin_apply, "_find_account_for_domain", lambda _d: None)
+    page = _FakePage("https://jobs.acme.com/login")
+    flow = _offsite()
+    out = asyncio.run(flow._llm_guided_apply(page))
+    assert out == "blocked"
+
+
+def test_preflight_login_wall_with_failing_stored_credentials_returns_failed(monkeypatch):
+    """Regression for T35: stored credentials exist for the domain but the
+    login attempt itself fails (transient/2FA/rate-limit) — this must end
+    -2 (retryable), not fall through to -3 like it did before the fix."""
+    _install_common(monkeypatch)
+    monkeypatch.setattr(linkedin_apply, "_find_account_for_domain",
+                        lambda _d: {"email": "a@b.com", "password": "pw"})
+
+    async def _login_fails(self, page, email, password):
+        return False
+    monkeypatch.setattr(linkedin_apply.OffsiteApplyFlow, "_try_login", _login_fails)
+
+    page = _FakePage("https://jobs.acme.com/login")
+    flow = _offsite()
+    out = asyncio.run(flow._llm_guided_apply(page))
+    assert out == "failed"

@@ -3210,8 +3210,14 @@ class OffsiteApplyFlow:
                     return "failed"
                 auth_attempted = True
                 ok = await self._handle_auth_page(page)
-                if not ok:
+                if ok is not True:
                     _auth_domain = urlparse(page.url).netloc.lower()
+                    if ok == "failed":
+                        # Stored credentials exist but the login attempt itself failed
+                        # (transient/2FA/rate-limit) — retryable, not a dead end.
+                        print(f"  [LLM] Login with stored credentials failed for "
+                              f"{_auth_domain} — marking failed")
+                        return "failed"
                     print(f"  [LLM] Login wall on {_auth_domain} — needs a human, "
                           f"marking blocked (no auto-retry)")
                     return "blocked"
@@ -4625,11 +4631,15 @@ class OffsiteApplyFlow:
             print(f"  [SSO] Sign-in error: {_sso_exc}")
             return False
 
-    async def _handle_auth_page(self, page: Page) -> bool:
+    async def _handle_auth_page(self, page: Page) -> bool | str:
         """
         Handles a 3rd-party login or registration page.
         Checks stored credentials first; falls back to registering a new account.
-        Returns True if we appear to be authenticated afterward.
+        Returns True if we appear to be authenticated afterward, "failed" if
+        stored credentials exist for this domain but the login attempt itself
+        failed (transient/2FA/rate-limit — retryable), or "blocked" if no
+        stored/discoverable credentials exist for this domain at all (needs a
+        human, not auto-retryable).
         """
         domain = urlparse(page.url).netloc
         print(f"  [Auth] Handling auth for {domain}")
@@ -4676,11 +4686,12 @@ class OffsiteApplyFlow:
             if await self._try_login(page, existing["email"], existing["password"]):
                 print(f"  [Auth] Login successful")
                 return True
-            print(f"  [Auth] Login failed with stored credentials")
+            print(f"  [Auth] Login failed with stored credentials for {domain} — marking failed")
+            return "failed"
 
         print(f"  [Auth] No stored credentials for {domain} — needs a human, "
               f"marking blocked (no auto-retry)")
-        return False
+        return "blocked"
 
     async def _try_login(self, page: Page, email: str, password: str) -> bool:
         """Fill login form and submit. Returns True if URL changed away from login page."""
