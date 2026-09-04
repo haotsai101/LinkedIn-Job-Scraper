@@ -389,7 +389,7 @@ Run once against `linkedin_jobs.db` after this PR merges; the next apply session
 
 ## T34 — Mid-flow blocked-ATS/login-wall paths still use `-2` instead of T33's `-3`
 
-**Phase:** T33 follow-up · **Risk:** low · **Status:** ✅ fixed (PR pending) · Found during T33 live validation run 2026-09-02/04.
+**Phase:** T33 follow-up · **Risk:** low · **Status:** ✅ fixed, merged (PR #26, 2026-09-04) · Found during T33 live validation run 2026-09-02/04.
 
 T33 added a `"blocked"` outcome (→ `applied=-3`, excluded from `--reset-failed`) for jobs that hit a known un-automatable ATS domain — but only wired it into the **pre-flight** domain check in `linkedin_apply.py` (~lines 3018-3019, 3169, 3178, 3216: `"marking blocked (no auto-retry)"`). Three mid-flow checks that are the same category of "needs a human, don't auto-retry" situation still `return "failed"` (→ `applied=-2`, which **is** retried by `--reset-failed`):
 
@@ -406,3 +406,17 @@ Note the **login-wall-with-credentials-that-fail-to-log-in** branch (also ~3316-
 **Known pre-existing quirk, not touched (flagged for the reviewer):** inside `_handle_auth_page` (`:4671-4680`), the "credentials exist but login failed" fallthrough has no `return` after its own print, so it falls into the same final `print(...); return False` as the true no-credentials case — meaning that specific pre-flight login-path call site (`:3212-3217`, not the mid-loop one this ticket targets) already always maps a failed stored-credential login to `blocked`/`-3` rather than the `failed`/`-2` the mid-loop check gives it. This predates T34 and is a separate, narrower gap from what this ticket's acceptance criteria cover — out of scope here.
 
 **Acceptance:** a job that hits the post-navigation blocked-ATS check or a login wall with no stored/discoverable credentials for that domain ends the run with `applied=-3`, not `-2`; `--reset-failed` does not pick these up; a job whose stored-credential login attempt genuinely fails still ends `-2` (unchanged, retryable); `pytest tests/` green.
+
+---
+
+## T35 — `_handle_auth_page` fallthrough over-blocks failed stored-credential logins (live since T33, ~2 months)
+
+**Phase:** T33/T34 follow-up · **Risk:** medium (silent, already live in production) · **Status:** open · Found by the T34 SWE agent, confirmed independently by the T34 PR reviewer, 2026-09-04.
+
+`_handle_auth_page` (`linkedin_apply.py:~4671-4680`) has two failure branches: "no stored credentials for this domain" and "stored credentials exist but the login attempt failed" (transient/2FA/rate-limit — should be retryable). The second branch's `print(...)` has no `return` statement after it, so execution falls through into the same final `return False` the true no-credentials case uses — collapsing both into one signal. Its caller, the **pre-flight** login-path check at `linkedin_apply.py:3212-3217`, maps any `False` to `"blocked"` → `applied=-3` (excluded from `--reset-failed`). Net effect: since T33 merged (`c962fef0`, 2026-07-03), **any offsite job whose stored credentials exist but whose login fails for a transient reason has been permanently written off as `-3` instead of retried as `-2`** — the exact mis-classification T33/T34 exist to prevent, just at a third call site neither ticket's scope covered. (T34's mid-loop equivalent, `_handle_auth_page`'s sibling check at `:3320-3323`, does NOT have this bug — it correctly distinguishes the two cases; only the pre-flight call site inherits the fallthrough.)
+
+**Fix:** add the missing `return` (or an explicit distinct sentinel, e.g. a 3-way return / exception, if `:3212-3217` needs to tell the two cases apart — check what that call site currently does with the `bool` and whether a signature change ripples further) after the "stored credentials exist but login failed" print in `_handle_auth_page`, so that branch reaches its own outcome instead of falling through to the no-credentials `return False`. Confirm `:3212-3217` still correctly maps the true no-credentials case to `"blocked"`/`-3` and the login-failed case to `"failed"`/`-2` (mirroring the mid-loop check T34 already got right).
+
+**Operator recovery (after this PR merges):** some current `applied=-3` rows may actually be transient login failures wrongly stuck as non-retryable. Consider auditing/reconsidering `-3` rows going back to 2026-07-03 whose blocked reason traces to this call site (vs. a genuine blocked-domain hit) — not automated here, DB layer out of scope for this ticket.
+
+**Acceptance:** a job where `_handle_auth_page` is reached via the pre-flight login-path check, stored credentials exist for the domain, and the login attempt itself fails, ends the run `applied=-2` (retryable), not `-3`. A job with no stored/discoverable credentials at all still correctly ends `-3`. Regression test covering both branches of `_handle_auth_page`'s caller at `:3212-3217` (not just the mid-loop `:3320-3323` one T34 covered). `pytest tests/` green.
