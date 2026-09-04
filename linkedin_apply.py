@@ -3279,8 +3279,9 @@ class OffsiteApplyFlow:
                                 print(f"  [LLM] Post-navigation spam domain ({_post_nav_domain}) — skipping")
                                 return "skipped"
                             if any(_domain_matches(_post_nav_domain, d) for d in _blocked_auto_apply_domains):
-                                print(f"  [LLM] Post-navigation blocked ATS ({_post_nav_domain}) — marking failed for manual review")
-                                return "failed"
+                                print(f"  [LLM] Post-navigation blocked ATS ({_post_nav_domain}) — needs a human, "
+                                      f"marking blocked (no auto-retry)")
+                                return "blocked"
                         break  # found a match — proceed with snapshot of current page
                     except Exception:
                         continue
@@ -3317,8 +3318,9 @@ class OffsiteApplyFlow:
                             print(f"  [LLM] Login with stored credentials failed for {_cur_domain} — marking failed")
                             return "failed"
                     else:
-                        print(f"  [LLM] Login wall detected (password field) on {_cur_domain} — marking failed for manual login")
-                        return "failed"
+                        print(f"  [LLM] Login wall detected (password field) on {_cur_domain} — needs a human, "
+                              f"marking blocked (no auto-retry)")
+                        return "blocked"
             except Exception:
                 pass
 
@@ -4676,7 +4678,8 @@ class OffsiteApplyFlow:
                 return True
             print(f"  [Auth] Login failed with stored credentials")
 
-        print(f"  [Auth] No stored credentials for {domain} — marking failed for manual login")
+        print(f"  [Auth] No stored credentials for {domain} — needs a human, "
+              f"marking blocked (no auto-retry)")
         return False
 
     async def _try_login(self, page: Page, email: str, password: str) -> bool:
