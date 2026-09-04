@@ -1013,9 +1013,13 @@ async def verify_submission(
     for phrase in _confirm:
         if phrase in content:
             return True, f"confirmation text {phrase!r}"
-    for phrase in _ALREADY_APPLIED_PHRASES:
-        if phrase in content:
-            return True, f"already-applied text {phrase!r} — an application is on file"
+    # "Already applied" is a success state offsite (an application is on file).
+    # Skipped for Easy Apply: LinkedIn's job-view DOM carries this text for other
+    # ("similar") jobs, and EasyApplyFlow already detects it pre-submit.
+    if modal_open is None:
+        for phrase in _ALREADY_APPLIED_PHRASES:
+            if phrase in content:
+                return True, f"already-applied text {phrase!r} — an application is on file"
 
     # 2. Easy Apply modal semantics (no URL navigation inside the modal).
     if modal_open is False:
