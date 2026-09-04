@@ -389,7 +389,7 @@ Run once against `linkedin_jobs.db` after this PR merges; the next apply session
 
 ## T34 — Mid-flow blocked-ATS/login-wall paths still use `-2` instead of T33's `-3`
 
-**Phase:** T33 follow-up · **Risk:** low · **Status:** ✅ fixed, merged (PR #26, 2026-09-04) · Found during T33 live validation run 2026-09-02/04.
+**Phase:** T33 follow-up · **Risk:** low · **Status:** ✅ **CLOSED** — merged (PR #26, 2026-09-04), QA passed 2026-09-04 (`tests/test_blocked_status.py` verified fail-pre-fix/pass-post-fix by both SWE and reviewer; live post-merge run showed no regression in EasyApply/spam-filter paths — did not itself exercise the changed branches, see T35's QA note for the same caveat and a suggested targeted follow-up run). Found during T33 live validation run 2026-09-02/04.
 
 T33 added a `"blocked"` outcome (→ `applied=-3`, excluded from `--reset-failed`) for jobs that hit a known un-automatable ATS domain — but only wired it into the **pre-flight** domain check in `linkedin_apply.py` (~lines 3018-3019, 3169, 3178, 3216: `"marking blocked (no auto-retry)"`). Three mid-flow checks that are the same category of "needs a human, don't auto-retry" situation still `return "failed"` (→ `applied=-2`, which **is** retried by `--reset-failed`):
 
@@ -411,7 +411,11 @@ Note the **login-wall-with-credentials-that-fail-to-log-in** branch (also ~3316-
 
 ## T35 — `_handle_auth_page` fallthrough over-blocks failed stored-credential logins (live since T33, ~2 months)
 
-**Phase:** T33/T34 follow-up · **Risk:** medium (silent, already live in production) · **Status:** ✅ fixed (PR pending) · Found by the T34 SWE agent, confirmed independently by the T34 PR reviewer, 2026-09-04.
+**Phase:** T33/T34 follow-up · **Risk:** medium (silent, already live in production) · **Status:** ✅ **CLOSED** — merged (PR #28, 2026-09-04), QA passed 2026-09-04. Found by the T34 SWE agent, confirmed independently by the T34 PR reviewer, 2026-09-04.
+
+**QA note (2026-09-04):** post-merge live run (`apply_jobs.py --auto --limit 3`) showed no regression (1 EasyApply submitted+confirmed, 2 spam-domain pre-classification skips, DB deltas exact match, 0 errors) but did not itself reach a login-wall branch, so it's evidence of "no regression in the surrounding flow," not direct live confirmation of the new `-2`/`-3` split. Direct evidence comes from `tests/test_blocked_status.py`'s two new pre-flight-call-site tests, independently re-run by the reviewer against the pre-fix commit and confirmed to fail there / pass post-fix. QA recommendation: sufficient to close; optionally, the `pending` pool has 3 Workday `OffsiteApply` postings (same ATS class that originally exposed T34) that a future `--type OffsiteApply` run could hit for added production confidence — not required.
+
+**Operator note:** consider auditing existing `applied=-3` rows dated on/after 2026-07-03 (T33's merge) for ones that trace to the pre-flight login-path call site rather than a genuine blocked-domain hit — those may have been transient login failures wrongly stuck non-retryable before this fix. Not automated.
 
 `_handle_auth_page` (`linkedin_apply.py:~4671-4680`) has two failure branches: "no stored credentials for this domain" and "stored credentials exist but the login attempt failed" (transient/2FA/rate-limit — should be retryable). The second branch's `print(...)` has no `return` statement after it, so execution falls through into the same final `return False` the true no-credentials case uses — collapsing both into one signal. Its caller, the **pre-flight** login-path check at `linkedin_apply.py:3212-3217`, maps any `False` to `"blocked"` → `applied=-3` (excluded from `--reset-failed`). Net effect: since T33 merged (`c962fef0`, 2026-07-03), **any offsite job whose stored credentials exist but whose login fails for a transient reason has been permanently written off as `-3` instead of retried as `-2`** — the exact mis-classification T33/T34 exist to prevent, just at a third call site neither ticket's scope covered. (T34's mid-loop equivalent, `_handle_auth_page`'s sibling check at `:3320-3323`, does NOT have this bug — it correctly distinguishes the two cases; only the pre-flight call site inherits the fallthrough.)
 
