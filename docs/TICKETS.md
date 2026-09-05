@@ -13,7 +13,7 @@ Baseline captured 2026-08-28. `docs/baseline/db_state.baseline.txt` holds the DB
 | 3 — Phase 2 | T14 #15, T26 #19, T27 #20, T14b #22 | ✅ **CLOSED** 2026-09-03. **The entire LLM stack is off the `claude` subprocess.** T14: Agent SDK wrapper + classifier routing (validated with 2 real applications). T26: `max_turns` fix. T27: NIM-tier hardening (model → `meta/llama-3.2-11b-vision-instruct`, circuit breaker, spam reorder, Greenhouse un-block; bundled T28+T29). T14b: browser agent (`_llm_guided_apply`, EEO pickers, `ScriptApplyEngine`) → one-shot `llm.query`/`query_json`; all dead `AsyncOpenAI` plumbing + the `load_env` `LLM_API` hard-exit removed. 154 tests. |
 | 4 — Phase 3 | ~~T15 browser-use spike~~ | **DROPPED** 2026-09-03 (owner: "skip all NIM-specific tasks, keep going with Agent SDK"). browser-use needs a working free NIM model; the whole tier is unreliable. `verify_submission` unification (T15's non-NIM half) folds into T33. |
 | 4/5 | **T33** — OffsiteApply flow reliability | **next** — unified `verify_submission` (fix Rippling `/jobs?page=0` false-negative), blocked-domain jobs → skip not auto-fail, T31 (prose in numeric fields), T32 (undersold answers). |
-| 5 — Phase 4 | **T16b** — decompose `_llm_guided_apply` on the Agent SDK (primary OffsiteApply path) + retire `ScriptApplyEngine` | after T33 |
+| 5 — Phase 4 | **T16b** — decompose `_llm_guided_apply` on the Agent SDK (primary OffsiteApply path) + retire `ScriptApplyEngine` | **split into 2 PRs.** PR 1 (`ScriptApplyEngine` retired + `page_snapshot`/`decide_action`/`detect_terminal_state`/`handle_auth` seams + tests) ✅ fixed (PR pending). PR 2 (`execute_action` extraction + thin orchestrator) still open. |
 | 6 — Phase 5 | T17 — scraper cleanup | needs T12 ✓ |
 | Follow-ups | T19 T20 T21 T22 T24 · T30 **parked** (NIM — owner: leave it, circuit breaker handles bad days) | not started (P2–P3) |
 
@@ -275,9 +275,22 @@ The Agent-SDK apply flow fills forms well (résumé upload, React Select, EEO de
 
 **Phase:** 4 · **Risk:** medium-high · **Deps:** T33 · (T15 browser-use spike dropped — this is now the OffsiteApply primary, not a fallback.)
 
+**Status:** ✅ **PR 1 fixed (PR pending)** — split into two PRs because a single behaviour-preserving diff over ~1,500 lines of the primary production path was too large to review safely.
+
 Split the ~1,500-line `_llm_guided_apply` into testable seams: `page_snapshot` · `decide_action` (the `llm.query` call) · `execute_action` · `detect_terminal_state` (applied / dead-end / needs-human — uses `verify_submission` from T33) · `handle_auth` (login + account creation + `EmailInbox` verification). Retire `ScriptApplyEngine` (the LLM-writes-a-Playwright-script path) — the step loop is the single OffsiteApply engine. Page representation → accessibility-tree / structured field list where practical (fewer tokens than raw DOM).
 
-**Acceptance:** each seam independently unit-tested; `ScriptApplyEngine` gone; a live OffsiteApply run against 5 known-failing jobs completes without the old function.
+**PR 1 (this):** `ScriptApplyEngine` retired entirely (`script_engine.py` + its tests deleted, all refs removed). Seams extracted as methods on `OffsiteApplyFlow`, wired at the *same* call sites (no reordering) so behaviour is preserved:
+- `_page_snapshot` / `_decide_action` — named wrappers over `_get_page_snapshot` / `_ask_llm_action`.
+- `_classify_domain` — dedupes the spam/blocked-ATS/dead-end host check that was copy-pasted at 3 sites (pre-flight, per-step, post-nav).
+- `_detect_expired` — closed/removed/not-found job detection.
+- `_detect_terminal_state` — consolidates the consecutive mid-loop reCAPTCHA-widget / Cloudflare / expired-text / Greenhouse-security-code walls.
+- `_handle_auth(phase="url"|"form")` — one entry point for SSO redirects, login-path pages, and mid-form password gates; **preserves the T34/T35 blocked(-3)-vs-failed(-2) split exactly**.
+- Static config (`_SPAM_DOMAINS`, `_BLOCKED_AUTO_APPLY_DOMAINS`, `_LOGIN_PATHS`, `_SSO_DOMAINS`, expired/cloudflare patterns) hoisted to class attributes.
+- New `tests/test_offsite_seams.py` (28 cases) covers every PR-1 seam in isolation. `test_blocked_status.py` (T34/T35) / `test_verify_submission.py` (T33) / `test_offsite_llm.py` / `test_bot_wall.py` all still green.
+
+**PR 2 (still open):** extract `execute_action` — the ~800-line `fill`/`select`/`click`/`upload`/`scroll` dispatch (React Select, Greenhouse autocomplete, ITI phone, cover-letter guards, new-tab rebinding) — into its own method with a small mutable `_StepState`, making the orchestrator a truly thin loop. This is the highest-risk part of the decomposition and gets its own review.
+
+**Acceptance:** each seam independently unit-tested (PR 1 ✅ for 4 of 5; `execute_action` in PR 2); `ScriptApplyEngine` gone (PR 1 ✅); a live OffsiteApply run against 5 known-failing jobs completes without the old function (deferred to post-merge QA).
 
 ---
 

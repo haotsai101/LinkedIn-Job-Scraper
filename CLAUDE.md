@@ -80,13 +80,13 @@ All pipeline logic is wrapped as Dagster ops/jobs/schedules in `scripts/dagster_
 
 `scripts/definitions.py` wires 4 jobs (`search_jobs_only`, `fetch_details_only`, `search_and_fetch_jobs`, `apply_jobs_job`), 3 schedules, and `unscraped_jobs_sensor`. The `no_persist_io_manager` resource discards op outputs so Dagster doesn't pickle them to `$DAGSTER_HOME/storage` on every run.
 
-### Autonomous apply agent (`apply_jobs.py`, `linkedin_apply.py`, `script_engine.py`)
+### Autonomous apply agent (`apply_jobs.py`, `linkedin_apply.py`)
 
 Reads jobs where `scraped=1 AND applied IS NULL` (filtered to remote/Utah). For each job:
 1. **LLM classifier** (`JobAgent`) calls an OpenAI-compatible API to decide relevance.
 2. **Playwright browser** logs into LinkedIn and runs one of two flows:
    - `EasyApplyFlow` — LinkedIn's native in-modal multi-step form (`SimpleOnsiteApply`, `ComplexOnsiteApply`)
-   - `OffsiteApplyFlow` — external company career site; tries `ScriptApplyEngine` (generates a complete Playwright script per page) first, then falls back to a step-by-step LLM loop. Can auto-create accounts (saved to `created_accounts.json`).
+   - `OffsiteApplyFlow` — external company career site. A single step-loop engine (`_llm_guided_apply`): snapshot page → detect terminal state → ask the LLM for one action → execute → repeat. Decomposed into seams — `_page_snapshot`, `_decide_action`, `_classify_domain` / `_detect_expired` / `_detect_terminal_state`, `_handle_auth`. Can auto-create accounts (saved to `created_accounts.json`). (The older `ScriptApplyEngine` "LLM writes a full Playwright script" path was retired in T16b.)
 3. `jobs.applied` is set to: `1`=applied, `-1`=skipped/irrelevant, `-2`=auto-failed, `-3`=blocked (un-automatable ATS / login wall — needs a human, not in the `--reset-failed` retry pool).
 
 The agent supports three separate LLM endpoints: `LLM_*` (default), `CLASSIFIER_LLM_*` (relevance scoring), `BROWSER_LLM_*` (form filling). All default to the same endpoint if not specified. Any OpenAI-compatible API works (NVIDIA NIM, OpenRouter, etc.).

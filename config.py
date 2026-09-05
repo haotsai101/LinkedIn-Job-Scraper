@@ -5,8 +5,7 @@ non-LLM runtime settings that live in ``.env``.
 
 Nothing imports this module yet -- T14 wires it into the apply agent. It exists
 now so that model choices can be changed with one ``.env`` edit instead of
-hunting for hardcoded strings across ``apply_jobs.py`` / ``linkedin_apply.py`` /
-``script_engine.py``.
+hunting for hardcoded strings across ``apply_jobs.py`` / ``linkedin_apply.py``.
 
 Three LLM *roles*, each with its own model plus (optionally) its own endpoint:
 

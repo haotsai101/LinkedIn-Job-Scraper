@@ -46,7 +46,6 @@ py-modules = [
     "nim_client",
     "apply_jobs",
     "linkedin_apply",
-    "script_engine",
     "search_retriever",
     "details_retriever",
     "to_csv",

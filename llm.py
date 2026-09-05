@@ -13,8 +13,8 @@ Entry points, deliberately different tools for different jobs:
   Used by ``apply_jobs.JobAgent`` to classify each job posting independently.
 
 * :func:`query` — the same fresh-session-per-call foundation, returning free
-  text. Used by the T14b offsite/EasyApply browser agent
-  (``linkedin_apply`` / ``script_engine``): every one of those call sites
+  text. Used by the T14b offsite/EasyApply browser agent (``linkedin_apply``):
+  every one of those call sites
   builds a fully self-contained prompt (profile + job context + progress recap
   + page snapshot + rules, re-sent each call), so there is nothing for a shared
   conversation to add — only redundant history, latency, and subscription
@@ -243,10 +243,9 @@ async def query(
     (``allowed_tools=[]``, ``permission_mode="dontAsk"``, ``setting_sources=[]``
     — no tool can run) but returns the assistant's plain text. For the T14b
     browser agent's call sites (``linkedin_apply._ask_llm`` /
-    ``_ask_llm_action`` / ``_summarize_job`` / the EEO pickers,
-    ``script_engine`` script generation): each builds a fully self-contained
-    prompt, so a shared conversation would only add redundant history, latency,
-    and subscription-usage burn.
+    ``_ask_llm_action`` / ``_summarize_job`` / the EEO pickers): each builds a
+    fully self-contained prompt, so a shared conversation would only add
+    redundant history, latency, and subscription-usage burn.
 
     ``timeout`` (seconds), when set, bounds the whole call with
     ``asyncio.wait_for``; a slow call raises :class:`asyncio.TimeoutError`

@@ -14,10 +14,9 @@ The adjacent branch — stored credentials exist but the login attempt itself
 fails — is a different, still-retryable case and must keep returning
 ``"failed"``; that is covered here as a regression guard.
 
-No browser: ``page``/``context`` are minimal fakes. ``ScriptApplyEngine``,
-the bot-wall pre-check, and ``_get_page_snapshot`` are monkeypatched out so
-each test only exercises ``_llm_guided_apply``'s own control flow around the
-checks under test.
+No browser: ``page``/``context`` are minimal fakes. The bot-wall pre-check
+and ``_get_page_snapshot`` are monkeypatched out so each test only exercises
+``_llm_guided_apply``'s own control flow around the checks under test.
 """
 
 from __future__ import annotations
@@ -25,7 +24,6 @@ from __future__ import annotations
 import asyncio
 
 import linkedin_apply
-import script_engine
 
 # ── llm.query / logging plumbing (unused on these paths, stubbed for safety) ─
 
@@ -39,17 +37,11 @@ def _install_common(monkeypatch):
     """Stub out everything ``_llm_guided_apply`` touches before it reaches the
     step loop's mid-flow checks, so a test only exercises the logic under test."""
     monkeypatch.setattr(linkedin_apply, "_write_llm_log", lambda *_a, **_k: None)
-    monkeypatch.setattr(script_engine, "_write_llm_log", lambda *_a, **_k: None)
     monkeypatch.setattr(linkedin_apply.llm, "query", _QueryStub())
-    monkeypatch.setattr(script_engine.llm, "query", _QueryStub())
 
     async def _no_bot_wall(self, page):
         return ""
     monkeypatch.setattr(linkedin_apply.OffsiteApplyFlow, "_detect_bot_wall", _no_bot_wall)
-
-    async def _script_engine_bails(self, page):
-        return "failed"  # falls back to the step loop, same as a real miss
-    monkeypatch.setattr(script_engine.ScriptApplyEngine, "apply", _script_engine_bails)
 
     async def _snapshot_stub(self, page):
         return {"fields": [], "buttons": [{"text": "placeholder"}], "visible_text": "x" * 30}

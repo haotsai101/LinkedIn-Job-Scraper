@@ -1,13 +1,13 @@
 """
 common.py — Shared stdlib-only helpers for the apply pipeline.
 
-Extracted (ticket T4) from ``apply_jobs.py`` / ``linkedin_apply.py`` /
-``script_engine.py``, where ``_write_llm_log``, the markdown-fence strip, and the
-JSON-object extraction were copy-pasted. Centralizing them removes the drift risk
-and shrinks the surface T14 (Agent SDK migration) has to touch.
+Extracted (ticket T4) from ``apply_jobs.py`` / ``linkedin_apply.py``, where
+``_write_llm_log``, the markdown-fence strip, and the JSON-object extraction
+were copy-pasted. Centralizing them removes the drift risk and shrinks the
+surface T14 (Agent SDK migration) has to touch.
 
 Keep this module import-light: ``json`` / ``re`` / stdlib only — **no**
-``playwright`` / ``openai`` / ``httpx``. All three large modules import it, and so
+``playwright`` / ``openai`` / ``httpx``. The large modules import it, and so
 does the test suite, sometimes in environments without the heavy deps installed.
 """
 

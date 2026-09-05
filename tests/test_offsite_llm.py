@@ -14,7 +14,6 @@ import pytest
 
 import config
 import linkedin_apply
-import script_engine
 
 
 class _QueryStub:
@@ -42,12 +41,10 @@ GUIDED_MODEL = config.get_llm_config("guided_apply").model
 @pytest.fixture(autouse=True)
 def _no_log(monkeypatch):
     monkeypatch.setattr(linkedin_apply, "_write_llm_log", lambda *_a, **_k: None)
-    monkeypatch.setattr(script_engine, "_write_llm_log", lambda *_a, **_k: None)
 
 
 def _install(monkeypatch, stub):
     monkeypatch.setattr(linkedin_apply.llm, "query", stub)
-    monkeypatch.setattr(script_engine.llm, "query", stub)
     return stub
 
 
@@ -64,15 +61,12 @@ def test_flows_default_to_the_guided_apply_model():
     assert _offsite().model == GUIDED_MODEL == "claude-sonnet-5"
     assert linkedin_apply.EasyApplyFlow(
         page=None, profile={}, auto_mode=True, callbacks={}).model == GUIDED_MODEL
-    assert script_engine.ScriptApplyEngine(
-        profile={}, context=None, company_name="", job_title="").model == GUIDED_MODEL
 
 
 def test_constructing_a_flow_makes_no_llm_call(monkeypatch):
     stub = _install(monkeypatch, _QueryStub())
     _offsite()
     linkedin_apply.EasyApplyFlow(page=None, profile={}, auto_mode=True, callbacks={})
-    script_engine.ScriptApplyEngine(profile={}, context=None, company_name="", job_title="")
     assert stub.calls == []
 
 
@@ -188,30 +182,10 @@ def test_spam_aggregator_landing_domain_still_returns_skipped(monkeypatch):
     assert out == "skipped"
 
 
-# ── ScriptApplyEngine script generation ────────────────────────────────────
-
-def test_script_engine_call_llm_uses_query_and_sanitizes(monkeypatch):
-    stub = _install(monkeypatch, _QueryStub(
-        "```python\nawait page.click('#submit')\n```"))
-    eng = script_engine.ScriptApplyEngine(
-        profile={}, context=None, company_name="ACME", job_title="Dev")
-    script = asyncio.run(eng._call_llm("prompt", "https://ex.com", 1))
-    assert "page.locator('#submit').click(timeout=5000)" in script
-    assert stub.calls[0]["model"] == GUIDED_MODEL
-    assert stub.calls[0]["timeout"] == 180
-
-
-def test_script_engine_call_llm_timeout_returns_none(monkeypatch):
-    _install(monkeypatch, _QueryStub(exc=asyncio.TimeoutError()))
-    eng = script_engine.ScriptApplyEngine(
-        profile={}, context=None, company_name="", job_title="")
-    assert asyncio.run(eng._call_llm("p", "u", 0)) is None
-
-
 # ── no persistent-session / subprocess plumbing left ──────────────────────
 
 def test_no_claude_subprocess_or_session_in_browser_agent_modules():
-    for mod in (linkedin_apply, script_engine):
+    for mod in (linkedin_apply,):
         src = open(mod.__file__).read()
         assert 'subprocess.run(["claude"' not in src
         assert "import subprocess" not in src
@@ -220,7 +194,7 @@ def test_no_claude_subprocess_or_session_in_browser_agent_modules():
 
 
 def test_no_asyncopenai_in_browser_agent_modules():
-    for mod in (linkedin_apply, script_engine):
+    for mod in (linkedin_apply,):
         src = open(mod.__file__).read()
         assert "AsyncOpenAI" not in src
         assert "from openai" not in src

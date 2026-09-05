@@ -14,8 +14,8 @@ _Generated 2026-08-28. Sections 1–2 are the as-is review; sections 3+ are the 
 | **Enrichment scraper** | `details_retriever.py`, `scripts/fetch.py:JobDetailRetriever` | ~210 | Full attributes for `scraped=0` → `scraped=1` |
 | **Orchestration** | `scripts/dagster_*.py`, `scripts/definitions.py` | ~1,100 | Dagster ops/jobs/schedules/sensor + SDA lineage assets |
 | **Apply agent — driver** | `apply_jobs.py` | 1,367 | CLI, env/profile, DB queries, `JobAgent` classifier, `run_session` loop, email |
-| **Apply agent — browser flows** | `linkedin_apply.py` | **4,607** | `EasyApplyFlow`, `OffsiteApplyFlow`, field matching, account creation |
-| **Apply agent — script generator** | `script_engine.py` | 547 | `ScriptApplyEngine`: LLM writes a full Playwright script per page |
+| **Apply agent — browser flows** | `linkedin_apply.py` | ~4,600 | `EasyApplyFlow`, `OffsiteApplyFlow` (single step-loop engine), field matching, account creation |
+| ~~**Apply agent — script generator**~~ | ~~`script_engine.py`~~ | — | Retired in T16b — `OffsiteApplyFlow._llm_guided_apply` is now the only OffsiteApply engine |
 | **Haiku helper CLI** | `apply_haiku.py` | 153 | list/mark/stats/log helpers for the `--haiku` skill |
 | **DB bootstrap / helpers** | `scripts/create_db.py`, `database_scripts.py`, `helpers.py` | ~310 | schema DDL, upserts, cleaning |
 | **Export / analysis** | `to_csv.py`, `analysis/` (gitignored, ~166 MB) | ~80 | CSV export + notebooks |
@@ -174,7 +174,7 @@ Current pending queue is ~75 % OffsiteApply, so most classification runs free.
 2. NIM returns 429 / rate-limit after N retries with backoff
 3. browser-use reports success but `verify_submission(page, job)` disagrees
 
-**`ScriptApplyEngine`** (547 LOC) is retired once the browser-use spike passes. **`apply_haiku.py`** + the Claude-in-Chrome apply path is deleted in Phase 1.
+**`ScriptApplyEngine`** (547 LOC) — retired in T16b (PR 1); the step loop is the single OffsiteApply engine. **`apply_haiku.py`** + the Claude-in-Chrome apply path is deleted in Phase 1.
 
 **Decomposition seams** for `_llm_guided_apply` (1,498 lines):
 `page_snapshot` · `decide_action` (the LLM call) · `execute_action` · `detect_terminal_state` (applied / dead-end / needs-human) · `handle_auth` (login + account creation + email verification).

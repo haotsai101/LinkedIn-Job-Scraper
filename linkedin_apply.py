@@ -2893,8 +2893,8 @@ class OffsiteApplyFlow:
           mode the step loop pauses for the user instead, so this returns ''.
 
         Cheap enough (one ``locator().count()`` + one ``innerText`` slice) to run
-        before the ScriptApplyEngine / summarize LLM calls so a walled job is
-        skipped without burning them.
+        before the ``_summarize_job`` LLM call so a walled job is skipped without
+        burning it.
         """
         try:
             if await page.locator(_CAPTCHA_WIDGET_SELECTOR).count() > 0:
@@ -2912,20 +2912,332 @@ class OffsiteApplyFlow:
                 pass
         return ""
 
+    # ── Static config for the step loop / seam helpers ────────────────────────
+    # Hoisted out of _llm_guided_apply so the extracted seams
+    # (_classify_domain, _handle_auth, _detect_terminal_state) share one copy.
+
+    # URL path prefixes that indicate a login / registration gate.
+    _LOGIN_PATHS = (
+        "/login", "/signin", "/sign-in", "/auth/login",
+        "/dashboard/login", "/register", "/create-account", "/join",
+    )
+    # Domains that are dead ends regardless of path (SSO login walls, enterprise portals).
+    _DEAD_END_DOMAINS = ("my.greenhouse.io",)
+    # Reasons in an LLM "failed" action that mean an unbeatable verification wall → skip.
+    _UNBLOCKABLE_WALL_KEYWORDS = ("persona", "identity", "verif", "captcha", "recaptcha")
+    # SSO / IdP hosts — handed to _handle_sso_page instead of the LLM loop.
+    _SSO_DOMAINS = (
+        "login.microsoftonline.com",   # Microsoft OIDC / SAML
+        "accounts.google.com",          # Google OAuth
+        "login.okta.com",               # Okta hosted login
+        "auth0.com",                    # Auth0
+        "onelogin.com",                 # OneLogin
+        "pingidentity.com",             # Ping Identity
+        "shibboleth",                   # Shibboleth (many academic/enterprise)
+    )
+    _CLOUDFLARE_SIGNALS = (
+        "performing security verification", "security service to protect",
+        "enable javascript and cookies", "ray id:",
+    )
+    _EXPIRED_URL_PATTERNS = (
+        "/second-chance", "/job-expired", "/job-not-found", "/404", "/error",
+        "ns_inactive_job=1", "inactive_job",
+    )
+    _EXPIRED_TEXT_PHRASES = (
+        "no longer available", "opportunity is no longer", "position has been filled",
+        "listing expired", "job has been filled", "this job is no longer", "job is closed",
+        "no longer accepting applications", "job not found", "error: job not found",
+        "this position has been", "this role has been filled",
+        "no longer active", "posting is no longer", "job posting has expired",
+        "this posting has been removed", "job has expired",
+    )
+    # Job aggregators / contractor-only / broken sites — not real employer apply flows, skip permanently.
+    _SPAM_DOMAINS = (
+        "jobright.ai",                  # aggregator — requires Jobright account to apply
+        "sundayy.com",                  # aggregator — requires account
+        "scale.jobs",                   # aggregator — requires account
+        "dice.com",                     # aggregator — OAuth redirects to wrong page
+        "mercor.com",                   # aggregator — behind account login
+        "remotehunter.com",             # aggregator — "Apply" navigates to homepage login wall
+        "haystack.cv",                  # aggregator — behind account login wall
+        "talentally.com",               # aggregator — pre-registered account only
+        "micro1.ai",                    # aggregator
+        "tenex.ai",                     # aggregator
+        "bestjobtool.com",              # aggregator — /job-description-usb/ path; script engine fails
+        "fetchjobs.co",                 # aggregator — /job-description-usb/ path; React EEO timeouts
+        "alignerr.com",                 # contractor — Google/LinkedIn OAuth only, no email registration
+        "app.dataannotation.tech",      # contractor — /worker_signup is registration, not a job apply form
+        "peakperformers.org",           # broken — apply form not on page, LLM hallucinates nav selector
+        "sourcehire.app",               # broken — "Apply to this role" button does not navigate
+        "jobs.gainwelltechnologies.com", # broken — portal loops back to job search, no direct apply form
+    )
+    # Real listings on ATS platforms / employer portals where auto-apply is blocked (CAPTCHA, account
+    # wall, chatbot, invisible SPA modal). Marked blocked (-3) so a human picks them up; no auto-retry.
+    # Checked at domain level so Workday's /apply/applyManually (not a login URL) is caught too.
+    _BLOCKED_AUTO_APPLY_DOMAINS = (
+        # reCAPTCHA / technical blockers the agent cannot overcome
+        "governmentjobs.com",           # NEOGOV — account + CAPTCHA required
+        "zohorecruit.com",              # Zoho Recruit — CAPTCHA blocks submission
+        "applytojob.com",               # ApplyToJob — reCAPTCHA on landing form
+        "hirebridge.com",               # HireBridge — hidden inputs + reCAPTCHA
+        "hackajob.com",                 # hackajob — email gate + reCAPTCHA
+        "jobs.twilio.com",              # Twilio — hidden g-recaptcha-response
+        "burtchworks.com",              # Burtch Works — React form fills don't persist
+        "jobs.cvshealth.com",           # CVS Health Phenom chatbot — navigation fails
+        "amazon.jobs",                  # Amazon portal — duplicate invisible fields
+        # Company career pages backed by reCAPTCHA (Greenhouse)
+        "careers.airbnb.com",
+        "www.pinterestcareers.com",
+        # Company sites requiring account login
+        "apply.careers.microsoft.com",  # Requires Microsoft account
+        "ycombinator.com",              # YC Work — SSO only
+        # ATS platforms with invisible SPA login modals (Apply opens overlay Playwright can't inspect)
+        "myworkdayjobs.com", "myworkdaysite.com",   # Workday
+        "ultipro.com",                              # UltiPro/UKG
+        "bamboohr.com",                             # BambooHR
+        "icims.com",                                # iCIMS
+        "jibeapply.com",                            # Jibe/Jobvite
+        "taleo.net",                                # Oracle Taleo
+        "paycomonline.net",                         # Paycom
+        "recruitingbypaycor.com",                   # Paycor
+        "yourpayrollhr.com",                        # Paycor-based
+        "oraclecloud.com",                          # Oracle HCM
+        "jobvite.com",                              # Jobvite
+        "recruiting.paylocity.com",                 # Paylocity
+        "etscareers.submit4jobs.com",               # ETS careers
+        # Career pages / ATSes where Apply form is inaccessible headlessly
+        "talent.fullstack.com",                     # FullStack — invisible modal
+        "careers-page.com",                         # Careers Page ATS
+        "careers.bigbear.ai",                       # BigBear.ai — only Search inputs visible
+        "careers.rideuta.com",                      # Utah Transit Authority — no Apply button
+        "entertimeonline.com",                      # EnterTime ATS — only Search field
+        "butterflymx.com",                          # ButterflyMX — Ashby embed, only Search visible
+        "www.seismic.com",                          # Seismic — embedded form, URL never changes
+        "hiringthing.com",                          # HiringThing ATS — stuck on listing page
+    )
+
+    @staticmethod
+    def _domain_matches(netloc: str, pattern: str) -> bool:
+        # Exact suffix match — prevents "fetchjobs.co" matching "fetchjobs.com", etc.
+        return netloc == pattern or netloc.endswith("." + pattern)
+
+    # ── Seam: page_snapshot ──────────────────────────────────────────────────
+    async def _page_snapshot(self, page: Page) -> dict:
+        """Structured representation of the current page for the LLM: URL, visible
+        (in-viewport) text, form fields with their current values, and buttons.
+
+        Thin wrapper over the DOM-walk in :meth:`_get_page_snapshot` — kept as a
+        named seam so the orchestrator and tests have one entry point.
+        """
+        return await self._get_page_snapshot(page)
+
+    # ── Seam: decide_action ─────────────────────────────────────────────────
+    async def _decide_action(
+        self, snapshot: dict, step: int, history: list[str] | None = None, *,
+        current_url: str = "", job_summary: str = "",
+        context_notes: list[str] | None = None, override_filled: dict | None = None,
+    ) -> dict:
+        """One ``llm.query`` round-trip: snapshot + context in, next action dict out.
+
+        Pure-ish — given fixed inputs it makes exactly one LLM call and parses the
+        result. Delegates to :meth:`_ask_llm_action`; isolated here for testing.
+        """
+        return await self._ask_llm_action(
+            snapshot, step, history, current_url=current_url,
+            job_summary=job_summary, context_notes=context_notes,
+            override_filled=override_filled,
+        )
+
+    # ── Seam: detect_terminal_state ────────────────────────────────────────
+    def _classify_domain(self, netloc: str, *, include_dead_end: bool = False) -> str | None:
+        """Classify a hostname against the static block lists.
+
+        Returns ``"skipped"`` (spam/aggregator), ``"blocked"`` (un-automatable
+        ATS / SSO dead-end → ``applied=-3``, no auto-retry), or ``None`` when the
+        domain is fine to proceed on. ``include_dead_end`` adds the substring
+        match against :data:`_DEAD_END_DOMAINS` used only for mid-flow redirects.
+        """
+        netloc = netloc.lower()
+        if include_dead_end and any(d in netloc for d in self._DEAD_END_DOMAINS):
+            return "blocked"
+        if any(self._domain_matches(netloc, d) for d in self._SPAM_DOMAINS):
+            return "skipped"
+        if any(self._domain_matches(netloc, d) for d in self._BLOCKED_AUTO_APPLY_DOMAINS):
+            return "blocked"
+        return None
+
+    async def _detect_expired(self, page: Page, *, check_url: bool = True,
+                              text_len: int = 800) -> str | None:
+        """Return ``"expired"`` if the page is a closed / removed / not-found job
+        posting, else ``None``. ``check_url`` also matches the URL against
+        :data:`_EXPIRED_URL_PATTERNS`; ``text_len`` caps the body-text slice read.
+        """
+        if check_url and any(p in page.url.lower() for p in self._EXPIRED_URL_PATTERNS):
+            return "expired"
+        try:
+            txt = (await page.evaluate(
+                f"() => (document.body.innerText || '').slice(0, {int(text_len)})"
+            )).lower()
+        except Exception:
+            return None
+        if any(p in txt for p in self._EXPIRED_TEXT_PHRASES):
+            return "expired"
+        return None
+
+    async def _detect_terminal_state(self, page: Page, *, step: int) -> str | None:
+        """Mid-loop classifier for walls that appear *after* the Apply click and
+        are not domain- or auth-based: a live reCAPTCHA/hCaptcha widget, a
+        Cloudflare interstitial, expired-job text, and the Greenhouse text
+        "security code" challenge.
+
+        Returns a terminal status (``"skipped"`` / ``"expired"``) or ``None`` to
+        keep looping. In interactive mode a Greenhouse security challenge pauses
+        for the human and then returns ``None``; in ``--auto`` it returns
+        ``"skipped"`` (a bare ``input()`` would wedge the event loop and the
+        outer ``asyncio.wait_for`` guard forever).
+        """
+        # reCAPTCHA / hCaptcha widget loaded into the form
+        try:
+            if await page.locator(_CAPTCHA_WIDGET_SELECTOR).count() > 0:
+                print("  [LLM] reCAPTCHA detected mid-loop — cannot submit, skipping")
+                return "skipped"
+        except Exception:
+            pass
+
+        # Cloudflare bot-gate + "job no longer available" after a navigation
+        if step > 0:
+            try:
+                _mid_text = (await page.evaluate(
+                    "() => (document.body.innerText || '').slice(0, 400)"
+                )).lower()
+                if any(s in _mid_text for s in self._CLOUDFLARE_SIGNALS):
+                    print("  [LLM] Cloudflare security wall detected mid-loop — skipping")
+                    return "skipped"
+                if any(p in _mid_text for p in self._EXPIRED_TEXT_PHRASES):
+                    print("  [LLM] Expired job text detected mid-loop — skipping")
+                    return "expired"
+            except Exception:
+                pass
+
+        # Greenhouse text "security code" bot wall — host-gated (the phrases
+        # overlap the legitimate account-creation email-verification step).
+        if "greenhouse.io" in urlparse(page.url).netloc.lower():
+            try:
+                _gh_text = (await page.evaluate(
+                    "() => (document.body.innerText || '').slice(0, 800)"
+                )).lower()
+                if any(s in _gh_text for s in _GREENHOUSE_SECURITY_SIGNALS):
+                    if self.auto_mode:
+                        print(f"  [LLM] Greenhouse security challenge at {page.url} — "
+                              f"cannot solve in --auto, skipping")
+                        return "skipped"
+                    print(f"\n  [LLM] ⚠ Greenhouse security check detected at {page.url}")
+                    print("  [LLM] Please solve the security challenge in the browser, "
+                          "then press Enter to continue...")
+                    try:
+                        input("  Press Enter when done: ")
+                    except EOFError:
+                        pass
+                    print("  [LLM] Resuming after security challenge...")
+                    await asyncio.sleep(1)
+            except Exception:
+                pass
+        return None
+
+    # ── Seam: handle_auth ─────────────────────────────────────────────────
+    # Return protocol for _handle_auth:
+    #   None            → not an auth page; the orchestrator proceeds normally
+    #   "__continue__"  → auth handled; the orchestrator should `continue` (re-snapshot)
+    #   "__proceed__"   → logged in mid-form; proceed in the SAME iteration
+    #   other str       → terminal status ("skipped" / "failed" / "blocked")
+    _AUTH_CONTINUE = "__continue__"
+    _AUTH_PROCEED = "__proceed__"
+
+    async def _handle_auth(self, page: Page, *, phase: str) -> str | None:
+        """Login walls, SSO redirects and mid-form password gates.
+
+        ``phase="url"`` (before the snapshot): SSO / IdP redirects go to
+        :meth:`_handle_sso_page`; a ``_LOGIN_PATHS`` URL goes to
+        :meth:`_handle_auth_page` (which checks stored credentials, tries
+        "Continue with LinkedIn", and — via :meth:`_try_register` /
+        :meth:`_fill_registration_form` / ``EmailInbox`` — can create an
+        account). ``phase="form"`` (after the snapshot): a bare
+        ``input[type=password]`` on the page is a login gate — try stored
+        credentials, else it needs a human.
+
+        Preserves the T34/T35 blocked-vs-failed split exactly: "no credentials
+        exist / domain is a dead end" → ``"blocked"`` (-3); "stored credentials
+        exist but the login attempt itself failed" → ``"failed"`` (-2).
+        """
+        _url = page.url.lower()
+        _url_domain = urlparse(_url).netloc
+
+        if phase == "url":
+            _is_sso = any(s in _url_domain for s in self._SSO_DOMAINS) or ".okta.com" in _url_domain
+            if _is_sso:
+                if self._auth_attempted:
+                    print(f"  [LLM] SSO auth already attempted on {_url_domain} — skipping")
+                    return "skipped"
+                self._auth_attempted = True
+                print(f"  [LLM] SSO redirect detected ({_url_domain}) — invoking sign-in flow")
+                ok = await self._handle_sso_page(page)
+                if not ok:
+                    print(f"  [LLM] SSO sign-in failed on {_url_domain} — skipping")
+                    return "skipped"
+                await asyncio.sleep(2)
+                return self._AUTH_CONTINUE
+
+            _url_path = urlparse(_url).path
+            if any(_url_path == p or _url_path.startswith(p + "/") or _url_path.startswith(p + "?")
+                   for p in self._LOGIN_PATHS):
+                if self._auth_attempted:
+                    print("  [LLM] Auth already attempted — giving up")
+                    return "failed"
+                self._auth_attempted = True
+                ok = await self._handle_auth_page(page)
+                if ok is not True:
+                    _auth_domain = urlparse(page.url).netloc.lower()
+                    if ok == "failed":
+                        # Stored credentials exist but the login attempt itself failed
+                        # (transient / 2FA / rate-limit) — retryable, not a dead end.
+                        print(f"  [LLM] Login with stored credentials failed for "
+                              f"{_auth_domain} — marking failed")
+                        return "failed"
+                    print(f"  [LLM] Login wall on {_auth_domain} — needs a human, "
+                          f"marking blocked (no auto-retry)")
+                    return "blocked"
+                await asyncio.sleep(2)
+                return self._AUTH_CONTINUE
+            return None
+
+        # phase == "form": mid-loop password-field login wall
+        try:
+            _pwd_fields = await page.locator("input[type='password']").count()
+        except Exception:
+            return None
+        if _pwd_fields <= 0:
+            return None
+        _cur_domain = urlparse(page.url).netloc.lower()
+        existing = _find_account_for_domain(_cur_domain)
+        if existing:
+            if await self._try_login(page, existing["email"], existing["password"]):
+                return self._AUTH_PROCEED   # logged in — keep going this iteration
+            print(f"  [LLM] Login with stored credentials failed for {_cur_domain} — marking failed")
+            return "failed"
+        print(f"  [LLM] Login wall detected (password field) on {_cur_domain} — needs a human, "
+              f"marking blocked (no auto-retry)")
+        return "blocked"
+
     async def _llm_guided_apply(self, page: Page) -> str:
         """
-        LLM-guided application loop.
-        At each step: snapshot page → ask LLM → execute action → log → repeat.
-        Returns 'applied' | 'failed'.
+        LLM-guided application loop (the single OffsiteApply engine).
+
+        Thin orchestrator over the seams: ``_page_snapshot`` → ``_detect_terminal_state``
+        / ``_classify_domain`` / ``_handle_auth`` → ``_decide_action`` → execute →
+        repeat, with loop-guard / repeat-action / max-step logic preserved.
+        Returns 'applied' | 'skipped' | 'failed' | 'blocked' | 'expired'.
         """
-        auth_attempted = False
-        _login_paths = (
-            "/login", "/signin", "/sign-in", "/auth/login",
-            "/dashboard/login", "/register", "/create-account", "/join",
-        )
-        # Domains that are dead ends regardless of path (SSO login walls, enterprise portals)
-        _dead_end_domains = ("my.greenhouse.io",)
-        _unblockable = ("persona", "identity", "verif", "captcha", "recaptcha")
+        self._auth_attempted = False
         action_history: list[str] = []
         context_notes: list[str] = []   # per-step observations from the LLM, accumulated as running context
         prev_url = ""
@@ -2940,87 +3252,18 @@ class OffsiteApplyFlow:
         # whose visible input is cleared by site JS. Tracked here so the LLM sees them as FILLED.
         _forced_filled: dict[str, str] = {}
 
-        def _domain_matches(netloc: str, pattern: str) -> bool:
-            # Exact suffix match — prevents "fetchjobs.co" matching "fetchjobs.com", etc.
-            return netloc == pattern or netloc.endswith("." + pattern)
-
-        # Job aggregators and contractor-only/broken sites — not real employer apply flows, skip permanently.
-        _spam_domains = (
-            "jobright.ai",                  # aggregator — requires Jobright account to apply
-            "sundayy.com",                  # aggregator — requires account
-            "scale.jobs",                   # aggregator — requires account
-            "dice.com",                     # aggregator — OAuth redirects to wrong page
-            "mercor.com",                   # aggregator — behind account login
-            "remotehunter.com",             # aggregator — "Apply" navigates to homepage login wall
-            "haystack.cv",                  # aggregator — behind account login wall
-            "talentally.com",               # aggregator — pre-registered account only
-            "micro1.ai",                    # aggregator
-            "tenex.ai",                     # aggregator
-            "bestjobtool.com",              # aggregator — /job-description-usb/ path; script engine fails
-            "fetchjobs.co",                 # aggregator — /job-description-usb/ path; React EEO timeouts
-            "alignerr.com",                 # contractor — Google/LinkedIn OAuth only, no email registration
-            "app.dataannotation.tech",      # contractor — /worker_signup is registration, not a job apply form
-            "peakperformers.org",           # broken — apply form not on page, LLM hallucinates nav selector
-            "sourcehire.app",               # broken — "Apply to this role" button does not navigate
-            "jobs.gainwelltechnologies.com", # broken — portal loops back to job search, no direct apply form
-        )
-
-        # Real job listings on ATS platforms or employer portals where auto-apply is blocked (CAPTCHA,
-        # account wall, chatbot, etc.). Marked failed so they surface in the manual queue for human review.
-        # Checked at domain level so Workday's /apply/applyManually (not a login URL) is caught too.
-        _blocked_auto_apply_domains = (
-            # reCAPTCHA / technical blockers the agent cannot overcome
-            "governmentjobs.com",           # NEOGOV — account + CAPTCHA required
-            "zohorecruit.com",              # Zoho Recruit — CAPTCHA blocks submission
-            "applytojob.com",               # ApplyToJob — reCAPTCHA on landing form
-            "hirebridge.com",               # HireBridge — hidden inputs + reCAPTCHA
-            "hackajob.com",                 # hackajob — email gate + reCAPTCHA
-            "jobs.twilio.com",              # Twilio — hidden g-recaptcha-response
-            "burtchworks.com",              # Burtch Works — React form fills don't persist
-            "jobs.cvshealth.com",           # CVS Health Phenom chatbot — navigation fails
-            "amazon.jobs",                  # Amazon portal — duplicate invisible fields
-            # Company career pages backed by reCAPTCHA (Greenhouse)
-            "careers.airbnb.com",
-            "www.pinterestcareers.com",
-            # Company sites requiring account login
-            "apply.careers.microsoft.com",  # Requires Microsoft account
-            "ycombinator.com",              # YC Work — SSO only
-            # ATS platforms with invisible SPA login modals (Apply opens overlay Playwright can't inspect)
-            "myworkdayjobs.com", "myworkdaysite.com",   # Workday
-            "ultipro.com",                              # UltiPro/UKG
-            "bamboohr.com",                             # BambooHR
-            "icims.com",                                # iCIMS
-            "jibeapply.com",                            # Jibe/Jobvite
-            "taleo.net",                                # Oracle Taleo
-            "paycomonline.net",                         # Paycom
-            "recruitingbypaycor.com",                   # Paycor
-            "yourpayrollhr.com",                        # Paycor-based
-            "oraclecloud.com",                          # Oracle HCM
-            "jobvite.com",                              # Jobvite
-            "recruiting.paylocity.com",                 # Paylocity
-            "etscareers.submit4jobs.com",               # ETS careers
-            # Career pages / ATSes where Apply form is inaccessible headlessly
-            "talent.fullstack.com",                     # FullStack — invisible modal
-            "careers-page.com",                         # Careers Page ATS
-            "careers.bigbear.ai",                       # BigBear.ai — only Search inputs visible
-            "careers.rideuta.com",                      # Utah Transit Authority — no Apply button
-            "entertimeonline.com",                      # EnterTime ATS — only Search field
-            "butterflymx.com",                          # ButterflyMX — Ashby embed, only Search visible
-            "www.seismic.com",                          # Seismic — embedded form, URL never changes
-            "hiringthing.com",                          # HiringThing ATS — stuck on listing page
-        )
-
         _landing_domain = urlparse(page.url).netloc.lower()
-        if any(_domain_matches(_landing_domain, d) for d in _spam_domains):
+        _pre = self._classify_domain(_landing_domain)
+        if _pre == "skipped":
             print(f"  [LLM] Spam/aggregator domain ({_landing_domain}) — skipping")
             return "skipped"
-        if any(_domain_matches(_landing_domain, d) for d in _blocked_auto_apply_domains):
+        if _pre == "blocked":
             print(f"  [LLM] Blocked auto-apply domain ({_landing_domain}) — needs a human, "
                   f"marking blocked (no auto-retry)")
             return "blocked"
 
         # Lever listing-page fast-path: jobs.lever.co/<company>/<id> is a listing page with no form.
-        # Append /apply to navigate directly to the application form, skipping a wasted ScriptEngine call.
+        # Append /apply to navigate directly to the application form, saving a wasted step-loop iteration.
         if "jobs.lever.co" in _landing_domain and _is_job_listing_url(page.url):
             _lever_apply_url = page.url.rstrip("/") + "/apply"
             print(f"  [LLM] Lever listing page detected — navigating to {_lever_apply_url}")
@@ -3054,60 +3297,26 @@ class OffsiteApplyFlow:
                 return "skipped"
 
         # Check immediately if the landing page shows an expired/unavailable job.
-        # URL check runs first (never throws); text check is separate so a JS error can't suppress the URL check.
-        _expired_url_patterns = ("/second-chance", "/job-expired", "/job-not-found", "/404", "/error",
-                                  "ns_inactive_job=1", "inactive_job")
-        _expired_text_phrases = (
-            "no longer available", "opportunity is no longer", "position has been filled",
-            "listing expired", "job has been filled", "this job is no longer", "job is closed",
-            "no longer accepting applications", "job not found", "error: job not found",
-            "this position has been", "this role has been filled",
-            "no longer active", "posting is no longer", "job posting has expired",
-            "this posting has been removed", "job has expired",
-        )
-        if any(p in page.url.lower() for p in _expired_url_patterns):
+        if any(p in page.url.lower() for p in self._EXPIRED_URL_PATTERNS):
             print(f"  [LLM] Landing URL indicates expired job ({page.url}) — skipping")
             return "expired"
-        try:
-            _landing_text = (await page.evaluate("() => (document.body.innerText || '').slice(0, 800)")).lower()
-            if any(p in _landing_text for p in _expired_text_phrases):
-                print(f"  [LLM] Landing page text indicates expired job — skipping")
-                return "expired"
-        except Exception as _e:
-            print(f"  [LLM] Warning: could not read landing page text for expired check ({_e})")
+        if await self._detect_expired(page, check_url=False):
+            print(f"  [LLM] Landing page text indicates expired job — skipping")
+            return "expired"
 
-        # Bot-wall pre-check: skip BEFORE the ScriptApplyEngine full-DOM read and
-        # the _summarize_job LLM call — a CAPTCHA-walled job can't be submitted no
-        # matter how good the generated script is.
+        # Bot-wall pre-check: skip BEFORE the _summarize_job LLM call — a
+        # CAPTCHA-walled job can't be submitted no matter what we do next.
         _wall = await self._detect_bot_wall(page)
         if _wall:
             print(f"  [LLM] {_wall} on landing form — cannot proceed, skipping")
             return "skipped"
 
-        # Script-generation engine: reads full DOM and generates a complete Playwright
-        # script per page. Runs first; falls back to step loop on failure.
-        try:
-            from script_engine import ScriptApplyEngine as _ScriptEngine
-            _ce = _ScriptEngine(
-                profile=self.profile,
-                context=self.context,
-                company_name=self.company_name,
-                job_title=self.job_title,
-            )
-            _cr = await _ce.apply(page)
-            print(f"  [Script] Engine result: {_cr}")
-            if _cr != "failed":
-                return _cr
-            print("  [Script] Engine returned failed — falling back to step loop")
-        except Exception as _ce_err:
-            print(f"  [Script] Engine error ({_ce_err}) — falling back to step loop")
-
         # Summarize job before entering the step loop — gives the LLM stable context about the role
         job_summary = await self._summarize_job()
         print(f"  [LLM] Job summary: {job_summary[:120]}{'...' if len(job_summary) > 120 else ''}")
 
-        # Re-run the bot-wall check: the ScriptApplyEngine may have navigated to a
-        # new page (e.g. a CAPTCHA step) since the pre-check above.
+        # Re-run the bot-wall check: navigation done above (Lever /apply,
+        # Greenhouse embed) may have landed on a new page (e.g. a CAPTCHA step).
         _wall = await self._detect_bot_wall(page)
         if _wall:
             print(f"  [LLM] {_wall} before step loop — cannot submit, skipping")
@@ -3161,68 +3370,25 @@ class OffsiteApplyFlow:
             _elapsed = int((datetime.now(timezone.utc) - _session_start).total_seconds())
             print(f"  [LLM] Step {step + 1} (+{_elapsed}s) — {current_url}")
 
-            # Auth wall (URL-based) — match against path segments to avoid false positives
-            # e.g. /joinroot/ should NOT match /join; /signup-flow should NOT match /signup
+            # Mid-flow redirect into a dead-end / spam / blocked domain
+            # (e.g. Dynatrace → SuccessFactors, my.greenhouse.io SSO wall).
             _url_domain = urlparse(current_url.lower()).netloc
-            if any(dead in _url_domain for dead in _dead_end_domains):
-                print(f"  [LLM] Landed on dead-end domain ({_url_domain}) — needs a human, "
-                      f"marking blocked (no auto-retry)")
-                return "blocked"
-
-            # Mid-flow redirect to blocked domain (e.g. Dynatrace → SuccessFactors)
-            if any(_domain_matches(_url_domain, d) for d in _spam_domains):
+            _mid = self._classify_domain(_url_domain, include_dead_end=True)
+            if _mid == "skipped":
                 print(f"  [LLM] Redirected to spam/aggregator domain mid-flow ({_url_domain}) — skipping")
                 return "skipped"
-            if any(_domain_matches(_url_domain, d) for d in _blocked_auto_apply_domains):
-                print(f"  [LLM] Redirected to blocked ATS mid-flow ({_url_domain}) — needs a human, "
-                      f"marking blocked (no auto-retry)")
+            if _mid == "blocked":
+                print(f"  [LLM] Redirected to blocked / dead-end domain mid-flow ({_url_domain}) — "
+                      f"needs a human, marking blocked (no auto-retry)")
                 return "blocked"
 
-            # SSO / Identity Provider redirect — hand off to dedicated sign-in flow instead of LLM
-            _sso_domains = (
-                "login.microsoftonline.com",   # Microsoft OIDC / SAML
-                "accounts.google.com",          # Google OAuth
-                "login.okta.com",               # Okta hosted login
-                "auth0.com",                    # Auth0
-                "onelogin.com",                 # OneLogin
-                "pingidentity.com",             # Ping Identity
-                "shibboleth",                   # Shibboleth (many academic/enterprise)
-            )
-            _is_sso = any(s in _url_domain for s in _sso_domains) or ".okta.com" in _url_domain
-            if _is_sso:
-                if auth_attempted:
-                    print(f"  [LLM] SSO auth already attempted on {_url_domain} — skipping")
-                    return "skipped"
-                auth_attempted = True
-                print(f"  [LLM] SSO redirect detected ({_url_domain}) — invoking sign-in flow")
-                ok = await self._handle_sso_page(page)
-                if not ok:
-                    print(f"  [LLM] SSO sign-in failed on {_url_domain} — skipping")
-                    return "skipped"
-                await asyncio.sleep(2)
+            # Auth walls (URL-based): SSO / IdP redirects and login/registration
+            # pages. Path segments are matched so /joinroot/ != /join, etc.
+            _auth = await self._handle_auth(page, phase="url")
+            if _auth == self._AUTH_CONTINUE:
                 continue
-
-            _url_path = urlparse(current_url.lower()).path
-            if any(_url_path == p or _url_path.startswith(p + "/") or _url_path.startswith(p + "?")
-                   for p in _login_paths):
-                if auth_attempted:
-                    print("  [LLM] Auth already attempted — giving up")
-                    return "failed"
-                auth_attempted = True
-                ok = await self._handle_auth_page(page)
-                if ok is not True:
-                    _auth_domain = urlparse(page.url).netloc.lower()
-                    if ok == "failed":
-                        # Stored credentials exist but the login attempt itself failed
-                        # (transient/2FA/rate-limit) — retryable, not a dead end.
-                        print(f"  [LLM] Login with stored credentials failed for "
-                              f"{_auth_domain} — marking failed")
-                        return "failed"
-                    print(f"  [LLM] Login wall on {_auth_domain} — needs a human, "
-                          f"marking blocked (no auto-retry)")
-                    return "blocked"
-                await asyncio.sleep(2)
-                continue
+            if _auth is not None:
+                return _auth
 
             # Dismiss cookie banners
             for _csel in (
@@ -3281,10 +3447,11 @@ class OffsiteApplyFlow:
                             prev_url = page.url
                             # Re-check blocked domains — deterministic click may have redirected into one
                             _post_nav_domain = urlparse(page.url).netloc.lower()
-                            if any(_domain_matches(_post_nav_domain, d) for d in _spam_domains):
+                            _post = self._classify_domain(_post_nav_domain)
+                            if _post == "skipped":
                                 print(f"  [LLM] Post-navigation spam domain ({_post_nav_domain}) — skipping")
                                 return "skipped"
-                            if any(_domain_matches(_post_nav_domain, d) for d in _blocked_auto_apply_domains):
+                            if _post == "blocked":
                                 print(f"  [LLM] Post-navigation blocked ATS ({_post_nav_domain}) — needs a human, "
                                       f"marking blocked (no auto-retry)")
                                 return "blocked"
@@ -3294,7 +3461,7 @@ class OffsiteApplyFlow:
 
             # Get page snapshot — retry up to 2× if page is blank (SPA still rendering)
             for _snap_try in range(3):
-                snapshot = await self._get_page_snapshot(page)
+                snapshot = await self._page_snapshot(page)
                 _snap_empty = (
                     not snapshot.get("fields") and not snapshot.get("buttons")
                     and len(snapshot.get("visible_text", "")) < 20
@@ -3311,72 +3478,18 @@ class OffsiteApplyFlow:
                 print("  [LLM] Page still blank after retries — skipping")
                 return "expired"
 
-            # Mid-loop login-wall check: if page has a password field, it's a login gate we can't pass
-            try:
-                _pwd_fields = await page.locator("input[type='password']").count()
-                if _pwd_fields > 0:
-                    _cur_domain = urlparse(page.url).netloc.lower()
-                    existing = _find_account_for_domain(_cur_domain)
-                    if existing:
-                        if await self._try_login(page, existing["email"], existing["password"]):
-                            pass  # logged in — continue loop
-                        else:
-                            print(f"  [LLM] Login with stored credentials failed for {_cur_domain} — marking failed")
-                            return "failed"
-                    else:
-                        print(f"  [LLM] Login wall detected (password field) on {_cur_domain} — needs a human, "
-                              f"marking blocked (no auto-retry)")
-                        return "blocked"
-            except Exception:
-                pass
+            # Mid-loop login-wall check: a password field is a login gate. Try
+            # stored credentials; else it needs a human.
+            _auth = await self._handle_auth(page, phase="form")
+            if _auth is not None and _auth != self._AUTH_PROCEED:
+                return _auth
 
-            # Mid-loop reCAPTCHA check: catch forms that load CAPTCHA after the Apply button click
-            try:
-                if await page.locator(_CAPTCHA_WIDGET_SELECTOR).count() > 0:
-                    print(f"  [LLM] reCAPTCHA detected mid-loop — cannot submit, skipping")
-                    return "skipped"
-            except Exception:
-                pass
-
-            # Mid-loop check: detect Cloudflare bot-gates and "job no longer available" after navigation
-            if step > 0:
-                try:
-                    _mid_text = (await page.evaluate("() => (document.body.innerText || '').slice(0, 400)")).lower()
-                    _cloudflare_signals = ("performing security verification", "security service to protect",
-                                          "enable javascript and cookies", "ray id:")
-                    if any(s in _mid_text for s in _cloudflare_signals):
-                        print(f"  [LLM] Cloudflare security wall detected mid-loop — skipping")
-                        return "skipped"
-                    if any(p in _mid_text for p in _expired_text_phrases):
-                        print(f"  [LLM] Expired job text detected mid-loop — skipping")
-                        return "expired"
-                except Exception:
-                    pass
-
-            # Greenhouse text "security code" bot wall: in --auto there is no one
-            # to type it and a bare input() would block the event loop (and the
-            # outer asyncio.wait_for that guards this whole flow) forever, so
-            # skip. In interactive mode, pause for the human.
-            _current_domain = urlparse(page.url).netloc.lower()
-            if "greenhouse.io" in _current_domain:
-                try:
-                    _gh_text = (await page.evaluate("() => (document.body.innerText || '').slice(0, 800)")).lower()
-                    if any(s in _gh_text for s in _GREENHOUSE_SECURITY_SIGNALS):
-                        if self.auto_mode:
-                            print(f"  [LLM] Greenhouse security challenge at {page.url} — "
-                                  f"cannot solve in --auto, skipping")
-                            return "skipped"
-                        print(f"\n  [LLM] ⚠ Greenhouse security check detected at {page.url}")
-                        print("  [LLM] Please solve the security challenge in the browser, "
-                              "then press Enter to continue...")
-                        try:
-                            input("  Press Enter when done: ")
-                        except EOFError:
-                            pass
-                        print("  [LLM] Resuming after security challenge...")
-                        await asyncio.sleep(1)
-                except Exception:
-                    pass
+            # Mid-loop walls that appear after the Apply click and aren't
+            # domain- or auth-based: live reCAPTCHA widget, Cloudflare gate,
+            # expired-job text, Greenhouse "security code" challenge.
+            _terminal = await self._detect_terminal_state(page, step=step)
+            if _terminal is not None:
+                return _terminal
 
             # Detect stuck pages using URL only — avoids false resets from cosmetic mutations
             # (e.g. "Add to favorites" → "Favorited" changes text but not URL)
@@ -3425,7 +3538,7 @@ class OffsiteApplyFlow:
                     print(f"  [verbose] Screenshot failed: {_se}")
 
             # Ask LLM (pass history + job context + running page notes for memory)
-            action = await self._ask_llm_action(
+            action = await self._decide_action(
                 snapshot, step, action_history,
                 current_url=page.url,
                 job_summary=job_summary,
@@ -3601,7 +3714,7 @@ class OffsiteApplyFlow:
                     print(f"  [LLM] Job reported as expired/closed ({reason}) — skipping")
                     return "expired"
                 # Detect unblockable verification walls
-                if any(k in reason.lower() for k in _unblockable):
+                if any(k in reason.lower() for k in self._UNBLOCKABLE_WALL_KEYWORDS):
                     print(f"  [LLM] Unblockable wall ({reason}) — skipping job")
                     return "skipped"
                 return "failed"
