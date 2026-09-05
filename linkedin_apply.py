@@ -2134,6 +2134,30 @@ class EasyApplyFlow:
 
 # ── OffsiteApplyFlow ───────────────────────────────────────────────────────────
 
+class _StepState:
+    """Mutable per-step context handed to :meth:`OffsiteApplyFlow._execute_action`.
+
+    * ``page`` — the live tab; ``_execute_action`` rebinds it when a non-submit
+      click opens a new tab, and the orchestrator loop must pick that up.
+    * ``selector`` — the action's CSS selector; the ``select`` branch normalises a
+      ``#<digit-id>`` to ``[id="…"]`` in place, and the loop's history entry uses
+      the normalised form (matches the pre-refactor inline behaviour).
+    * ``forced_filled`` — the shared dict of fields to treat as already filled
+      (jQuery-UI / React-Select commit to a hidden input and clear the visible
+      one); the same object the orchestrator passes to ``_decide_action``.
+    * ``submit_clicked`` — latches True once a real submit button is clicked;
+      ``verify_submission`` uses it to tell a real post-submit redirect from a
+      stray navigation.
+    """
+    __slots__ = ("page", "selector", "forced_filled", "submit_clicked")
+
+    def __init__(self, page, selector, forced_filled, submit_clicked):
+        self.page = page
+        self.selector = selector
+        self.forced_filled = forced_filled
+        self.submit_clicked = submit_clicked
+
+
 class OffsiteApplyFlow:
     """
     Drives an external company career site application.
@@ -3122,11 +3146,12 @@ class OffsiteApplyFlow:
                 if any(s in _mid_text for s in self._CLOUDFLARE_SIGNALS):
                     print("  [LLM] Cloudflare security wall detected mid-loop — skipping")
                     return "skipped"
-                if any(p in _mid_text for p in self._EXPIRED_TEXT_PHRASES):
-                    print("  [LLM] Expired job text detected mid-loop — skipping")
-                    return "expired"
             except Exception:
                 pass
+            # Expired-job text check shares _detect_expired (URL patterns skipped —
+            # a mid-loop redirect back to a listing URL is not an expiry signal).
+            if await self._detect_expired(page, check_url=False, text_len=400):
+                return "expired"
 
         # Greenhouse text "security code" bot wall — host-gated (the phrases
         # overlap the legitimate account-creation email-verification step).
@@ -3734,6 +3759,45 @@ class OffsiteApplyFlow:
                     return "skipped"
                 return "failed"
 
+            # ── Seam: execute the decided action (scroll/upload/fill/select/click) ──
+            _state = _StepState(page, selector, _forced_filled, _submit_clicked)
+            _exec_result = await self._execute_action(action_type, text, value, _state)
+            page = _state.page
+            selector = _state.selector          # `select` may normalise a #<digit> id
+            _submit_clicked = _state.submit_clicked
+            if _exec_result is not None:
+                return _exec_result
+
+            # Record action in history (keep last 10)
+            hist_entry = f"{action_type}:{selector or text}"
+            if value:
+                hist_entry += f"={value[:30]}"
+            action_history.append(hist_entry)
+            if len(action_history) > 10:
+                action_history = action_history[-10:]
+            last_action_type = action_type
+
+        print("  [LLM] Reached step limit without completion")
+        return "failed"
+
+    async def _execute_action(self, action_type: str, text: str, value: str,
+                              state: "_StepState") -> str | None:
+        """Seam: apply one decided action to the page — ``scroll`` / ``upload`` /
+        ``fill`` / ``select`` / ``click``. Verbatim extraction of the dispatch that
+        used to sit inline in :meth:`_llm_guided_apply`; no LLM call except the
+        React-Select decline-option picker (unchanged from the inline version).
+
+        Returns a terminal status (``"skipped"``, or whatever :meth:`_handle_submit`
+        returns for a submit click) to end the flow, or ``None`` to keep looping.
+        Threads mutable per-step context through ``state``: a non-submit click that
+        opens a new tab rebinds ``state.page``; the ``select`` branch normalises a
+        ``#<digit-id>`` selector in place (``state.selector``); ``forced_filled`` is
+        mutated directly; ``state.submit_clicked`` latches once a submit fires.
+        """
+        page = state.page
+        selector = state.selector
+        _forced_filled = state.forced_filled
+        try:
             if action_type == "scroll":
                 try:
                     await page.evaluate("window.scrollBy(0, window.innerHeight * 0.85)")
@@ -4509,7 +4573,7 @@ class OffsiteApplyFlow:
                     # Record that a submit was attempted — verify_submission uses
                     # this to distinguish a real post-submit redirect from a
                     # stray nav / premature "done".
-                    _submit_clicked = True
+                    state.submit_clicked = True
                     # Route submit-type buttons through ready_to_submit callback.
                     # If the button is aria-disabled (e.g. Rippling), JS-click it to trigger
                     # client-side validation errors instead — then let the LLM loop continue
@@ -4555,18 +4619,12 @@ class OffsiteApplyFlow:
                             continue
                     if not clicked:
                         print(f"  [LLM] Click target not found: {selector!r} / {text!r}")
-
-            # Record action in history (keep last 10)
-            hist_entry = f"{action_type}:{selector or text}"
-            if value:
-                hist_entry += f"={value[:30]}"
-            action_history.append(hist_entry)
-            if len(action_history) > 10:
-                action_history = action_history[-10:]
-            last_action_type = action_type
-
-        print("  [LLM] Reached step limit without completion")
-        return "failed"
+        finally:
+            # Terminal returns above unwind straight out; only the fall-through
+            # path needs the new-tab / normalised-selector rebinds synced back.
+            state.page = page
+            state.selector = selector
+        return None
 
     async def _fill_external_form(self, page: Page) -> str:
         return await self._llm_guided_apply(page)

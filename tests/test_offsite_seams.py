@@ -322,3 +322,332 @@ def test_decide_action_delegates_to_ask_llm_action(monkeypatch):
     assert seen["step"] == 4
     assert seen["history"] == ["click:#a"]
     assert seen["kw"]["job_summary"] == "S"
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# _execute_action / _StepState  (T16b PR 2)
+# ══════════════════════════════════════════════════════════════════════════
+#
+# The scroll/upload/fill/select/click dispatch inside _execute_action is a
+# byte-for-byte extraction of code that was inline in _llm_guided_apply (the
+# one intended change: `_submit_clicked = True` -> `state.submit_clicked =
+# True`). It has no pre-existing unit coverage — it needs a real browser. These
+# tests target the *seam boundary*: dispatch routing, terminal-return
+# propagation, and the mutable state plumbed via _StepState (page rebind on a
+# new tab, #<digit>-id selector normalisation, submit_clicked latch,
+# forced_filled shared-dict mutation).
+
+_SS = linkedin_apply._StepState
+
+
+class _ExecLoc:
+    """Configurable fake Locator for the exec dispatch. Records .click() calls."""
+
+    def __init__(self, *, count=1, visible=True, enabled=True, text="",
+                 attrs=None, tag="button", checked=False, input_value=""):
+        self._count = count
+        self._visible = visible
+        self._enabled = enabled
+        self._text = text
+        self._attrs = attrs or {}
+        self._tag = tag
+        self._checked = checked
+        self._input_value = input_value
+        self.clicks = []
+        self.filled = []
+        self.typed = []
+
+    @property
+    def first(self):
+        return self
+
+    def nth(self, _i):
+        return self
+
+    async def count(self):
+        return self._count
+
+    async def is_visible(self):
+        return self._visible
+
+    async def is_enabled(self):
+        return self._enabled
+
+    async def is_checked(self):
+        return self._checked
+
+    async def inner_text(self):
+        return self._text
+
+    async def input_value(self):
+        return self._input_value
+
+    async def get_attribute(self, name):
+        return self._attrs.get(name)
+
+    async def evaluate(self, js, *_a):
+        if "tagName" in js:
+            return self._tag
+        if "getAttribute('type')" in js or "el.type" in js:
+            return self._attrs.get("type", "")
+        if "aria-disabled" in js:
+            return self._attrs.get("aria-disabled") == "true"
+        return ""
+
+    async def click(self, **kw):
+        self.clicks.append(kw)
+
+    async def check(self):
+        self._checked = True
+
+    async def fill(self, v):
+        self.filled.append(v)
+
+    async def type(self, v, **_kw):
+        self.typed.append(v)
+
+    async def press(self, _key):
+        pass
+
+    async def select_option(self, **_kw):
+        pass
+
+    async def set_input_files(self, _p):
+        pass
+
+    async def wait_for(self, **_kw):
+        pass
+
+    async def scroll_into_view_if_needed(self):
+        pass
+
+
+class _ExecPage:
+    def __init__(self, url="https://jobs.acme.com/apply", *, locators=None):
+        self.url = url
+        self._locators = locators or {}
+        self.evaluated = []
+        self.default_loc = _ExecLoc(count=0)
+
+    def locator(self, selector):
+        for key, loc in self._locators.items():
+            if key in selector:
+                return loc
+        return self.default_loc
+
+    def get_by_label(self, *_a, **_kw):
+        return _ExecLoc(count=0)
+
+    async def evaluate(self, js, *_a):
+        self.evaluated.append(js)
+        return ""
+
+    async def wait_for_load_state(self, *_a, **_kw):
+        pass
+
+
+class _ExecCtxNewTab:
+    """context.expect_page(...) that yields a fresh tab (a click opened one)."""
+
+    def __init__(self, new_page):
+        self._new_page = new_page
+
+    def expect_page(self, timeout=3000):
+        np = self._new_page
+
+        class _CM:
+            async def __aenter__(self_):
+                return self_
+
+            async def __aexit__(self_, *_e):
+                return False
+
+            @property
+            def value(self_):
+                async def _get():
+                    return np
+                return _get()
+
+        return _CM()
+
+
+class _ExecCtxNoTab:
+    def expect_page(self, timeout=3000):
+        class _CM:
+            async def __aenter__(self_):
+                return self_
+
+            async def __aexit__(self_, *_e):
+                return False
+
+            @property
+            def value(self_):
+                async def _get():
+                    raise Exception("no new tab")
+                return _get()
+
+        return _CM()
+
+
+def _exec(flow, action_type, state, *, text="", value=""):
+    return _run(flow._execute_action(action_type, text, value, state))
+
+
+# ── _StepState ───────────────────────────────────────────────────────────
+
+def test_stepstate_holds_the_four_mutable_slots():
+    ff = {"x": "1"}
+    p = _ExecPage()
+    st = _SS(p, "#sel", ff, False)
+    assert st.page is p and st.selector == "#sel"
+    assert st.forced_filled is ff and st.submit_clicked is False
+
+
+# ── dispatch routing ─────────────────────────────────────────────────────
+
+def test_execute_scroll_calls_scrollby_and_returns_none():
+    page = _ExecPage()
+    st = _SS(page, "", {}, False)
+    assert _exec(_offsite(), "scroll", st) is None
+    assert any("scrollBy" in js for js in page.evaluated)
+
+
+def test_execute_unknown_action_type_is_a_noop():
+    page = _ExecPage()
+    st = _SS(page, "#whatever", {}, False)
+    assert _exec(_offsite(), "wait", st) is None
+    assert st.page is page and st.selector == "#whatever"
+
+
+# ── new-tab page rebind (the sharp edge) ─────────────────────────────────
+
+def test_execute_click_opening_new_tab_rebinds_state_page():
+    landing = _ExecPage("https://jobs.acme.com/listing")
+    new_tab = _ExecPage("https://ats.example.com/form")
+    nav_btn = _ExecLoc(count=1, visible=True, text="View posting", tag="a")
+    landing._locators = {"View posting": nav_btn, "a:has-text": nav_btn}
+    flow = _offsite()
+    flow.context = _ExecCtxNewTab(new_tab)
+    st = _SS(landing, 'a:has-text("View posting")', {}, False)
+    out = _exec(flow, "click", st, text="View posting")
+    assert out is None
+    assert st.page is new_tab            # orchestrator must see the new tab
+    assert st.submit_clicked is False
+
+
+def test_execute_click_no_new_tab_keeps_state_page():
+    landing = _ExecPage("https://jobs.acme.com/listing")
+    btn = _ExecLoc(count=1, visible=True, text="Show more", tag="button")
+    landing._locators = {"Show more": btn, "button:has-text": btn}
+    flow = _offsite()
+    flow.context = _ExecCtxNoTab()
+    st = _SS(landing, 'button:has-text("Show more")', {}, False)
+    assert _exec(flow, "click", st, text="Show more") is None
+    assert st.page is landing
+    assert btn.clicks  # it was clicked
+
+
+# ── submit-click: submit_clicked latch + _handle_submit propagation ──────
+
+def test_execute_click_submit_button_latches_and_returns_handle_submit(monkeypatch):
+    page = _ExecPage("https://ats.example.com/form")
+    submit_btn = _ExecLoc(count=1, visible=True, text="Submit application",
+                          tag="button", attrs={"aria-disabled": "false"})
+    form_inputs = _ExecLoc(count=3)
+    page._locators = {"Submit application": submit_btn,
+                      'button:has-text("Submit application")': submit_btn,
+                      "input:not(": form_inputs}
+
+    async def _fake_handle_submit(self, pg, btn):
+        return "applied"
+    _patch(monkeypatch, "_handle_submit", _fake_handle_submit)
+
+    flow = _offsite()
+    st = _SS(page, 'button:has-text("Submit application")', {}, False)
+    out = _exec(flow, "click", st, text="Submit application")
+    assert out == "applied"          # terminal — propagates out of the loop
+    assert st.submit_clicked is True  # latched for verify_submission corroboration
+
+
+def test_execute_click_disabled_submit_latches_but_continues(monkeypatch):
+    page = _ExecPage("https://ats.example.com/form")
+    submit_btn = _ExecLoc(count=1, visible=True, text="Submit application",
+                          tag="button", attrs={"aria-disabled": "true"})
+    form_inputs = _ExecLoc(count=2)
+    page._locators = {"Submit application": submit_btn,
+                      'button:has-text("Submit application")': submit_btn,
+                      "input:not(": form_inputs}
+
+    async def _boom_handle_submit(self, pg, btn):
+        raise AssertionError("_handle_submit must NOT be called for a disabled button")
+    _patch(monkeypatch, "_handle_submit", _boom_handle_submit)
+
+    flow = _offsite()
+    st = _SS(page, 'button:has-text("Submit application")', {}, False)
+    out = _exec(flow, "click", st, text="Submit application")
+    assert out is None               # loop continues so the LLM sees validation errors
+    assert st.submit_clicked is True
+
+
+# ── select: #<digit>-id selector normalisation into state.selector ───────
+
+def test_execute_select_normalises_digit_id_selector():
+    page = _ExecPage("https://ats.example.com/form")
+    page._locators = {'[id="12345"]': _ExecLoc(count=0)}  # not found -> no-op body
+    flow = _offsite()
+    st = _SS(page, "#12345", {}, False)
+    _exec(flow, "select", st, value="United States")
+    assert st.selector == '[id="12345"]'   # loop's history entry uses the normalised form
+
+
+def test_execute_select_plain_selector_unchanged():
+    page = _ExecPage("https://ats.example.com/form")
+    page._locators = {"#country": _ExecLoc(count=0)}
+    flow = _offsite()
+    st = _SS(page, "#country", {}, False)
+    _exec(flow, "select", st, value="United States")
+    assert st.selector == "#country"
+
+
+# ── fill: CAPTCHA-exception guard returns "skipped" ─────────────────────
+
+def test_execute_fill_captcha_exception_returns_skipped():
+    class _RaiseLoc(_ExecLoc):
+        async def count(self):
+            raise RuntimeError("hCaptcha challenge frame blocked the fill")
+
+    page = _ExecPage("https://ats.example.com/form")
+    page._locators = {"#name": _RaiseLoc()}
+    flow = _offsite()
+    st = _SS(page, "#name", {}, False)
+    assert _exec(flow, "fill", st, value="Jordan") == "skipped"
+
+
+# ── fill: forced_filled is the caller's dict, mutated in place ──────────
+
+def test_execute_fill_shares_forced_filled_dict():
+    # a React-Select combobox whose value commits internally -> forced_filled[id]
+    combo = _ExecLoc(count=1, visible=True, text="Prefer not to say", tag="input",
+                     attrs={"role": "combobox", "id": "eeo-gender"}, input_value="")
+    option = _ExecLoc(count=1, visible=True, text="Prefer not to say")
+    page = _ExecPage("https://ats.example.com/form")
+    page._locators = {"#eeo-gender": combo, '[id="eeo-gender"]': combo,
+                      'role="option"': option, "option": option}
+    ff = {}
+    flow = _offsite()
+    st = _SS(page, "#eeo-gender", ff, False)
+    _exec(flow, "fill", st, value="Prefer not to say")
+    assert st.forced_filled is ff            # same object, no reassignment
+    assert ff.get("eeo-gender") == "Prefer not to say"
+
+
+# ── T31/T32 numeric coercion stays in the orchestrator, unchanged ───────
+
+def test_coerce_numeric_answer_still_reduces_prose_to_bare_int():
+    # _execute_action does NOT touch this — it runs in _llm_guided_apply before
+    # the dispatch. Guard that the helper the orchestrator calls is intact.
+    out = linkedin_apply._coerce_numeric_answer(
+        "Rate your Python experience (1-10)",
+        "I'd rate my Python experience about an 8 out of 10", "text", {},
+    )
+    assert out == "8"
