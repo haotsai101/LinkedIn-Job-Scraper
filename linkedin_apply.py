@@ -2176,6 +2176,9 @@ class OffsiteApplyFlow:
         self.verbose = verbose
         self.inbox = inbox
         self.unanswered_fields: list[str] = []
+        # Reset at the top of each _llm_guided_apply run; declared here so the
+        # auth seams are safe to call standalone (tests, _fill_external_form).
+        self._auth_attempted = False
 
     _EXPIRED_PHRASES = [
         "No longer accepting applications",
@@ -3070,17 +3073,23 @@ class OffsiteApplyFlow:
                               text_len: int = 800) -> str | None:
         """Return ``"expired"`` if the page is a closed / removed / not-found job
         posting, else ``None``. ``check_url`` also matches the URL against
-        :data:`_EXPIRED_URL_PATTERNS`; ``text_len`` caps the body-text slice read.
+        :data:`_EXPIRED_URL_PATTERNS` (skipped mid-loop, where a redirect back to
+        a listing URL is not itself an expiry signal); ``text_len`` caps the
+        body-text slice read. The URL check runs first and never throws, so a JS
+        error in the text read can't suppress it.
         """
         if check_url and any(p in page.url.lower() for p in self._EXPIRED_URL_PATTERNS):
+            print(f"  [LLM] URL indicates expired job ({page.url}) — skipping")
             return "expired"
         try:
             txt = (await page.evaluate(
                 f"() => (document.body.innerText || '').slice(0, {int(text_len)})"
             )).lower()
-        except Exception:
+        except Exception as _e:
+            print(f"  [LLM] Warning: could not read page text for expired check ({_e})")
             return None
         if any(p in txt for p in self._EXPIRED_TEXT_PHRASES):
+            print("  [LLM] Page text indicates expired job — skipping")
             return "expired"
         return None
 
@@ -3210,23 +3219,32 @@ class OffsiteApplyFlow:
                 return self._AUTH_CONTINUE
             return None
 
-        # phase == "form": mid-loop password-field login wall
+        # phase == "form": mid-loop password-field login wall.
+        #
+        # master wrapped the whole probe + login attempt in ONE broad
+        # ``try: … except Exception: pass`` so any throw (a dead browser page
+        # mid-login, a locator error, a bad logins.csv row) was swallowed and
+        # the step loop continued — the job could still recover to "applied" on
+        # a later step. Preserve that: only the deliberate "failed" / "blocked"
+        # returns below are terminal; a genuine exception falls through to
+        # ``None`` (proceed this iteration).
         try:
             _pwd_fields = await page.locator("input[type='password']").count()
-        except Exception:
+            if _pwd_fields <= 0:
+                return None
+            _cur_domain = urlparse(page.url).netloc.lower()
+            existing = _find_account_for_domain(_cur_domain)
+            if existing:
+                if await self._try_login(page, existing["email"], existing["password"]):
+                    return self._AUTH_PROCEED   # logged in — keep going this iteration
+                print(f"  [LLM] Login with stored credentials failed for {_cur_domain} — marking failed")
+                return "failed"
+            print(f"  [LLM] Login wall detected (password field) on {_cur_domain} — needs a human, "
+                  f"marking blocked (no auto-retry)")
+            return "blocked"
+        except Exception as _auth_exc:
+            print(f"  [LLM] Mid-loop login-wall check errored ({_auth_exc}) — continuing")
             return None
-        if _pwd_fields <= 0:
-            return None
-        _cur_domain = urlparse(page.url).netloc.lower()
-        existing = _find_account_for_domain(_cur_domain)
-        if existing:
-            if await self._try_login(page, existing["email"], existing["password"]):
-                return self._AUTH_PROCEED   # logged in — keep going this iteration
-            print(f"  [LLM] Login with stored credentials failed for {_cur_domain} — marking failed")
-            return "failed"
-        print(f"  [LLM] Login wall detected (password field) on {_cur_domain} — needs a human, "
-              f"marking blocked (no auto-retry)")
-        return "blocked"
 
     async def _llm_guided_apply(self, page: Page) -> str:
         """
@@ -3296,12 +3314,9 @@ class OffsiteApplyFlow:
                 print(f"  [LLM] Could not navigate to Greenhouse direct URL ({_gh_e}) — skipping")
                 return "skipped"
 
-        # Check immediately if the landing page shows an expired/unavailable job.
-        if any(p in page.url.lower() for p in self._EXPIRED_URL_PATTERNS):
-            print(f"  [LLM] Landing URL indicates expired job ({page.url}) — skipping")
-            return "expired"
-        if await self._detect_expired(page, check_url=False):
-            print(f"  [LLM] Landing page text indicates expired job — skipping")
+        # Check immediately if the landing page shows an expired/unavailable job
+        # (URL patterns + body text — _detect_expired logs which one matched).
+        if await self._detect_expired(page):
             return "expired"
 
         # Bot-wall pre-check: skip BEFORE the _summarize_job LLM call — a

@@ -258,6 +258,42 @@ def test_handle_auth_form_password_stored_creds_login_fails_stays_failed(monkeyp
     assert _run(_offsite()._handle_auth(_Page(password_fields=1), phase="form")) == "failed"
 
 
+def test_handle_auth_form_try_login_exception_is_swallowed(monkeypatch):
+    """master wrapped the whole probe + login attempt in one broad
+    ``try/except Exception: pass`` — a throw from ``_try_login`` (dead browser
+    page mid-login) was swallowed and the step loop continued, so the job
+    could still recover to "applied" later. A raising ``_try_login`` must NOT
+    become a hard terminal -2; ``_handle_auth`` returns None (proceed)."""
+    monkeypatch.setattr(linkedin_apply, "_find_account_for_domain",
+                        lambda _d: {"email": "a@b.com", "password": "pw"})
+
+    async def _login_boom(self, page, email, password):
+        raise RuntimeError("Target page, context or browser has been closed")
+    _patch(monkeypatch, "_try_login", _login_boom)
+    assert _run(_offsite()._handle_auth(_Page(password_fields=1), phase="form")) is None
+
+
+def test_handle_auth_form_find_account_exception_is_swallowed(monkeypatch):
+    """Same broad-swallow contract for a throw from ``_find_account_for_domain``
+    (e.g. a malformed logins.csv row) — proceed, don't hard-fail the job."""
+    def _boom(_d):
+        raise RuntimeError("bad credentials file")
+    monkeypatch.setattr(linkedin_apply, "_find_account_for_domain", _boom)
+    assert _run(_offsite()._handle_auth(_Page(password_fields=1), phase="form")) is None
+
+
+# ── _handle_auth: _auth_attempted is initialised in __init__ ──────────────
+
+def test_auth_attempted_initialised_so_seams_are_callable_standalone():
+    """The ticket wants the seams independently callable. _handle_auth reads
+    self._auth_attempted; a freshly constructed flow (no _llm_guided_apply
+    run) must not AttributeError."""
+    off = _offsite()
+    assert off._auth_attempted is False
+    out = _run(off._handle_auth(_Page("https://jobs.acme.com/careers/1"), phase="url"))
+    assert out is None
+
+
 # ── _page_snapshot / _decide_action delegation ───────────────────────────
 
 def test_page_snapshot_delegates_to_get_page_snapshot(monkeypatch):

@@ -183,6 +183,30 @@ def test_login_wall_with_failing_stored_credentials_stays_failed(monkeypatch):
     assert out == "failed"
 
 
+def test_midflow_login_wall_try_login_exception_does_not_hard_fail(monkeypatch):
+    """T16b regression: master wrapped the whole mid-loop login-wall block
+    (probe + _find_account_for_domain + _try_login) in one broad
+    ``try/except Exception: pass`` — a throw from _try_login (a dead browser
+    page mid-login is realistic) was swallowed and the loop continued. The
+    extracted _handle_auth must keep that: _llm_guided_apply must NOT let the
+    exception propagate out to run_session (which would hard-map it to
+    applied=-2), it should fall through and let the loop run its course."""
+    _install_common(monkeypatch)
+    monkeypatch.setattr(linkedin_apply, "_find_account_for_domain",
+                        lambda _d: {"email": "a@b.com", "password": "pw"})
+
+    async def _login_boom(self, page, email, password):
+        raise RuntimeError("Target page, context or browser has been closed")
+    monkeypatch.setattr(linkedin_apply.OffsiteApplyFlow, "_try_login", _login_boom)
+
+    page = _FakePage("https://jobs.acme.com/careers/123/apply", password_fields=1)
+    flow = _offsite()
+    out = asyncio.run(flow._llm_guided_apply(page))  # must not raise
+    # falls through to the step loop; the stubbed LLM can't drive the form, so
+    # the loop ends on its own terms — the point is it did NOT propagate.
+    assert out in ("failed", "expired", "skipped")
+
+
 # ── 4)-5) T35 — pre-flight login-path check (:3212-3217), not the mid-loop
 #            password-field check above. Reached when the page URL's *path*
 #            matches a known login route (e.g. "/login") rather than via a
