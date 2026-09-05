@@ -126,7 +126,32 @@ def test_detect_expired_check_url_false_ignores_url_pattern():
     assert _run(_offsite()._detect_expired(p, check_url=False)) is None
 
 
+def test_detect_expired_uses_supplied_body_text_without_reading_page():
+    """When the caller passes body_text, _detect_expired does no page.evaluate
+    (the mid-loop path shares its Cloudflare read) and stays silent on a
+    would-be read failure."""
+    p = _Page(evaluate_raises=True)  # any internal read would blow up / warn
+    assert _run(_offsite()._detect_expired(
+        p, check_url=False, body_text="This job is no longer accepting applications")) == "expired"
+    assert _run(_offsite()._detect_expired(
+        p, check_url=False, body_text="")) is None          # empty = read failed upstream, silent
+
+
 # ── _detect_terminal_state ────────────────────────────────────────────────
+
+def test_terminal_state_step_gt_zero_reads_body_text_once():
+    """One page.evaluate for step>0 (shared by the Cloudflare check and the
+    expired check) — was 2 in the first PR-2 draft."""
+    p = _Page(body_text="First name Last name")
+    p._reads = 0
+    _orig = p.evaluate
+
+    async def _counting(js):
+        p._reads += 1
+        return await _orig(js)
+    p.evaluate = _counting
+    assert _run(_offsite()._detect_terminal_state(p, step=2)) is None
+    assert p._reads == 1
 
 def test_terminal_state_recaptcha_widget_returns_skipped():
     assert _run(_offsite()._detect_terminal_state(_Page(captcha=1), step=2)) == "skipped"

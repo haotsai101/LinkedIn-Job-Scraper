@@ -3094,25 +3094,33 @@ class OffsiteApplyFlow:
         return None
 
     async def _detect_expired(self, page: Page, *, check_url: bool = True,
-                              text_len: int = 800) -> str | None:
+                              text_len: int = 800,
+                              body_text: str | None = None) -> str | None:
         """Return ``"expired"`` if the page is a closed / removed / not-found job
         posting, else ``None``. ``check_url`` also matches the URL against
         :data:`_EXPIRED_URL_PATTERNS` (skipped mid-loop, where a redirect back to
         a listing URL is not itself an expiry signal); ``text_len`` caps the
         body-text slice read. The URL check runs first and never throws, so a JS
         error in the text read can't suppress it.
+
+        ``body_text``: if the caller already read ``document.body.innerText``
+        (the mid-loop path does, for its Cloudflare check), pass it here to
+        avoid a second ``page.evaluate`` — and, matching that caller's
+        pre-refactor behaviour, a read failure there is swallowed silently
+        rather than logged.
         """
         if check_url and any(p in page.url.lower() for p in self._EXPIRED_URL_PATTERNS):
             print(f"  [LLM] URL indicates expired job ({page.url}) — skipping")
             return "expired"
-        try:
-            txt = (await page.evaluate(
-                f"() => (document.body.innerText || '').slice(0, {int(text_len)})"
-            )).lower()
-        except Exception as _e:
-            print(f"  [LLM] Warning: could not read page text for expired check ({_e})")
-            return None
-        if any(p in txt for p in self._EXPIRED_TEXT_PHRASES):
+        if body_text is None:
+            try:
+                body_text = await page.evaluate(
+                    f"() => (document.body.innerText || '').slice(0, {int(text_len)})"
+                )
+            except Exception as _e:
+                print(f"  [LLM] Warning: could not read page text for expired check ({_e})")
+                return None
+        if any(p in body_text.lower() for p in self._EXPIRED_TEXT_PHRASES):
             print("  [LLM] Page text indicates expired job — skipping")
             return "expired"
         return None
@@ -3137,20 +3145,21 @@ class OffsiteApplyFlow:
         except Exception:
             pass
 
-        # Cloudflare bot-gate + "job no longer available" after a navigation
+        # Cloudflare bot-gate + "job no longer available" after a navigation.
+        # One body-text read, shared by the Cloudflare check and _detect_expired
+        # (URL patterns skipped — a mid-loop redirect to a listing URL is not an
+        # expiry signal). A read failure is swallowed silently, as on master.
         if step > 0:
             try:
-                _mid_text = (await page.evaluate(
+                _mid_text = await page.evaluate(
                     "() => (document.body.innerText || '').slice(0, 400)"
-                )).lower()
-                if any(s in _mid_text for s in self._CLOUDFLARE_SIGNALS):
-                    print("  [LLM] Cloudflare security wall detected mid-loop — skipping")
-                    return "skipped"
+                )
             except Exception:
-                pass
-            # Expired-job text check shares _detect_expired (URL patterns skipped —
-            # a mid-loop redirect back to a listing URL is not an expiry signal).
-            if await self._detect_expired(page, check_url=False, text_len=400):
+                _mid_text = ""
+            if any(s in _mid_text.lower() for s in self._CLOUDFLARE_SIGNALS):
+                print("  [LLM] Cloudflare security wall detected mid-loop — skipping")
+                return "skipped"
+            if await self._detect_expired(page, check_url=False, body_text=_mid_text):
                 return "expired"
 
         # Greenhouse text "security code" bot wall — host-gated (the phrases
