@@ -10,9 +10,9 @@ application_log.json and emailed via Gmail when the run finishes.
 LLM configuration lives in config.py (get_llm_config). Roles:
     classifier    - job relevance scoring; OffsiteApply -> NVIDIA NIM
                     (CLASSIFIER_* env), Easy Apply -> Claude Agent SDK.
-    guided_apply  - the browser agent (OffsiteApplyFlow / EasyApplyFlow /
-                    ScriptApplyEngine) via the Claude Agent SDK. Subscription
-                    auth: no API key, requires a `claude` CLI login. (T14b)
+    guided_apply  - the browser agent (OffsiteApplyFlow / EasyApplyFlow) via
+                    the Claude Agent SDK. Subscription auth: no API key,
+                    requires a `claude` CLI login. (T14b)
 
 Environment variables (put in a .env file or export before running):
     CLASSIFIER_API / CLASSIFIER_BASE_URL / CLASSIFIER_MODEL - NIM classifier
@@ -255,8 +255,8 @@ def load_env():
     #   * classifier   — OffsiteApply → nim_client (config.get_llm_config("classifier"),
     #                    honours CLASSIFIER_* + legacy aliases); Easy Apply → Claude
     #                    Agent SDK subscription auth.
-    #   * browser agent (OffsiteApplyFlow / EasyApplyFlow / ScriptApplyEngine) →
-    #                    Claude Agent SDK subscription auth (config "guided_apply").
+    #   * browser agent (OffsiteApplyFlow / EasyApplyFlow) → Claude Agent SDK
+    #                    subscription auth (config "guided_apply").
     # LLM_API / LLM_URL / LLM_MODEL are now optional — read here only for the
     # legacy OpenAI-backed profile-setup interview (build_profile_interactively),
     # which degrades to raw answers when they are unset.
