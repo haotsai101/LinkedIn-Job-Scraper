@@ -832,6 +832,52 @@ _NUMERIC_LABEL_HINTS = (
     "years of", "how many",
 )
 
+# Free-text / STAR-question cues. A label carrying one of these wants a written
+# answer even if it also contains a numeric hint token ("How many times have you
+# had to escalate a production issue? Describe one." — "how many" + "describe").
+# Used by ``_ask_llm`` ONLY, to force the prose prompt; it must not feed
+# ``_label_is_numeric`` (that would also disable ``_coerce_numeric_answer``'s
+# safety net for the OffsiteApply / focused-field fill paths). T37 review.
+_FREE_TEXT_LABEL_CUES = (
+    "describe", "tell us", "tell me", "explain", "give an example",
+    "give me an example", "walk us through", "walk me through", "why do you",
+    "why are you", "share an experience", "share a time", "a time when",
+    "a time you",
+)
+
+
+def _label_has_free_text_cue(label: str) -> bool:
+    """Label explicitly asks for a written/STAR answer (see ``_FREE_TEXT_LABEL_CUES``)."""
+    lab = re.sub(r"\s+", " ", (label or "").lower()).strip()
+    return any(c in lab for c in _FREE_TEXT_LABEL_CUES)
+
+
+def _label_is_numeric(label: str, kind: str = "text") -> bool:
+    """Whether a form field is really asking for a bare number / 1-N scale value.
+
+    Single source of truth shared by :func:`_coerce_numeric_answer` (its
+    ``is_numeric`` gate) and :func:`_ask_llm` (its ``is_long_form`` exclusion) so
+    the two detections can never drift apart again (T37 — a long-labelled
+    "Rate your experience (1-10) …" field slipped past ``_ask_llm``'s old narrow
+    hardcoded tuple, so it took the 2-4-sentence prose path *and* had coercion
+    skipped by the ``if not is_long_form`` guard).
+
+    Every select/radio/checkbox and every genuine long-form field
+    (``textarea``/``contenteditable``) is excluded up front, so a real free-text
+    prompt ("Describe your experience …", "Why do you want to work here?") is
+    never misclassified as numeric. ``email``/``tel``/``url`` are excluded too —
+    a phone or URL field is never a 1-N scale even if its label says "number".
+    """
+    if kind in ("select", "select-one", "select-multiple", "radio", "checkbox",
+                "textarea", "contenteditable", "email", "tel", "url"):
+        return False
+    lab = re.sub(r"\s+", " ", (label or "").lower()).strip()
+    return (
+        kind == "number"
+        or any(h in lab for h in _NUMERIC_LABEL_HINTS)
+        or bool(re.search(r"\brate\b|\brating\b", lab))
+    )
+
 
 def _coerce_numeric_answer(label: str, answer: str, kind: str = "text",
                            profile: dict | None = None) -> str:
@@ -842,39 +888,69 @@ def _coerce_numeric_answer(label: str, answer: str, kind: str = "text",
 
     * the first ``\\d+`` in the answer wins, clamped to a range stated in the
       label (e.g. ``(1-10)``, ``1 to 5``);
-    * no digit anywhere → a sensible fallback: the profile's ``years_experience``
+    * a label with an explicit range **or** a strong rating cue (``rate`` /
+      ``rating`` / ``on a scale`` / ``scale of``) is a strong enough signal to
+      grab the digit unconditionally — "Rate your Python proficiency" (no
+      parenthetical) still reduces a verbose "…probably an 8 out of 10…" answer;
+    * otherwise (a plain "how many …" / "years of …" label, no range, not
+      ``type=number``) the digit is only trusted when the answer already looks
+      like a number: ``<= 60`` chars, the digit is the first token, the digit is
+      glued to a "years"/"months" unit, or the whole answer is just the number
+      with surrounding punctuation. A stray year/count inside a genuine prose
+      sentence ("…most memorably in 2021 when I…") is NOT grabbed (T37 review) —
+      such answers fall through to the no-digit path.
+    * no confident digit → a sensible fallback: the profile's ``years_experience``
       for a "years"/"months" question, the midpoint of a stated scale otherwise,
       and finally the answer unchanged.
     """
     if not answer or not isinstance(answer, str):
         return answer
-    # Never touch a genuine long-form field. "textarea"/"contenteditable" is the
-    # guided-apply fill branch's only guard (it has no ``is_long_form`` check),
-    # so keeping them here makes the helper safe to call unconditionally.
-    if kind in ("select", "select-one", "select-multiple", "radio", "checkbox",
-                "textarea", "contenteditable"):
-        return answer
-    lab = re.sub(r"\s+", " ", (label or "").lower()).strip()
-    is_numeric = (
-        kind == "number"
-        or any(h in lab for h in _NUMERIC_LABEL_HINTS)
-        or bool(re.search(r"\brate\b|\brating\b", lab))
-    )
-    if not is_numeric:
+    # Numeric-field detection (incl. the select/radio/checkbox/textarea/
+    # contenteditable exclusion that keeps this helper safe to call
+    # unconditionally) lives in the shared ``_label_is_numeric`` predicate so
+    # ``_ask_llm``'s ``is_long_form`` exclusion can never drift from it (T37).
+    if not _label_is_numeric(label, kind):
         return answer
 
+    lab = re.sub(r"\s+", " ", (label or "").lower()).strip()
     s = answer.strip()
+    # A STAR / "describe … / give an example / a time when …" cue in the label
+    # means this is a written-answer field that merely *contains* a numeric hint
+    # token ("how many times…", "how would you rate…"). Never digit-grab it — a
+    # stray year/count in the prose ("…most memorably in 2021…") is not the
+    # answer. ``_ask_llm`` routes these to the prose prompt for the same reason;
+    # this guard covers the OffsiteApply / focused-field paths that call the
+    # coercion directly. (T37 review.)
+    if _label_has_free_text_cue(label):
+        return answer
     rng = re.search(r"(\d+)\s*(?:-|–|to)\s*(\d+)", lab)
     lo, hi = (int(rng.group(1)), int(rng.group(2))) if rng else (None, None)
+    # A rating label ("Rate your X", "on a scale, rate …") is as strong a signal
+    # as an explicit (1-N) range — a range-less rating field is very common and
+    # otherwise re-opens the T31 bug (T37 review). The free-text-cue short-circuit
+    # above already ran, so "Describe a time you rated a peer …" stays prose.
+    rating_label = bool(re.search(r"\brate\b|\brating\b|on a scale|scale of", lab))
 
     m = re.search(r"\d+", s)
     if m:
         n = int(m.group())
         if lo is not None and hi is not None and lo <= hi:
-            n = max(lo, min(hi, n))
-        return str(n)
+            # An explicit range in the label is a strong signal — grab the digit
+            # unconditionally and clamp it.
+            return str(max(lo, min(hi, n)))
+        if rating_label:
+            return str(n)
+        # Plain "how many …" / "years of …" label, no range. Trust the digit only
+        # when the answer already reads as a number, not a sentence that merely
+        # contains one ("…took down 3 services for 40 minutes." → falls through).
+        if (kind == "number"
+                or len(s) <= 60
+                or re.match(r"\s*\d", s)
+                or re.search(r"\b\d+\s*\+?\s*(?:years?|yrs?|months?|mos?)\b", s.lower())
+                or re.fullmatch(r"[\W_]*\d[\d\W_]*", s)):
+            return str(n)
 
-    # No digit in the answer at all.
+    # No digit in the answer (or no digit we trust).
     # An explicit "I don't have this" must stay 0 — don't bump a truthful
     # negative up to a fabricated number.
     if re.search(r"\b(none|no experience|no exp|never|n/?a|zero|not at all|no prior)\b",
@@ -1157,15 +1233,21 @@ async def _ask_llm(model: str, profile: dict, field: dict) -> str | None:
         return None
     options = field.get("options", [])
     kind = field.get("kind", "text")
-    label_lower = label.lower()
-    # "How many years..." and "years of experience" questions expect a number, not a sentence
-    _is_numeric_question = (
-        any(k in label_lower for k in ("how many years", "years of experience", "years experience", "how many months"))
-        and kind in ("text", "number")
-    )
+    # A numeric / 1-N-scale field (incl. long-labelled "Rate your experience
+    # (1-10) …" prompts) expects a bare number, not a sentence — use the same
+    # predicate ``_coerce_numeric_answer`` gates on so the two stay in sync (T37).
+    _is_numeric_question = _label_is_numeric(label, kind)
+    # …but an explicit "describe / give an example / a time when …" cue always
+    # wins: a STAR question that merely contains "how many" or "rate" must still
+    # get the 2-4-sentence prose prompt, never digit-coercion (T37 review).
+    _is_free_text_question = _label_has_free_text_cue(label)
     # Select/radio with options is never long-form regardless of label length
     _is_choice = kind in ("select", "select-one", "select-multiple", "radio") or bool(options)
-    is_long_form = (kind in ("textarea", "contenteditable") or len(label) > 60) and not _is_numeric_question and not _is_choice
+    _len_or_area = kind in ("textarea", "contenteditable") or len(label) > 60
+    is_long_form = not _is_choice and (
+        _is_free_text_question
+        or (_len_or_area and not _is_numeric_question)
+    )
     prompt = f"Job application form field:\nLabel: {label}\nType: {kind}\n"
     if options:
         prompt += f"Options: {', '.join(str(o) for o in options)}\n"

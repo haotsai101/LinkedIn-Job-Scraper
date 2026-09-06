@@ -380,6 +380,11 @@ def write_session_log(report: dict):
     else:
         existing = {"sessions": []}
 
+    # Valid JSON of the wrong shape (a bare `[]`, or `{"sessions": 5}`) slips
+    # past the parse guard above but would crash on the append below (T37).
+    if not isinstance(existing, dict) or not isinstance(existing.get("sessions"), list):
+        existing = {"sessions": []}
+
     existing["sessions"].append(report)
     log_path.write_text(json.dumps(existing, indent=2))
     print(f"  Session log written to {LOG_PATH}")

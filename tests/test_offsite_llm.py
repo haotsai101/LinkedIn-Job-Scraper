@@ -102,6 +102,50 @@ def test_ask_llm_field_fill_goes_through_query(monkeypatch):
     assert stub.calls[0]["model"] == GUIDED_MODEL
 
 
+def test_ask_llm_long_labelled_scale_field_yields_bare_integer(monkeypatch):
+    # T37: a 90+ char "Rate ... (1-10) ..." label must NOT take the long-form
+    # prose path — even when the model answers with a sentence, _ask_llm returns
+    # the range-clamped bare integer.
+    stub = _install(monkeypatch, _QueryStub("I would rate my experience a 7 out of 10..."))
+    label = ("Rate your experience (1-10) designing and building production "
+             "data pipelines using SQL and Python.")
+    out = asyncio.run(linkedin_apply._ask_llm(
+        GUIDED_MODEL, {"years_experience": 8}, {"label": label, "kind": "text"},
+    ))
+    assert out == "7"
+    # The non-long-form prompt was used (no "2-4 sentence" instruction).
+    assert "2-4 sentence" not in stub.calls[0]["prompt"]
+
+
+def test_ask_llm_genuine_free_text_still_gets_prose(monkeypatch):
+    # T37 guard: a long free-text label with no numeric wording keeps the prose path.
+    prose = "I have spent a decade building distributed data platforms end to end."
+    stub = _install(monkeypatch, _QueryStub(prose))
+    out = asyncio.run(linkedin_apply._ask_llm(
+        GUIDED_MODEL, {},
+        {"label": "Describe your experience building and operating data pipelines at scale",
+         "kind": "text"},
+    ))
+    assert out == prose
+    assert "2-4 sentence" in stub.calls[0]["prompt"]
+
+
+def test_ask_llm_star_question_with_a_hint_token_gets_prose(monkeypatch):
+    # T37 review: a long STAR question that *contains* "how many" / "rate" but
+    # also a free-text cue ("describe", "give an example") must take the prose
+    # path and NOT be digit-coerced — the inverse of the T37 bug.
+    prose = ("There were several occasions, most memorably in 2021 when I pushed "
+             "back on a rushed migration.")
+    stub = _install(monkeypatch, _QueryStub(prose))
+    out = asyncio.run(linkedin_apply._ask_llm(
+        GUIDED_MODEL, {"years_experience": 8},
+        {"label": "How many times have you had to advocate for an unpopular "
+                  "decision? Give an example.", "kind": "text"},
+    ))
+    assert out == prose
+    assert "2-4 sentence" in stub.calls[0]["prompt"]
+
+
 # ── _ask_llm_action decide-action loop ─────────────────────────────────────
 
 _SNAP = {"visible_text": "Apply now", "fields": [], "url": "https://ex.com/apply"}

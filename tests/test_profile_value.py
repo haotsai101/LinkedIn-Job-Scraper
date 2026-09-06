@@ -19,6 +19,11 @@ import linkedin_apply as la
 
 _gpv = la._get_profile_value
 _coerce = la._coerce_numeric_answer
+# T37 symbols — via getattr so a pre-fix tree fails these tests as clean
+# assertion/TypeError failures inside the test body, not a whole-file collection
+# error.
+_label_is_numeric = getattr(la, "_label_is_numeric", None)
+_label_has_free_text_cue = getattr(la, "_label_has_free_text_cue", None)
 
 
 # A synthetic profile shaped like ``user_profile.json`` (see PROFILE_QUESTIONS in
@@ -186,6 +191,138 @@ def test_coerce_numeric_answer_detection_is_scoped_to_real_numeric_fields():
     assert _coerce("What interests you about this role?",
                    "I have shipped 3 production systems", "text") == \
         "I have shipped 3 production systems"
+
+
+# ── T37: shared _label_is_numeric predicate (used by _ask_llm + _coerce) ──────
+
+def test_label_is_numeric_matches_long_labelled_scale_fields():
+    # The live-QA failure: a 90+ char label the old _ask_llm tuple never matched.
+    long_scale = ("Rate your experience (1-10) designing and building production "
+                  "data pipelines using SQL and Python.")
+    assert len(long_scale) > 60
+    assert _label_is_numeric(long_scale, "text") is True
+    assert _label_is_numeric(
+        "How would you rate your Python skills on a scale of 1 to 5?", "text") is True
+    assert _label_is_numeric("Years of experience with Kubernetes", "text") is True
+    assert _label_is_numeric("Experience level", "number") is True
+
+
+def test_label_is_numeric_leaves_genuine_free_text_alone():
+    # All >60 chars, none numeric — must still take the prose path.
+    assert _label_is_numeric(
+        "Describe your experience building and operating data pipelines at scale",
+        "text") is False
+    assert _label_is_numeric(
+        "Why do you want to work at Acme and what draws you to this role?",
+        "text") is False
+    assert _label_is_numeric(
+        "Tell us about a time you overcame a significant technical challenge",
+        "text") is False
+    # Choices / long-form kinds are excluded regardless of label wording.
+    assert _label_is_numeric("Rate your experience", "select") is False
+    assert _label_is_numeric("Rate your experience (1-10) ...", "textarea") is False
+    # T37 review: email / tel / url fields are never a 1-N scale.
+    assert _label_is_numeric("How many years at this number", "tel") is False
+    assert _label_is_numeric("Rate this URL", "url") is False
+    assert _label_is_numeric("How many accounts on this email", "email") is False
+
+
+def test_coerce_numeric_answer_handles_long_labelled_scale_prose():
+    # End-to-end: the exact live-QA prose answers -> bare, range-clamped ints.
+    label = ("Rate your experience (1-10) designing and building production "
+             "data pipelines using SQL and Python.")
+    assert _coerce(label, "I would rate my experience a 7. Over the last...", "text") == "7"
+    assert _coerce(label, "6 — I have hands-on experience building...", "text") == "6"
+    assert _coerce("Rate your experience (1-10) with distributed systems architecture "
+                   "and event-driven design", "I would rate my experience a 12 out of 10",
+                   "text") == "10"
+
+
+# ── T37 review: STAR / free-text questions that merely contain a hint token ────
+
+def test_label_has_free_text_cue():
+    cue = _label_has_free_text_cue
+    assert cue("How many times have you had to escalate a production issue? Describe one.") is True
+    assert cue("Tell us about a time you disagreed with your manager") is True
+    assert cue("Why do you want to work here") is True
+    assert cue("Walk me through your proudest project") is True
+    # A true rating field carries none of the cues.
+    assert cue("Rate your experience (1-10) designing and building data pipelines") is False
+    assert cue("How many years of Python experience") is False
+
+
+def test_coerce_numeric_answer_leaves_star_questions_with_a_hint_token_as_prose():
+    # The T37 review regression: label contains "how many" / "rate" AND a
+    # free-text cue -> prose kept, stray year/count NOT grabbed. Fails pre-fix
+    # (old code returned "2021" / "3").
+    assert _coerce(
+        "How many times have you had to advocate for an unpopular decision? Give an example.",
+        "There were several occasions, most memorably in 2021 when I pushed back "
+        "on a rushed migration.", "text",
+    ) == ("There were several occasions, most memorably in 2021 when I pushed back "
+          "on a rushed migration.")
+    assert _coerce(
+        "How would you rate the hardest incident you resolved end to end? Explain.",
+        "The Redis outage in March that took down 3 services for 40 minutes.", "text",
+    ) == "The Redis outage in March that took down 3 services for 40 minutes."
+
+
+def test_coerce_numeric_answer_digit_grab_is_conservative_without_a_range():
+    # No explicit range in the label, non-number kind: a stray digit inside a
+    # long prose answer is not the answer (T37 review). Fails pre-fix.
+    assert _coerce(
+        "How many production incidents have you led end to end for a payments team",
+        "The Redis outage in March that took down 3 services for 40 minutes was the worst.",
+        "text",
+    ) == "The Redis outage in March that took down 3 services for 40 minutes was the worst."
+    # …but a short / basically-bare-number answer is still reduced.
+    assert _coerce("How many incidents have you led", "About 4", "text") == "4"
+    assert _coerce("How many incidents have you led", "  7.  ", "text") == "7"
+    # type=number is always trusted regardless of length.
+    assert _coerce(
+        "Roughly how many services do you own",
+        "Somewhere between eight and nine, call it 8 on an average sprint honestly",
+        "number",
+    ) == "8"
+
+
+def test_coerce_numeric_answer_rating_label_without_a_range_still_reduces_prose():
+    # T37 review #1: a rating label with NO "(1-N)" parenthetical is still a
+    # strong enough signal to grab the digit out of a verbose answer. Fails
+    # pre-fix (fell through to prose because len > 40 and no range).
+    assert _coerce(
+        "Rate your Python proficiency",
+        "I'd say I'm quite strong, probably an 8 out of 10 honestly, used daily",
+        "text",
+    ) == "8"
+    assert _coerce(
+        "On a scale, rate your SQL expertise",
+        "Comfortably a 7 — I write window functions and tune queries but rarely do DBA work",
+        "text",
+    ) == "7"
+    # …but a rating *cue* buried in a "describe a time" question stays prose.
+    assert _coerce(
+        "Describe a time you had to rate a peer honestly in a review",
+        "In 2022 I gave a report a 2 on communication and we built a plan together.",
+        "text",
+    ) == "In 2022 I gave a report a 2 on communication and we built a plan together."
+
+
+def test_coerce_numeric_answer_trusts_a_digit_glued_to_a_years_unit():
+    # T37 review #2: a verbose "how many years" answer (> 40 chars) where the
+    # digit is glued to a "years" unit -> extracted, not dropped to the T32
+    # undersell. Fails pre-fix (len 60+ -> fell through -> "1" / wrong skill).
+    assert _coerce(
+        "How many years of professional experience do you have with Python",
+        "I have approximately 5 years of professional experience with Python",
+        "text", {"years_experience": "9"},
+    ) == "5"
+    # digit as the first token of a longer answer is also trusted.
+    assert _coerce(
+        "How many years have you worked in data engineering roles specifically",
+        "6, though only 4 of those were with a modern lakehouse stack end to end",
+        "text",
+    ) == "6"
 
 
 # ── T32: unmapped "years of <skill>" never falls back to 0 ───────────────
