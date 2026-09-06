@@ -49,7 +49,7 @@ WHERE applied = -1
 |---|---|---|
 | T19 | P2 | Auto-run pending migrations at *every* entrypoint (not just apply). Consolidate `_ensure_apply_schema` / `migrate_db` / `ensure_schema_current`. Add DB backup before migration. |
 | T20 | P3 | `ruff` not in the interpreter that runs the agent — document/bootstrap lint. |
-| T21 | P2 | `fetch_job_details_op` has the same required-config bug T6 fixed for `search_jobs_op` — `details_schedule` is `RUNNING` with no run_config → scheduled enrichment fails every 12h. |
+| T21 | P2 | ✅ **CLOSED** (#33, QA'd 2026-09-06) — `fetch_job_details_op` had the same required-config bug T6 fixed for `search_jobs_op`; `details_schedule` (`RUNNING`, no run_config) failed config validation every 12h. Fixed with `Field(Int, default_value=25/30)`. |
 | T22 | P2 | `blocked_entities.ats_domain` rows are seeded but `run_session` still reads `BLOCKED_DOMAINS` from the Python constant — table not wired for domain blocks. |
 | T24 | P3 | `ensure_schema_current` backfill gate can't distinguish "unparseable" from "not yet done" — a permanently-NULL `listed_epoch` row would re-trigger the full-table backfill every startup. Zero impact on current data. Fold into T19. |
 
@@ -321,11 +321,11 @@ T8's indexes + WAL and T9's schema changes only take effect when the operator ma
 
 ## T21 — `fetch_job_details_op` required-config bug
 
-**Phase:** follow-up · **Risk:** low · **Deps:** none · **Status:** ✅ fixed (PR pending) · Raised by the T6 reviewer.
+**Phase:** follow-up · **Risk:** low · **Deps:** none · **Status:** ✅ **CLOSED** — merged (PR #33, 2026-09-06), QA passed 2026-09-06 (`validate_run_config` against the real `fetch_details_only` / `search_jobs_only` / `search_and_fetch_jobs` job objects: all validate with empty config, explicit override still honoured; `scripts.definitions` imports clean; reviewer independently confirmed the pre-fix schema raises `DagsterInvalidConfigError` so the new tests are genuine regression cover). Raised by the T6 reviewer.
 
-`scripts/dagster_retrievers.py:fetch_job_details_op` has `config_schema={"max_updates": int, "sleep_time": int}` with both fields required, but `details_schedule` (`default_status=RUNNING`) supplies no `run_config` — so scheduled enrichment fails config validation every 12h (only `unscraped_jobs_sensor` provides config). Same class of bug T6 fixed for `search_jobs_op`. Apply the same `Field(default_value=...)` treatment: `max_updates=25`, `sleep_time=30` (match the existing `.get()` fallbacks + the sensor's values). `search_and_fetch_jobs` (unscheduled) also benefits.
+`scripts/dagster_retrievers.py:fetch_job_details_op` had `config_schema={"max_updates": int, "sleep_time": int}` with both fields required, but `details_schedule` (`default_status=RUNNING`) supplies no `run_config` — so scheduled enrichment failed config validation every 12h (only `unscraped_jobs_sensor` provided config). Same class of bug T6 fixed for `search_jobs_op`. Fixed with the same `Field(Int, default_value=...)` treatment: `max_updates=25`, `sleep_time=30` (matches the existing `.get()` fallbacks; the sensor passes `sleep_time:30` + a dynamic `max_updates` that still overrides). New `tests/test_dagster_op_config.py`.
 
-**Acceptance:** `details_schedule` produces a valid run from the launchpad with no config; the sensor path is unaffected.
+**Acceptance:** ✅ `details_schedule`'s job produces a valid run with no config; the sensor path is unaffected.
 
 ---
 
