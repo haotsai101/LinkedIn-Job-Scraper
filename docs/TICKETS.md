@@ -23,13 +23,15 @@ Baseline captured 2026-08-28. `docs/baseline/db_state.baseline.txt` holds the DB
 
 | # | Sev | Summary |
 |---|---|---|
-| T30 | P2 | ✅ **CLOSED — superseded by T38** (PR pending). New classifier `meta/llama-3.2-11b-vision-instruct` returned non-JSON ~1/3 of NIM-route calls in the real flow, and was 8-12s (not the ~1.5s probe). **Root cause found (T38):** NIM returns an *empty/whitespace* body for job descriptions over ~4–5K chars — reproduced directly (short desc → clean JSON; a real 6.7K-char posting → `JSONDecodeError` every time). Real postings are routinely 6–8K, so the NIM route fails on most real jobs; 3 in a row trips `run_session`'s `_MAX_CLASSIFY_FAIL_STREAK` and aborts the session, and the T27 breaker only catches `TimeoutError`, not parse failures. **Fix (T38):** the Agent SDK is now the default classifier for *all* jobs (reliable, same latency, rides the Claude subscription = free). NIM stays in the tree as an opt-in route behind `CLASSIFIER_ROUTE=nim`. |
-| T31 | P2 | ✅ fixed (PR pending) — see `## T31 / T32` below. Numeric/scale free-text fields got prose instead of a bare number. |
-| T32 | P2 | ✅ fixed (PR pending) — see `## T31 / T32` below. Unmapped "years of &lt;skill&gt;" fields undersold to `0`. |
-| T36 | P3 | (split out of T32) Playwright tab crash mid-fill → `applied=-2` auto-fail. Browser-stability concern, not form-answer quality — needs its own ticket. |
-| T37 | P2 | ✅ fixed (PR pending) — see `## T37` below. Live QA of PR #34 found `_ask_llm`'s local numeric detection out of sync with `_coerce_numeric_answer` — long-labelled "Rate … (1-10)" scale fields still got prose. |
-| T38 | P1 | ✅ fixed (PR pending) — see `## T38` below. Supersedes/closes T30. NIM classifier returns an empty body for descriptions over ~4–5K chars → most real OffsiteApply jobs fail to classify → session aborts. Agent SDK is now the default classifier for all jobs; NIM is opt-in (`CLASSIFIER_ROUTE=nim`). |
+| T30 | P2 | ✅ **CLOSED — superseded by T38** (#38, QA 2026-09-06). New classifier `meta/llama-3.2-11b-vision-instruct` returned non-JSON ~1/3 of NIM-route calls in the real flow, and was 8-12s (not the ~1.5s probe). **Root cause found (T38):** NIM returns an *empty/whitespace* body for job descriptions over ~4–5K chars — reproduced directly (short desc → clean JSON; a real 6.7K-char posting → `JSONDecodeError` every time). Real postings are routinely 6–8K, so the NIM route fails on most real jobs; 3 in a row trips `run_session`'s `_MAX_CLASSIFY_FAIL_STREAK` and aborts the session, and the T27 breaker only catches `TimeoutError`, not parse failures. **Fix (T38):** the Agent SDK is now the default classifier for *all* jobs (reliable, same latency, rides the Claude subscription = free). NIM stays in the tree as an opt-in route behind `CLASSIFIER_ROUTE=nim`. |
+| T31 | P2 | ✅ **CLOSED** (#34 + #37, QA 2026-09-06) — see `## T31 / T32` below. Numeric/scale free-text fields got prose instead of a bare number. Residual: T40. |
+| T32 | P2 | ✅ **CLOSED** (#34, QA 2026-09-06) — see `## T31 / T32` below. Unmapped "years of &lt;skill&gt;" fields undersold to `0`. Residual: T40 (catch-all branch order). |
+| T36 | P3 | (split out of T32) Playwright tab crash mid-fill → `applied=-2` auto-fail. Browser-stability concern, not form-answer quality — needs its own ticket. **Not started.** |
+| T37 | P2 | ✅ **CLOSED** (#36, QA 2026-09-06) — see `## T37` below. Live QA of PR #34 found `_ask_llm`'s local numeric detection out of sync with `_coerce_numeric_answer` — long-labelled "Rate … (1-10)" scale fields still got prose. |
+| T38 | P1 | ✅ **CLOSED** (#38, QA 2026-09-06) — see `## T38` below. Supersedes/closes T30. NIM classifier returns an empty body for descriptions over ~4–5K chars → most real OffsiteApply jobs fail to classify → session aborts. Agent SDK is now the default classifier for all jobs; NIM is opt-in (`CLASSIFIER_ROUTE=nim`). |
+| T40 | P3 | (found by the T22/T38 QA run 2026-09-06) `_get_profile_value`'s `"years of experience"` catch-all (~line 555) runs *before* the T32 tiered "years of &lt;skill/role&gt;" branch, so `"How many years of experience do you have as a Lead?"` returns full `years_experience` (`4`) — asserts a whole career in a role the applicant has never held. Reorder so the tiered branch handles `"…as a &lt;role&gt;"` / skill-qualified phrasings first; keep the catch-all only for bare "years of experience" / "total experience". **Not started.** |
 | — | P3 | (T14b reviewer note) Watch for orphaned `claude` processes after timeout-heavy runs — `asyncio.wait_for` on `llm.query` cancels the SDK generator mid-iteration; subprocess cleanup then depends on the SDK's `GeneratorExit` handling. |
+| T39 | P3 | (found by the T22/T38 QA run 2026-09-06) OffsiteApply step-loop can't reach the apply form when a Greenhouse `boards.greenhouse.io/<co>` URL 30x-redirects to a company-hosted careers SPA (MongoDB). LLM scrolls, URL never changes, stuck-detection kills it → `applied=-2` → churns the `--reset-failed` pool forever. See `## T39` below. |
 
 **T27 .env:** classifier model must be `meta/llama-3.2-11b-vision-instruct` (via `CLASSIFIER_MODEL` or the legacy `CLASSIFIER_LLM_MODEL`) — done 2026-09-02.
 
@@ -52,7 +54,7 @@ WHERE applied = -1
 | T19 | P2 | Auto-run pending migrations at *every* entrypoint (not just apply). Consolidate `_ensure_apply_schema` / `migrate_db` / `ensure_schema_current`. Add DB backup before migration. |
 | T20 | P3 | `ruff` not in the interpreter that runs the agent — document/bootstrap lint. |
 | T21 | P2 | ✅ **CLOSED** (#33, QA'd 2026-09-06) — `fetch_job_details_op` had the same required-config bug T6 fixed for `search_jobs_op`; `details_schedule` (`RUNNING`, no run_config) failed config validation every 12h. Fixed with `Field(Int, default_value=25/30)`. |
-| T22 | P2 | ✅ fixed (PR pending) — `run_session` loads `ats_domain` rows from `blocked_entities` once per session and the per-job check matches them (host-suffix) against `posting_domain`/`application_url`, marking a hit `applied=-3`. Operator-added domain blocks now fire with no code change. |
+| T22 | P2 | ✅ **CLOSED** (#37, QA 2026-09-06) — `run_session` loads `ats_domain` rows from `blocked_entities` once per session and the per-job check matches them (host-suffix) against `posting_domain`/`application_url`, marking a hit `applied=-3`. Operator-added domain blocks now fire with no code change. |
 | T24 | P3 | `ensure_schema_current` backfill gate can't distinguish "unparseable" from "not yet done" — a permanently-NULL `listed_epoch` row would re-trigger the full-table backfill every startup. Zero impact on current data. Fold into T19. |
 
 ## Dependency graph
@@ -333,7 +335,9 @@ T8's indexes + WAL and T9's schema changes only take effect when the operator ma
 
 ## T22 — Wire `blocked_entities.ats_domain` to `run_session`
 
-**Phase:** follow-up · **Risk:** low · **Deps:** T9 (done) · **Status:** ✅ fixed (PR pending) · Raised by the T9 reviewer.
+**Phase:** follow-up · **Risk:** low · **Deps:** T9 (done) · **Status:** ✅ **CLOSED** — merged (PR #37), QA passed 2026-09-06. Raised by the T9 reviewer.
+
+**QA note (2026-09-06):** the `run_session` apply-loop path was not hit by a live run (no operator-blocked domain landed in the 12-job pool; the two `-3` blocks that run came from the `linkedin_apply.py` pre-flight Workday check, a separate T33/T34 mechanism). Validated instead by: (a) a direct real-DB check — `load_session_blocked_domains(cur)` returns the operator `ats_domain` row unioned with the seed rows; a real pending `haystack.cv` job → `_match_blocked_domain` truthy; `job-boards.greenhouse.io` → `None` (negative control); (b) the reviewer's `inspect.getsource` wiring proof that `run_session` calls `_match_blocked_domain(session_blocked_domains, posting_domain, application_url)` and marks a hit `applied=-3` / `blocked_count++`; (c) 7 of 11 new tests fail on the pre-fix code. A future run hitting an operator-blocked domain would be belt-and-suspenders, not required.
 
 T9 created `blocked_entities` and seeds `ats_domain` rows, but `run_session`'s URL check still reads `BLOCKED_DOMAINS` (derived from the frozen `BLOCKED_ENTITIES_SEED` Python constant), so an operator adding an `ats_domain` row to the table is silently ignored. Have `run_session` load `ats_domain` patterns from the table once per session (mirror the `get_pending_jobs` approach), making the table authoritative for domain blocks too.
 
@@ -460,7 +464,7 @@ Note the **login-wall-with-credentials-that-fail-to-log-in** branch (also ~3316-
 
 ## T31 / T32 — form answer quality (numeric fields + undersold "years of X")
 
-**Phase:** T33 follow-up · **Risk:** low · **Status:** ✅ **CLOSED** — merged (PR #34). **Follow-up:** live QA of PR #34 found the T31 symptom still reproducing on the EasyApply path for *long-labelled* scale fields — `_ask_llm`'s own local numeric-question detection had never been brought in sync with `_coerce_numeric_answer`. Closed by **T37**. The PR #34 work itself (the `_get_profile_value` tiering, the `_coerce_fill_value` seam) is sound and untouched by T37. · From the T27/T14b live apply runs 2026-09-01/02.
+**Phase:** T33 follow-up · **Risk:** low · **Status:** ✅ **CLOSED** — merged (PR #34), residual gap closed by **T37** (PR #36), QA passed 2026-09-06. **Follow-up 1:** live QA of PR #34 found the T31 symptom still reproducing on the EasyApply path for *long-labelled* scale fields — `_ask_llm`'s own local numeric-question detection had never been brought in sync with `_coerce_numeric_answer`. Closed by **T37**. The PR #34 work itself (the `_get_profile_value` tiering, the `_coerce_fill_value` seam) is sound and untouched by T37. **Follow-up 2 (open — T40):** the 2026-09-06 QA run showed `_get_profile_value`'s `"years of experience"` catch-all (~line 555) short-circuits the T32 tiered branch — `"How many years of experience do you have as a Lead?"` → full `years_experience` (`4`), asserting a whole career as a Lead for an applicant who has never held the title. Mild overclaim via a pre-T32 code path (not a regression). Fix: reorder so the tiered branch runs first for `"…as a <role>"` / skill-qualified phrasings. See **T40**. · From the T27/T14b live apply runs 2026-09-01/02.
 
 Both bugs live in the same code area (form answer generation), so they ship together. T33 (PR #25) landed a first pass — the `_coerce_numeric_answer` helper and a capped `_get_profile_value` "how many years" branch. This PR closes the paths that pass left uncovered.
 
@@ -492,7 +496,7 @@ Reviewer feedback addressed: the earlier revision returned a blanket `min(tot, 2
 
 ## T37 — `_ask_llm` routes long-labelled scale questions to prose, bypassing T31 coercion
 
-**Phase:** T31/T32 follow-up · **Risk:** low · **Status:** ✅ fixed (PR pending) · Found by live QA of PR #34 (T31/T32), EasyApply path.
+**Phase:** T31/T32 follow-up · **Risk:** low · **Status:** ✅ **CLOSED** — merged (PR #36), QA passed 2026-09-06 (on unit-test strength — 272 tests, reviewer confirmed the pre-fix tree fails the new `_coerce` cases; the 2026-09-06 live run had no scale field / no LLM-driven fill so the unified detection was not live-reproduced — noted, not blocking). Found by live QA of PR #34 (T31/T32), EasyApply path.
 
 **Symptom (still live after PR #34):** a job with three fields labelled `"Rate your experience (1-10) designing and building production data pipelines using SQL and Python."` (and near-identical variants) got filled with prose — `"I would rate my experience a 7. Over the…"`, `"6 — I have hands-on experience building…"`, `"I would rate my experience a 7 out of 10…"` — instead of a bare `7` / `6`. This is exactly the T31 failure mode, on a field T31's shared `_coerce_numeric_answer` already recognises.
 
@@ -524,7 +528,7 @@ Reviewer feedback addressed: the earlier revision returned a blanket `min(tot, 2
 
 ## T38 — Default the relevance classifier to the Claude Agent SDK; make NIM opt-in
 
-**Phase:** T27 / T14 follow-up · **Risk:** low · **Status:** ✅ fixed (PR pending) · **Supersedes & closes T30.** Decided by the project owner 2026-09-06.
+**Phase:** T27 / T14 follow-up · **Risk:** low · **Status:** ✅ **CLOSED** — merged (PR #38), QA passed 2026-09-06 (clean full pass: 12/12 jobs classified via Agent SDK, 0 NIM calls, `Deferred: 0` vs `Deferred: 3` on every prior run; the BECU / Aalyria / DailyPay canaries that deferred every run for days all classified `✓ relevant` first try; session did not abort). **Supersedes & closes T30.** Decided by the project owner 2026-09-06.
 
 **Root cause:** the NIM classifier route (`_classify_nim` → `nim_client.classify_via_nim`, model `meta/llama-3.2-11b-vision-instruct`) returns an **empty / whitespace response** for job descriptions over ~4–5K chars. Reproduced directly: short descriptions classify fine (clean JSON, 1.7–10s); a real 6.7K-char posting → `JSONDecodeError: Expecting value: line 1 column 1 (char 0)` every time. Real job postings are routinely 6–8K chars, so the OffsiteApply classifier route fails on most real jobs. Three consecutive failures trip `run_session`'s `_MAX_CLASSIFY_FAIL_STREAK` → the whole session aborts. The T27 circuit breaker only catches `TimeoutError`, not parse failures, so it never engages for this. This blocked QA runs for days (BECU / Aalyria / DailyPay deferred every run).
 
@@ -538,3 +542,24 @@ Reviewer feedback addressed: the earlier revision returned a blanket `min(tot, 2
 **Tests:** `tests/test_classifier_routing.py` — default (no flag) routes OffsiteApply to `_classify_agent`; with `_NIM_CLASSIFIER_ENABLED=True`, OffsiteApply → `_classify_nim`, others → `_classify_agent`, `prefer_agent_sdk=True` → agent; `classify_with_circuit_breaker` with NIM disabled never calls `resolve_classifier`. `tests/test_config.py` — `get_classifier_route` default / `nim` / bad-value-warns. Existing NIM-route + circuit-breaker tests updated (autouse fixture enables the flag for that module). Full suite green + `ruff check .` diff-clean.
 
 **Acceptance:** with no `CLASSIFIER_ROUTE` set, an OffsiteApply job with a 6–8K-char description classifies via the Agent SDK and the session does not abort; `CLASSIFIER_ROUTE=nim` restores the previous NIM-for-OffsiteApply behaviour incl. the circuit breaker; `pytest tests/` green.
+
+---
+
+## T39 — OffsiteApply step-loop stalls when a Greenhouse board URL redirects to a company careers SPA
+
+**Phase:** T16b follow-up · **Risk:** low · **Status:** open · **Sev:** P3 · Found by the T22/T38 live QA run (`apply_jobs.py --auto --limit 12`, 2026-09-06), job 11.
+
+**Symptom:** MongoDB "Senior Software Engineer, SQL Engines". `application_url` is `http://boards.greenhouse.io/mongodb/jobs/8161512?gh_src=…`. `_llm_guided_apply` navigates there; the host 30x-redirects to `https://www.mongodb.com/careers/jobs/8161512`, MongoDB's own JS careers page, where the apply CTA is not reachable by scrolling (it opens an embedded Greenhouse form on click). The step-loop issued `scroll` on steps 1/2/3, the URL never changed, and the "URL unchanged for 3 consecutive steps — browser is stuck, giving up" guard fired → `[!] Auto-apply failed` → `applied=-2`. ~40s + 3 `claude-sonnet-5` browser_action calls burned, no application.
+
+**Not a regression.** None of T22/T31/T32/T37/T38 touch OffsiteApply navigation or the step-loop. The stuck-detection guard firing and marking `-2` is correct terminal behaviour given the loop genuinely could not progress. This is a pre-existing capability gap, distinct from **T36** (T36 = a Playwright tab *crash* mid-fill; this is a clean navigation dead-end with no exception).
+
+**Why it's worth a ticket (not just "this ATS is hard"):**
+- `-2` is in the `--reset-failed` retry pool, so this job re-burns the same ~40s + 3 LLM calls on every future `--auto` run and can never succeed as-is.
+- The redirect pattern (an ATS "boards" URL bouncing to a company-branded careers SPA that hides the apply CTA behind a click) is not MongoDB-specific — several large employers configure Greenhouse this way.
+
+**Suggested fix / next steps (pick one or more):**
+1. **Canonical embed retry:** when the landing host differs from the `application_url` host and the original was `*.greenhouse.io`, retry once against the iframe-embed host `https://job-boards.greenhouse.io/<slug>/jobs/<id>` (renders the bare form directly) before entering the step-loop.
+2. **Un-stick the scroll loop:** if two consecutive `scroll` actions produce no URL change and no new form fields / no Apply control, let the loop try clicking a visible `Apply` link even though the generic prompt currently discourages bare "Apply" nav links.
+3. **Cheaper give-up + correct terminal state:** detect "no form, no reachable apply control after 2 scrolls" and mark it `-3` (needs a human) instead of `-2`, so it leaves the auto-retry pool. Lowest-effort mitigation; forfeits the apply but stops the churn.
+
+**Affected users / impact:** one job per run stuck in a no-op retry loop; a class of Greenhouse-backed employers with custom careers SPAs is currently un-appliable via OffsiteApply.
