@@ -13,6 +13,7 @@ import pytest
 import config
 
 _ALL_VARS = [
+    "CLASSIFIER_ROUTE",
     "CLASSIFIER_MODEL", "CLASSIFIER_API", "CLASSIFIER_BASE_URL",
     "BROWSER_USE_MODEL", "BROWSER_USE_API", "BROWSER_USE_BASE_URL",
     "GUIDED_APPLY_MODEL",
@@ -128,6 +129,43 @@ def test_deprecation_warning_emitted_once(monkeypatch, recwarn):
     config.get_llm_config("browser_use")
     deprecations = [w for w in recwarn.list if issubclass(w.category, DeprecationWarning)]
     assert len(deprecations) == 1
+
+
+# ── classifier route (T38) ─────────────────────────────────────────────────────
+
+def test_classifier_route_defaults_to_agent():
+    assert config.get_classifier_route() == "agent"
+
+
+def test_classifier_route_nim_opt_in(monkeypatch):
+    monkeypatch.setenv("CLASSIFIER_ROUTE", "nim")
+    assert config.get_classifier_route() == "nim"
+
+
+def test_classifier_route_is_case_insensitive_and_trimmed(monkeypatch):
+    monkeypatch.setenv("CLASSIFIER_ROUTE", "  NIM  ")
+    assert config.get_classifier_route() == "nim"
+
+
+def test_classifier_route_blank_falls_through_to_agent(monkeypatch):
+    monkeypatch.setenv("CLASSIFIER_ROUTE", "   ")
+    assert config.get_classifier_route() == "agent"
+
+
+def test_classifier_route_bad_value_warns_and_defaults(monkeypatch):
+    monkeypatch.setenv("CLASSIFIER_ROUTE", "OpenAI")
+    with pytest.warns(RuntimeWarning, match="OpenAI"):
+        assert config.get_classifier_route() == "agent"
+
+
+def test_apply_jobs_nim_flag_defaults_off_on_clean_import():
+    """The T38 contract: a clean-env import of apply_jobs resolves the NIM
+    classifier route OFF, so no CLASSIFIER_API is needed by default. (The
+    routing suite's autouse fixture forces it True; nothing else pins the
+    default.)"""
+    import apply_jobs
+
+    assert apply_jobs._NIM_CLASSIFIER_ENABLED is False
 
 
 # ── guards ─────────────────────────────────────────────────────────────────────
