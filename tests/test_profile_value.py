@@ -104,10 +104,11 @@ def test_numbers_experience_and_salary():
     assert _gpv(PROFILE, "Years of experience", "number") == "10"
     assert _gpv(PROFILE, "How many years of experience do you have?", "number") == "10"
     # T32: an unmapped "years with <specific skill>" question must NOT return "0"
-    # for a plausible adjacent skill — that reads as "no experience" and gets the
-    # applicant auto-filtered. Capped at 2, never above the profile total.
+    # (reads as "no experience" and gets the applicant auto-filtered). For a skill
+    # with no overlap at all with this backend/AI profile the floor is "1" — not a
+    # fabricated "2".
     de = _gpv(PROFILE, "How many years of Data Engineering experience do you have?", "text")
-    assert de != "0" and de == "2"
+    assert de not in ("0", None) and de == "1"
     # A recognised data/AI skill still routes through the AI-skills branch ("1").
     assert _gpv(PROFILE, "How many years of machine learning experience?", "text") == "1"
     # No profile years_experience at all -> "1", matching the AI/ML branch so an
@@ -189,16 +190,21 @@ def test_coerce_numeric_answer_detection_is_scoped_to_real_numeric_fields():
 
 # ── T32: unmapped "years of <skill>" never falls back to 0 ───────────────
 
-def test_years_of_specific_skill_never_returns_zero():
+def test_years_of_specific_skill_never_returns_zero_but_is_not_fabricated():
     # The exact reported failure: "years of Data Engineering experience = 0" for a
-    # data-focused applicant. No "how many" prefix — must still be caught.
+    # data-focused applicant. No "how many" prefix — must still be caught. For a
+    # skill with no overlap with this profile (title "Senior Software Engineer",
+    # summary "…a decade of backend experience", skills Python/SQL/ML) the answer
+    # is the "1" floor — never 0, but also NOT a fabricated "2".
     de = _gpv(PROFILE, "Years of Data Engineering experience", "text")
     assert de not in (None, "0", "")
-    assert de == "2"                       # adjacent skill -> capped at 2
-    # "years with <skill>" phrasing.
-    assert _gpv(PROFILE, "Years with Rust", "number") == "2"
+    assert de == "1"
+    assert _gpv(PROFILE, "Years with Rust", "number") == "1"
     assert _gpv(PROFILE, "How many years of work experience do you have with .NET Framework?",
-                "text") == "2"
+                "text") == "1"
+    # T32's own warning: don't claim years of a niche tech never touched.
+    assert _gpv(PROFILE, "How many years of COBOL experience?", "text") == "1"
+    assert _gpv(PROFILE, "Years of management experience", "text") == "1"  # applicant is an IC
 
 
 def test_years_of_a_listed_skill_uses_full_tenure():
@@ -207,6 +213,15 @@ def test_years_of_a_listed_skill_uses_full_tenure():
     # (never inflated above it).
     assert _gpv(PROFILE, "How many years of Python experience do you have?", "text") == "10"
     assert _gpv(PROFILE, "Years with SQL", "text") == "10"
+
+
+def test_years_of_skill_adjacent_to_background_is_capped_at_two():
+    # A skill that isn't in the list but overlaps a content word in the
+    # title / headline / summary is treated as adjacent -> capped at 2.
+    p = dict(PROFILE, summary="Backend engineer who owns the data pipeline and ETL stack.")
+    assert _gpv(p, "Years of data pipeline experience", "text") == "2"   # "data" ∈ summary
+    # …and a skill with no overlap at all still floors at 1, not 2.
+    assert _gpv(p, "Years of COBOL experience", "text") == "1"
 
 
 def test_years_of_skill_falls_back_to_one_without_an_overall_figure():
