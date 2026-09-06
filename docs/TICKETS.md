@@ -12,7 +12,7 @@ Baseline captured 2026-08-28. `docs/baseline/db_state.baseline.txt` holds the DB
 | 2 | T6 #9, T13 #8, T9 #10, T4 #11, T23 #12, T3 #13 | ✅ **CLOSED** — QA passed 2026-08-29 (`docs/qa/wave2-qa.md`). T9 shipped a P1 regression (`create_tables()` crash on unmigrated DB); fixed by T23 hotfix. |
 | 3 — Phase 2 | T14 #15, T26 #19, T27 #20, T14b #22 | ✅ **CLOSED** 2026-09-03. **The entire LLM stack is off the `claude` subprocess.** T14: Agent SDK wrapper + classifier routing (validated with 2 real applications). T26: `max_turns` fix. T27: NIM-tier hardening (model → `meta/llama-3.2-11b-vision-instruct`, circuit breaker, spam reorder, Greenhouse un-block; bundled T28+T29). T14b: browser agent (`_llm_guided_apply`, EEO pickers, `ScriptApplyEngine`) → one-shot `llm.query`/`query_json`; all dead `AsyncOpenAI` plumbing + the `load_env` `LLM_API` hard-exit removed. 154 tests. |
 | 4 — Phase 3 | ~~T15 browser-use spike~~ | **DROPPED** 2026-09-03 (owner: "skip all NIM-specific tasks, keep going with Agent SDK"). browser-use needs a working free NIM model; the whole tier is unreliable. `verify_submission` unification (T15's non-NIM half) folds into T33. |
-| 4/5 | **T33** — OffsiteApply flow reliability | **next** — unified `verify_submission` (fix Rippling `/jobs?page=0` false-negative), blocked-domain jobs → skip not auto-fail, T31 (prose in numeric fields), T32 (undersold answers). |
+| 4/5 | **T33** — OffsiteApply flow reliability | ✅ **CLOSED** — merged (PR #25). Unified `verify_submission` (Rippling `/jobs?page=0` false-negative), blocked-domain jobs → `-3` not auto-fail. First pass at T31/T32; the rest split to their own PR (see `## T31 / T32`). |
 | 5 — Phase 4 | **T16b** — decompose `_llm_guided_apply` on the Agent SDK (primary OffsiteApply path) + retire `ScriptApplyEngine` | ✅ **CLOSED** 2026-09-05 — PR 1 (#30) + PR 2 (#31) merged, QA passed (live run: 3 real applications inc. multi-step Rippling, 2 correct `-3` blocks, 0 errors). `ScriptApplyEngine` gone; OffsiteApply is a single decomposed step-loop engine. |
 | 6 — Phase 5 | T17 — scraper cleanup | needs T12 ✓ |
 | Follow-ups | T19 T20 T21 T22 T24 · T30 **parked** (NIM — owner: leave it, circuit breaker handles bad days) | not started (P2–P3) |
@@ -24,8 +24,9 @@ Baseline captured 2026-08-28. `docs/baseline/db_state.baseline.txt` holds the DB
 | # | Sev | Summary |
 |---|---|---|
 | T30 | P2 | New classifier `meta/llama-3.2-11b-vision-instruct` returned non-JSON ~1/3 of NIM-route calls in the real flow, and was 8-12s (not the ~1.5s probe). Contained (deferred, not lost) but the NIM route's value (free) is thin vs Agent SDK (reliable, same latency). Watch; revisit routing. **Data point (T16b QA, 2026-09-05):** 11 jobs hit the NIM classifier — 3 non-JSON (27%) + 1 timeout (T27 breaker correctly routed that one to the Agent SDK). Consistent with the "~1/3" figure, not worse; staying parked. **Concrete fix for whenever this is revisited:** the T27 circuit breaker falls back to the Agent SDK on *timeout* but NOT on *non-JSON parse error* (non-JSON just retries once then defers). Routing non-JSON failures through the same Agent-SDK fallback would have salvaged all 3 deferred jobs in that run. |
-| T31 | P2 | Agent fills free-text "Rate your experience (1-10)" fields with prose (`"I would rate my experience at an 8 out of 10…"`) instead of a number. |
-| T32 | P2 | Agent answered "years of Data Engineering experience = 0" for a data-focused applicant (undersells). Also a Playwright tab crash mid-fill → `applied=-2` auto-fail (browser stability). |
+| T31 | P2 | ✅ fixed (PR pending) — see `## T31 / T32` below. Numeric/scale free-text fields got prose instead of a bare number. |
+| T32 | P2 | ✅ fixed (PR pending) — see `## T31 / T32` below. Unmapped "years of &lt;skill&gt;" fields undersold to `0`. |
+| T36 | P3 | (split out of T32) Playwright tab crash mid-fill → `applied=-2` auto-fail. Browser-stability concern, not form-answer quality — needs its own ticket. |
 | — | P3 | (T14b reviewer note) Watch for orphaned `claude` processes after timeout-heavy runs — `asyncio.wait_for` on `llm.query` cancels the SDK generator mid-iteration; subprocess cleanup then depends on the SDK's `GeneratorExit` handling. |
 
 **T27 .env:** classifier model must be `meta/llama-3.2-11b-vision-instruct` (via `CLASSIFIER_MODEL` or the legacy `CLASSIFIER_LLM_MODEL`) — done 2026-09-02.
@@ -443,3 +444,34 @@ Note the **login-wall-with-credentials-that-fail-to-log-in** branch (also ~3316-
 **Acceptance:** a job where `_handle_auth_page` is reached via the pre-flight login-path check, stored credentials exist for the domain, and the login attempt itself fails, ends the run `applied=-2` (retryable), not `-3`. A job with no stored/discoverable credentials at all still correctly ends `-3`. Regression test covering both branches of `_handle_auth_page`'s caller at `:3212-3217` (not just the mid-loop `:3320-3323` one T34 covered). `pytest tests/` green.
 
 **Fix (this PR):** `_handle_auth_page` (`linkedin_apply.py:4628`) changed its return type from a plain `bool` to `bool | str`: `True` on successful auth, `"failed"` when stored credentials exist for the domain but the login attempt itself fails, `"blocked"` when no stored/discoverable credentials exist at all — mirroring the `"blocked"`/`"failed"` string idiom `run_session` and the mid-loop check already use. The missing `return` after the "login failed with stored credentials" print (`:4679`) is now explicit (`return "failed"`) instead of falling through into the no-credentials branch's `return "blocked"` a few lines later. Its sole caller — the pre-flight login-path check (`:3212-3217`) — now branches on `ok is not True` and inspects the string: `"failed"` → `return "failed"` (`applied=-2`, retryable), anything else → `return "blocked"` (`applied=-3`, unchanged). `_handle_auth_page` has exactly one call site in the codebase (confirmed by grep), so no other caller needed updating. Added two regression tests to `tests/test_blocked_status.py` targeting this pre-flight call site specifically (T34's existing tests only covered the mid-loop `:3320-3323` check, which never had this bug): a login-path URL (e.g. `/login`) with no stored credentials → `"blocked"`, and the same URL with stored credentials that fail to log in → `"failed"`. `pytest tests/` (186 tests) green; `ruff check` on the two changed files clean (the pre-existing ~400 lint findings elsewhere in `linkedin_apply.py` are untouched debt, not introduced by this change).
+
+---
+
+## T31 / T32 — form answer quality (numeric fields + undersold "years of X")
+
+**Phase:** T33 follow-up · **Risk:** low · **Status:** ✅ fixed (PR pending) · From the T27/T14b live apply runs 2026-09-01/02.
+
+Both bugs live in the same code area (form answer generation), so they ship together. T33 (PR #25) landed a first pass — the `_coerce_numeric_answer` helper and a capped `_get_profile_value` "how many years" branch. This PR closes the paths that pass left uncovered.
+
+### T31 — numeric / 1-N-scale fields got prose instead of a number
+Symptom: "Rate your experience (1-10)" / "How many years…" free-text fields filled with `"I would rate my experience at an 8 out of 10…"` instead of `8`. Seen on both EasyApply and OffsiteApply.
+
+**Fix:** `_coerce_numeric_answer` (already the shared coercion point — numeric-label detection + prose→bare-int + range clamp + sensible fallback, no-op for genuine free text / selects / textareas) is now wired into **every** fill path:
+- EasyApply one-shot LLM fill (`linkedin_apply._ask_llm`) — already wired in T33, unchanged.
+- OffsiteApply step loop (`_llm_guided_apply` orchestrator, before `_execute_action`) — was only coerced when the action `selector` matched a snapshot field by `id`/`name`. Now also falls back to the LLM's own `text` label hint when the selector doesn't resolve (CSS-class / xpath / `:has-text` selectors). `_execute_action` itself is untouched (T16b PR-2 byte-for-byte seam preserved).
+- **New:** the interactive `[f]` focused-field helper (`apply_jobs._llm_fill_focused`) now coerces its result too — it was the one fill path with no coercion.
+- Both LLM fill prompts (`_ask_llm`, `_ask_llm_action`) gained an explicit "reply with just a number" instruction for years/scale questions.
+
+### T32 — unmapped "years of &lt;skill&gt;" fields undersold to `0`
+Symptom: "Years of Data Engineering experience" → `0` for an applicant with `years_experience: "4"` and adjacent skills; "years with C#" / ".NET Framework" → `0` for a 4-YoE engineer.
+
+**Fix:** `_get_profile_value`'s "years of &lt;skill&gt;" branch was broadened from matching only `"how many years"` / `"how many months"` to also catch `"years of"` / `"years with"` phrasings (the exact reported label "Years of Data Engineering experience" has no "how many" prefix), excluding `"relevant"` / `"total"` questions which want the full figure and are handled downstream. The fallback is now:
+- skill the applicant actually lists (matched word-boundary against `profile["skills"]`) → their full `years_experience` (still capped at that figure — never inflated);
+- adjacent / unrecognised skill → `min(years_experience, 2)`;
+- no usable overall figure → `"1"` (matches the AI/ML branch, so an unrecognised skill never claims more than a recognised one);
+- never `0`. A truthful zero is only produced by `_coerce_numeric_answer`'s negative-phrase guard ("none", "never", "n/a") when the LLM's own answer positively says no experience.
+Both OffsiteApply and EasyApply LLM prompts also now instruct: never answer `0` for a "years of X" question unless the profile shows no experience; default to the overall figure.
+
+**Tests (`tests/test_profile_value.py`, following the existing `_get_profile_value` style):** numeric detection positive + negative ("describe your … experience" free-text stays prose), prose→number coercion, the "years of X" non-zero fallback (adjacent → 2, listed skill → full tenure, no figure → 1), "relevant"/"total" still return the full figure, and a regression that a genuine `0` (explicit-no answer) stays `0`. Full suite: 235 passed (was 230). `ruff check` diff-scoped: 428 = 428 (pre-existing repo lint debt untouched).
+
+**Out of scope / follow-up:** T32's original row also noted a Playwright tab crash mid-fill → `applied=-2` — that's a browser-stability concern, not form-answer quality. Split out as **T36** (P3) in the follow-up table; no quick guard added here.

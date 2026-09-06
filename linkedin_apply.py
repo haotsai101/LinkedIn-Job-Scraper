@@ -565,20 +565,43 @@ def _get_profile_value(profile: dict, label: str, kind: str = "text") -> str | N
         "transformer", "diffusion model", "reinforcement learning",
     )) and kind in ("text", "number"):
         return "1"
-    if any(k in l for k in ("how many years", "how many months")) and kind in ("text", "number"):
-        # Unmapped technology-specific "years with <X>" question (T32). "0" reads
-        # as "no experience at all" and gets the applicant auto-filtered; for a
-        # plausible adjacent skill a conservative real figure is safer. Cap an
-        # unrecognised skill at 2 years and never exceed the applicant's overall
-        # experience — and fall back to "1" (matching the recognised-AI/ML branch
-        # above) when the profile has no usable total, so an *unrecognised* skill
-        # never claims MORE than a recognised one. Does not fabricate expertise;
-        # just stops "0 years of Data Engineering" for a data-focused applicant.
+    if (any(k in l for k in ("how many years", "how many months", "years of", "years with",
+                             "yrs of experience", "yrs experience"))
+            and not any(k in l for k in ("relevant", "total"))
+            and kind in ("text", "number")):
+        # Unmapped "years of <specific skill>" question (T32). "0" reads as "no
+        # experience at all" and gets the applicant auto-filtered, so it is never
+        # returned here — a truthful zero is only produced when the answer text
+        # positively says so (_coerce_numeric_answer's negative-phrase guard).
+        #   * a skill the applicant actually lists -> their full tenure, still
+        #     capped at the overall years_experience figure (never inflated);
+        #   * an adjacent / unrecognised skill     -> capped at 2 years;
+        #   * no usable overall figure             -> "1" (matches the AI/ML
+        #     branch above, so an unrecognised skill never claims MORE than a
+        #     recognised one).
+        # ("relevant" / "total" experience questions are excluded — they want the
+        # full figure and are handled by the "total years" branch further down.)
         try:
             _tot_years = int(float(str(p.get("years_experience", "")).strip() or 0))
         except (TypeError, ValueError):
             _tot_years = 0
-        return str(min(_tot_years, 2)) if _tot_years > 0 else "1"
+        if _tot_years <= 0:
+            return "1"
+        _skills = p.get("skills") or []
+        if isinstance(_skills, str):
+            _skills = re.split(r"[,;]", _skills)
+        _known_skill = False
+        for _sk in _skills:
+            for _part in re.split(r"[/,]", str(_sk).lower()):
+                _part = _part.strip()
+                if len(_part) >= 2 and re.search(
+                    r"(?<![a-z0-9+#.])" + re.escape(_part) + r"(?![a-z0-9+#.])", l
+                ):
+                    _known_skill = True
+                    break
+            if _known_skill:
+                break
+        return str(_tot_years) if _known_skill else str(min(_tot_years, 2))
     # "Are you currently on OPT or STEM OPT?" → Yes if profile work_authorization is OPT/STEM
     if any(k in l for k in ("opt or stem", "opt/stem", "stem opt", "currently on opt")) \
             and kind in ("select", "select-one", "radio"):
@@ -1145,6 +1168,10 @@ async def _ask_llm(model: str, profile: dict, field: dict) -> str | None:
             "If radio/select, reply with exactly one of the listed options — always pick one, never leave blank. "
             "For Yes/No experience or skill questions, pick the truthful answer based on the profile, or 'No' as a safe default if unknown. "
             "For ANY numeric/years/experience text field, always reply with a number — never leave blank. "
+            "For a 'years of <skill>' or 'how many years' question, reply with just a number "
+            "and never 0 unless the profile clearly shows no experience with that skill — "
+            "default to the profile's overall years of experience for a skill in the "
+            "applicant's background. "
             "CRITICAL: Never fabricate URLs, social media handles, usernames, or specific data not in the profile. "
             "For URL/link fields (Twitter, Instagram, Facebook, personal blog, etc.) not explicitly in the profile, reply with an empty string. "
             "If the profile has no relevant info for a non-select/non-radio non-numeric field, reply with an empty string. "
@@ -2800,6 +2827,10 @@ class OffsiteApplyFlow:
             "Never re-fill a field already in 'Actions taken so far'. Never Cancel/Sign-out. "
             "Never fill or upload to any field labeled 'Cover Letter' or 'Covering Letter' — skip entirely. "
             f"Sponsorship questions: answer '{_sponsor_val}'. Work authorization: always 'Yes'. "
+            "For a 'years of <skill>' or 'how many years' field, fill just a number — never 0 "
+            "unless the profile clearly shows no experience with that skill; default to the "
+            "profile's overall years of experience (yrs=...) for a skill in the applicant's "
+            "background. "
             "CRITICAL: Never fabricate URLs, social media handles, usernames, or any information not in the profile. "
             "For any field where you have no value (optional URL, referral email, social handle, portfolio, etc.) — do NOT issue a fill action at all. Skip that field entirely and move to the next [EMPTY] field or click Submit. Never fill a field with an empty string (value='') — an empty fill does nothing useful and can trigger browser validation errors. "
             "If all [EMPTY] fields are filled and a submit button is listed as (offscreen), use action=click with its selector to click it — do not scroll first. "
@@ -3601,12 +3632,15 @@ class OffsiteApplyFlow:
             value = action.get("value", "")
             # T31: if the LLM is filling a numeric / 1-N-scale field with prose,
             # reduce it to the bare integer. Resolve the target field from the
-            # snapshot by matching its id/name against the selector.
-            if action_type == "fill" and value and selector:
+            # snapshot by matching its id/name against the selector; when that
+            # fails (selector is a CSS class / xpath / :has-text pattern), fall
+            # back to the LLM's own label hint in ``text``. _coerce_numeric_answer
+            # is a no-op for a non-numeric label, so the fallback is safe.
+            if action_type == "fill" and value:
                 _tgt = next(
                     (f for f in snapshot.get("fields", [])
-                     if (f.get("id") and f["id"] in selector)
-                     or (f.get("name") and f["name"] in selector)),
+                     if (f.get("id") and selector and f["id"] in selector)
+                     or (f.get("name") and selector and f["name"] in selector)),
                     None,
                 )
                 if _tgt:
@@ -3614,6 +3648,8 @@ class OffsiteApplyFlow:
                         _tgt.get("label") or "", value,
                         _tgt.get("type", "text"), self.profile,
                     )
+                elif text:
+                    value = _coerce_numeric_answer(text, value, "text", self.profile)
             # Capture per-step observation and append to running context
             update = action.get("update", "").strip()
             if update:

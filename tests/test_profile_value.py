@@ -170,6 +170,56 @@ def test_coerce_numeric_answer_keeps_an_explicit_negative_at_zero():
     assert _coerce("Years of experience with Fortran", "n/a", "text",
                    {"years_experience": "10"}) == "0"
     assert _coerce("How many years with Haskell?", "never", "text") == "0"
+    # A bare "0" the model produced for an explicit-no skill also stays 0.
+    assert _coerce("How many years of Fortran?", "0", "text", PROFILE) == "0"
+
+
+def test_coerce_numeric_answer_detection_is_scoped_to_real_numeric_fields():
+    # T31: a genuine free-text prompt that merely contains the word "experience"
+    # (no "rate", no "years of", no scale) must keep its prose answer.
+    prose = "I built ETL pipelines and owned the data warehouse for two teams."
+    assert _coerce("Describe your data engineering experience", prose, "text") == prose
+    assert _coerce("Tell us about a challenge you overcame", prose, "text") == prose
+    # A number that happens to appear in an otherwise free-text answer is NOT
+    # extracted when the field isn't numeric.
+    assert _coerce("What interests you about this role?",
+                   "I have shipped 3 production systems", "text") == \
+        "I have shipped 3 production systems"
+
+
+# ── T32: unmapped "years of <skill>" never falls back to 0 ───────────────
+
+def test_years_of_specific_skill_never_returns_zero():
+    # The exact reported failure: "years of Data Engineering experience = 0" for a
+    # data-focused applicant. No "how many" prefix — must still be caught.
+    de = _gpv(PROFILE, "Years of Data Engineering experience", "text")
+    assert de not in (None, "0", "")
+    assert de == "2"                       # adjacent skill -> capped at 2
+    # "years with <skill>" phrasing.
+    assert _gpv(PROFILE, "Years with Rust", "number") == "2"
+    assert _gpv(PROFILE, "How many years of work experience do you have with .NET Framework?",
+                "text") == "2"
+
+
+def test_years_of_a_listed_skill_uses_full_tenure():
+    # A skill the applicant actually lists (PROFILE skills = "Python, SQL, ML")
+    # gets their real tenure, still capped at the overall years_experience figure
+    # (never inflated above it).
+    assert _gpv(PROFILE, "How many years of Python experience do you have?", "text") == "10"
+    assert _gpv(PROFILE, "Years with SQL", "text") == "10"
+
+
+def test_years_of_skill_falls_back_to_one_without_an_overall_figure():
+    # No usable years_experience -> "1" (matches the AI/ML branch), never "0".
+    assert _gpv({}, "How many years of Rust experience?", "text") == "1"
+    assert _gpv({"skills": "Rust"}, "Years with Rust", "text") == "1"
+
+
+def test_relevant_and_total_experience_questions_keep_the_full_figure():
+    # "relevant" / "total" year questions are excluded from the capped-at-2 branch
+    # — they want the whole figure.
+    assert _gpv(PROFILE, "Total years of relevant experience", "text") == "10"
+    assert _gpv(PROFILE, "Years of relevant experience", "text") == "10"
 
 
 # ── work authorization / visa / citizenship ───────────────────────────────────
