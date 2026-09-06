@@ -50,7 +50,7 @@ WHERE applied = -1
 | T19 | P2 | Auto-run pending migrations at *every* entrypoint (not just apply). Consolidate `_ensure_apply_schema` / `migrate_db` / `ensure_schema_current`. Add DB backup before migration. |
 | T20 | P3 | `ruff` not in the interpreter that runs the agent — document/bootstrap lint. |
 | T21 | P2 | ✅ **CLOSED** (#33, QA'd 2026-09-06) — `fetch_job_details_op` had the same required-config bug T6 fixed for `search_jobs_op`; `details_schedule` (`RUNNING`, no run_config) failed config validation every 12h. Fixed with `Field(Int, default_value=25/30)`. |
-| T22 | P2 | `blocked_entities.ats_domain` rows are seeded but `run_session` still reads `BLOCKED_DOMAINS` from the Python constant — table not wired for domain blocks. |
+| T22 | P2 | ✅ fixed (PR pending) — `run_session` loads `ats_domain` rows from `blocked_entities` once per session and the per-job check matches them (host-suffix) against `posting_domain`/`application_url`, marking a hit `applied=-3`. Operator-added domain blocks now fire with no code change. |
 | T24 | P3 | `ensure_schema_current` backfill gate can't distinguish "unparseable" from "not yet done" — a permanently-NULL `listed_epoch` row would re-trigger the full-table backfill every startup. Zero impact on current data. Fold into T19. |
 
 ## Dependency graph
@@ -331,11 +331,20 @@ T8's indexes + WAL and T9's schema changes only take effect when the operator ma
 
 ## T22 — Wire `blocked_entities.ats_domain` to `run_session`
 
-**Phase:** follow-up · **Risk:** low · **Deps:** T9 (done) · Raised by the T9 reviewer.
+**Phase:** follow-up · **Risk:** low · **Deps:** T9 (done) · **Status:** ✅ fixed (PR pending) · Raised by the T9 reviewer.
 
 T9 created `blocked_entities` and seeds `ats_domain` rows, but `run_session`'s URL check still reads `BLOCKED_DOMAINS` (derived from the frozen `BLOCKED_ENTITIES_SEED` Python constant), so an operator adding an `ats_domain` row to the table is silently ignored. Have `run_session` load `ats_domain` patterns from the table once per session (mirror the `get_pending_jobs` approach), making the table authoritative for domain blocks too.
 
-**Acceptance:** adding an `ats_domain` row to `blocked_entities` blocks that domain on the next apply session with no code change.
+**Fix (this PR):**
+- New helper `apply_jobs.load_session_blocked_domains(cursor)` → `BLOCKED_DOMAINS | {pattern FROM blocked_entities WHERE kind = 'ats_domain'}`, `.strip().lower()`-normalised, whitespace-only rows dropped (a bare `'   '` would otherwise normalise to `""` and wildcard-match every job). Union keeps the seed authoritative on a not-yet-migrated DB; missing table → `sqlite3.OperationalError` caught → falls back to the constant.
+- New host matcher `_match_blocked_domain(blocked_domains, *candidates)`, a sibling of `_match_spam_domain` — both now share extracted `_host_of` / `_host_matches` helpers (host-suffix match: `rex.zone` ≠ `forex.zone`; **not** the old substring `in` test).
+- `run_session` loads `session_blocked_domains` once at session start and the per-job check calls `_match_blocked_domain(session_blocked_domains, posting_domain, application_url)`. **Corrected from PR #37 round 1:** the check previously read `url` (`= j.job_posting_url`), which is *always* a `linkedin.com/jobs/view` link (verified 123/123 rows), so no `ats_domain` pattern could ever fire. The ATS host lives in `posting_domain` / `application_url` (the same inputs the spam filter uses).
+- An operator explicitly blocking a domain means "never attempt this" → the check now marks `applied = -3` (blocked, excluded from `--reset-failed`), consistent with T33/T34's `-3` for un-automatable ATS domains. Was `-1`.
+- `BLOCKED_COMPANIES` has no analogous staleness — not read anywhere in `run_session`; company blocks are already table-authoritative via `get_pending_jobs`'s `NOT EXISTS`.
+
+New `tests/test_session_blocked_domains.py` (15 cases): operator row blocks end-to-end with no code change; the linkedin `job_url` never trips the check; host-suffix not substring; whitespace-only row can't wildcard; table-missing fallback; seed still blocks; `inspect.getsource` guard that `run_session` feeds `posting_domain`/`application_url` (not `url`) into the matcher and marks `-3`. `pytest tests/` 255 green; `ruff check apply_jobs.py` 42 findings (43 pre-existing on master − 1 removed here, 0 added).
+
+**Acceptance:** ✅ adding an `ats_domain` row to `blocked_entities` blocks that domain on the next apply session with no code change.
 
 ---
 
