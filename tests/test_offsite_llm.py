@@ -130,6 +130,22 @@ def test_ask_llm_genuine_free_text_still_gets_prose(monkeypatch):
     assert "2-4 sentence" in stub.calls[0]["prompt"]
 
 
+def test_ask_llm_star_question_with_a_hint_token_gets_prose(monkeypatch):
+    # T37 review: a long STAR question that *contains* "how many" / "rate" but
+    # also a free-text cue ("describe", "give an example") must take the prose
+    # path and NOT be digit-coerced — the inverse of the T37 bug.
+    prose = ("There were several occasions, most memorably in 2021 when I pushed "
+             "back on a rushed migration.")
+    stub = _install(monkeypatch, _QueryStub(prose))
+    out = asyncio.run(linkedin_apply._ask_llm(
+        GUIDED_MODEL, {"years_experience": 8},
+        {"label": "How many times have you had to advocate for an unpopular "
+                  "decision? Give an example.", "kind": "text"},
+    ))
+    assert out == prose
+    assert "2-4 sentence" in stub.calls[0]["prompt"]
+
+
 # ── _ask_llm_action decide-action loop ─────────────────────────────────────
 
 _SNAP = {"visible_text": "Apply now", "fields": [], "url": "https://ex.com/apply"}

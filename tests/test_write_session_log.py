@@ -42,6 +42,12 @@ def test_write_session_log_recovers_from_dict_without_sessions_key(monkeypatch, 
     assert out == {"sessions": [_REPORT]}
 
 
+def test_write_session_log_recovers_from_wrong_typed_sessions_value(monkeypatch, tmp_path):
+    # T37 review: {"sessions": 5} / {"sessions": {}} also must not crash.
+    assert _run(monkeypatch, tmp_path, '{"sessions": 5}') == {"sessions": [_REPORT]}
+    assert _run(monkeypatch, tmp_path, '{"sessions": {}}') == {"sessions": [_REPORT]}
+
+
 def test_write_session_log_appends_to_a_well_formed_file(monkeypatch, tmp_path):
     prior = {"ts": "earlier"}
     out = _run(monkeypatch, tmp_path, json.dumps({"sessions": [prior]}))
