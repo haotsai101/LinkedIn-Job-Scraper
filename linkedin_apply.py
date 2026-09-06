@@ -888,12 +888,17 @@ def _coerce_numeric_answer(label: str, answer: str, kind: str = "text",
 
     * the first ``\\d+`` in the answer wins, clamped to a range stated in the
       label (e.g. ``(1-10)``, ``1 to 5``);
-    * when the label states **no** explicit range and the field is not
-      ``type=number``, the digit is only trusted if the answer is already
-      basically-a-number (``<= 40`` chars, or nothing but a single number with
-      surrounding punctuation) — otherwise a stray year/count inside a genuine
-      prose sentence ("…most memorably in 2021 when I…") would be mistaken for
-      the answer (T37 review). Such answers fall through to the no-digit path.
+    * a label with an explicit range **or** a strong rating cue (``rate`` /
+      ``rating`` / ``on a scale`` / ``scale of``) is a strong enough signal to
+      grab the digit unconditionally — "Rate your Python proficiency" (no
+      parenthetical) still reduces a verbose "…probably an 8 out of 10…" answer;
+    * otherwise (a plain "how many …" / "years of …" label, no range, not
+      ``type=number``) the digit is only trusted when the answer already looks
+      like a number: ``<= 60`` chars, the digit is the first token, the digit is
+      glued to a "years"/"months" unit, or the whole answer is just the number
+      with surrounding punctuation. A stray year/count inside a genuine prose
+      sentence ("…most memorably in 2021 when I…") is NOT grabbed (T37 review) —
+      such answers fall through to the no-digit path.
     * no confident digit → a sensible fallback: the profile's ``years_experience``
       for a "years"/"months" question, the midpoint of a stated scale otherwise,
       and finally the answer unchanged.
@@ -920,6 +925,11 @@ def _coerce_numeric_answer(label: str, answer: str, kind: str = "text",
         return answer
     rng = re.search(r"(\d+)\s*(?:-|–|to)\s*(\d+)", lab)
     lo, hi = (int(rng.group(1)), int(rng.group(2))) if rng else (None, None)
+    # A rating label ("Rate your X", "on a scale, rate …") is as strong a signal
+    # as an explicit (1-N) range — a range-less rating field is very common and
+    # otherwise re-opens the T31 bug (T37 review). The free-text-cue short-circuit
+    # above already ran, so "Describe a time you rated a peer …" stays prose.
+    rating_label = bool(re.search(r"\brate\b|\brating\b|on a scale|scale of", lab))
 
     m = re.search(r"\d+", s)
     if m:
@@ -928,11 +938,15 @@ def _coerce_numeric_answer(label: str, answer: str, kind: str = "text",
             # An explicit range in the label is a strong signal — grab the digit
             # unconditionally and clamp it.
             return str(max(lo, min(hi, n)))
-        # No range stated. Trust the digit only when the field type says number,
-        # the answer is short, or the answer is essentially just the number with
-        # punctuation around it. A prose sentence that merely happens to contain
-        # a digit ("…took down 3 services for 40 minutes.") falls through.
-        if (kind == "number" or len(s) <= 40
+        if rating_label:
+            return str(n)
+        # Plain "how many …" / "years of …" label, no range. Trust the digit only
+        # when the answer already reads as a number, not a sentence that merely
+        # contains one ("…took down 3 services for 40 minutes." → falls through).
+        if (kind == "number"
+                or len(s) <= 60
+                or re.match(r"\s*\d", s)
+                or re.search(r"\b\d+\s*\+?\s*(?:years?|yrs?|months?|mos?)\b", s.lower())
                 or re.fullmatch(r"[\W_]*\d[\d\W_]*", s)):
             return str(n)
 

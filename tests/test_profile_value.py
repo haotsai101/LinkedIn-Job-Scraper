@@ -19,7 +19,11 @@ import linkedin_apply as la
 
 _gpv = la._get_profile_value
 _coerce = la._coerce_numeric_answer
-_label_is_numeric = la._label_is_numeric
+# T37 symbols — via getattr so a pre-fix tree fails these tests as clean
+# assertion/TypeError failures inside the test body, not a whole-file collection
+# error.
+_label_is_numeric = getattr(la, "_label_is_numeric", None)
+_label_has_free_text_cue = getattr(la, "_label_has_free_text_cue", None)
 
 
 # A synthetic profile shaped like ``user_profile.json`` (see PROFILE_QUESTIONS in
@@ -237,7 +241,7 @@ def test_coerce_numeric_answer_handles_long_labelled_scale_prose():
 # ── T37 review: STAR / free-text questions that merely contain a hint token ────
 
 def test_label_has_free_text_cue():
-    cue = la._label_has_free_text_cue
+    cue = _label_has_free_text_cue
     assert cue("How many times have you had to escalate a production issue? Describe one.") is True
     assert cue("Tell us about a time you disagreed with your manager") is True
     assert cue("Why do you want to work here") is True
@@ -280,6 +284,45 @@ def test_coerce_numeric_answer_digit_grab_is_conservative_without_a_range():
         "Somewhere between eight and nine, call it 8 on an average sprint honestly",
         "number",
     ) == "8"
+
+
+def test_coerce_numeric_answer_rating_label_without_a_range_still_reduces_prose():
+    # T37 review #1: a rating label with NO "(1-N)" parenthetical is still a
+    # strong enough signal to grab the digit out of a verbose answer. Fails
+    # pre-fix (fell through to prose because len > 40 and no range).
+    assert _coerce(
+        "Rate your Python proficiency",
+        "I'd say I'm quite strong, probably an 8 out of 10 honestly, used daily",
+        "text",
+    ) == "8"
+    assert _coerce(
+        "On a scale, rate your SQL expertise",
+        "Comfortably a 7 — I write window functions and tune queries but rarely do DBA work",
+        "text",
+    ) == "7"
+    # …but a rating *cue* buried in a "describe a time" question stays prose.
+    assert _coerce(
+        "Describe a time you had to rate a peer honestly in a review",
+        "In 2022 I gave a report a 2 on communication and we built a plan together.",
+        "text",
+    ) == "In 2022 I gave a report a 2 on communication and we built a plan together."
+
+
+def test_coerce_numeric_answer_trusts_a_digit_glued_to_a_years_unit():
+    # T37 review #2: a verbose "how many years" answer (> 40 chars) where the
+    # digit is glued to a "years" unit -> extracted, not dropped to the T32
+    # undersell. Fails pre-fix (len 60+ -> fell through -> "1" / wrong skill).
+    assert _coerce(
+        "How many years of professional experience do you have with Python",
+        "I have approximately 5 years of professional experience with Python",
+        "text", {"years_experience": "9"},
+    ) == "5"
+    # digit as the first token of a longer answer is also trusted.
+    assert _coerce(
+        "How many years have you worked in data engineering roles specifically",
+        "6, though only 4 of those were with a modern lakehouse stack end to end",
+        "text",
+    ) == "6"
 
 
 # ── T32: unmapped "years of <skill>" never falls back to 0 ───────────────
