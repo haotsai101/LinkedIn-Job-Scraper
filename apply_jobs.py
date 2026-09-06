@@ -69,7 +69,7 @@ from linkedin_apply import (
     _coerce_numeric_answer,
     _get_profile_value,
 )
-from scripts.create_db import BLOCKED_ENTITIES_SEED, ensure_schema_current
+from scripts.create_db import BLOCKED_ENTITIES_SEED, ensure_db_ready, ensure_schema_current
 
 sys.stdout.reconfigure(line_buffering=True)
 
@@ -961,7 +961,9 @@ def _ensure_apply_schema(cursor):
     the ``_has_index`` check in ``get_pending_jobs`` a safety net rather than
     load-bearing.
     """
-    # TODO(T19): consolidate with the startup auto-migrator
+    # This is the cheap per-call path (get_pending_jobs calls it): schema
+    # modernization only, no migration discovery / backup. The numbered
+    # migrations run once per process from ``ensure_db_ready`` in ``main()`` (T19).
     ensure_schema_current(cursor.connection, cursor)
 
 
@@ -1689,7 +1691,11 @@ def main():
 
     conn   = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    migrate_db(conn, cursor)
+    migrate_db(conn, cursor)          # legacy: add jobs.applied on a pre-migrations DB
+    # T19: base DDL + ensure_schema_current + run any pending numbered migrations
+    # (schema_migrations tracking table, one-time DB backup). Idempotent no-op
+    # once the DB is current.
+    ensure_db_ready(conn, cursor, db_path=DB_PATH)
 
     if args.stats:
         print_stats(cursor)

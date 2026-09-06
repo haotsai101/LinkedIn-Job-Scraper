@@ -1,4 +1,4 @@
-from scripts.create_db import create_tables
+from scripts.create_db import ensure_db_ready
 from scripts.database_scripts import insert_data
 from scripts.fetch import JobDetailRetriever
 import sqlite3
@@ -12,7 +12,7 @@ MAX_UPDATES = 25
 conn = sqlite3.connect('linkedin_jobs.db')
 cursor = conn.cursor()
 
-create_tables(conn, cursor)
+ensure_db_ready(conn, cursor)
 
 
 job_detail_retriever = JobDetailRetriever()

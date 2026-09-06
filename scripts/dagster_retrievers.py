@@ -28,7 +28,7 @@ from dagster import (
     MetadataValue,
 )
 
-from scripts.create_db import create_tables
+from scripts.create_db import ensure_db_ready
 from scripts.database_scripts import insert_job_postings, insert_data
 from scripts.fetch import JobSearchRetriever, JobDetailRetriever
 from scripts.helpers import clean_job_postings
@@ -64,10 +64,10 @@ def search_jobs_op(context) -> dict:
     """
     keywords = context.op_config.get("keywords", SEARCH_KEYWORDS)
     pages_to_fetch = context.op_config.get("pages_to_fetch", 5)
-    
+
     conn = sqlite3.connect("linkedin_jobs.db")
     cursor = conn.cursor()
-    create_tables(conn, cursor)
+    ensure_db_ready(conn, cursor)
     
     logger.info(f"🔍 Starting job search for keywords: {keywords}")
     
@@ -148,10 +148,10 @@ def fetch_job_details_op(context) -> dict:
     """
     max_updates = context.op_config.get("max_updates", 25)
     sleep_time = context.op_config.get("sleep_time", 30)
-    
+
     conn = sqlite3.connect("linkedin_jobs.db")
     cursor = conn.cursor()
-    create_tables(conn, cursor)
+    ensure_db_ready(conn, cursor)
     
     logger.info(f"📋 Fetching details for up to {max_updates} jobs...")
     

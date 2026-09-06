@@ -15,7 +15,7 @@ Baseline captured 2026-08-28. `docs/baseline/db_state.baseline.txt` holds the DB
 | 4/5 | **T33** — OffsiteApply flow reliability | ✅ **CLOSED** — merged (PR #25). Unified `verify_submission` (Rippling `/jobs?page=0` false-negative), blocked-domain jobs → `-3` not auto-fail. First pass at T31/T32; the rest split to their own PR (see `## T31 / T32`). |
 | 5 — Phase 4 | **T16b** — decompose `_llm_guided_apply` on the Agent SDK (primary OffsiteApply path) + retire `ScriptApplyEngine` | ✅ **CLOSED** 2026-09-05 — PR 1 (#30) + PR 2 (#31) merged, QA passed (live run: 3 real applications inc. multi-step Rippling, 2 correct `-3` blocks, 0 errors). `ScriptApplyEngine` gone; OffsiteApply is a single decomposed step-loop engine. |
 | 6 — Phase 5 | T17 — scraper cleanup | needs T12 ✓ |
-| Follow-ups | T19 T20 T21 T22 T24 · T30 **CLOSED — superseded by T38** (NIM classifier now opt-in; Agent SDK is the default) | not started (P2–P3) |
+| Follow-ups | T19 ✅ + T24 ✅ (PR pending) · T22 ✅ (PR pending) · T21 **CLOSED** (#33) · T20 open · T30 **CLOSED — superseded by T38** (NIM classifier now opt-in; Agent SDK is the default) | P2–P3 |
 
 **Direction change (2026-09-03):** T14b live-QA runs confirmed the Agent SDK classifier is 100% reliable where NIM's model isn't (T30), but NIM stays for OffsiteApply classification with the circuit breaker as the safety net. The browser-use spike (T15) is dropped — the free NIM tier can't host an agentic browser model reliably. Remaining apply-agent work goes straight to hardening + decomposing `_llm_guided_apply` on the Agent SDK.
 
@@ -51,11 +51,11 @@ WHERE applied = -1
 
 | # | Sev | Summary |
 |---|---|---|
-| T19 | P2 | Auto-run pending migrations at *every* entrypoint (not just apply). Consolidate `_ensure_apply_schema` / `migrate_db` / `ensure_schema_current`. Add DB backup before migration. |
+| T19 | P2 | ✅ fixed (PR pending) — `scripts/migrations/runner.py:run_pending_migrations` + `scripts/create_db.py:ensure_db_ready` run pending `NNN_*.py` migrations (tracked in `schema_migrations`, one-time DB backup) at every entrypoint: both retrievers, both scraper Dagster ops, and `apply_jobs.main`. |
 | T20 | P3 | `ruff` not in the interpreter that runs the agent — document/bootstrap lint. |
 | T21 | P2 | ✅ **CLOSED** (#33, QA'd 2026-09-06) — `fetch_job_details_op` had the same required-config bug T6 fixed for `search_jobs_op`; `details_schedule` (`RUNNING`, no run_config) failed config validation every 12h. Fixed with `Field(Int, default_value=25/30)`. |
 | T22 | P2 | ✅ **CLOSED** (#37, QA 2026-09-06) — `run_session` loads `ats_domain` rows from `blocked_entities` once per session and the per-job check matches them (host-suffix) against `posting_domain`/`application_url`, marking a hit `applied=-3`. Operator-added domain blocks now fire with no code change. |
-| T24 | P3 | `ensure_schema_current` backfill gate can't distinguish "unparseable" from "not yet done" — a permanently-NULL `listed_epoch` row would re-trigger the full-table backfill every startup. Zero impact on current data. Fold into T19. |
+| T24 | P3 | ✅ fixed (folded into T19) — `ensure_schema_current`'s backfill re-run gate is now `LISTED_EPOCH_PENDING_PROBE_SQL` (`_epoch_fixable` mirrors the `_epoch_case` `WHEN` arms), so a permanently-unparseable `listed_epoch IS NULL` row no longer re-triggers the full-table backfill. |
 
 ## Dependency graph
 
@@ -305,11 +305,18 @@ Split the ~1,500-line `_llm_guided_apply` into testable seams: `page_snapshot` �
 
 ## T19 — Auto-run pending DB migrations on startup
 
-**Phase:** P3 · **Risk:** low · **Deps:** T8, T9 · Raised by log-bug-detector during Wave 1 QA.
+**Phase:** P3 · **Risk:** low · **Deps:** T8, T9 · **Status:** ✅ fixed (PR pending) · Raised by log-bug-detector during Wave 1 QA.
 
 T8's indexes + WAL and T9's schema changes only take effect when the operator manually runs the migration scripts. For an unattended agent that's a footgun. Add a lightweight "run all `scripts/migrations/NNN_*.py` that haven't been applied" step to `apply_jobs.py` startup (and/or a Dagster op), tracked via a `schema_migrations(id TEXT PRIMARY KEY, applied_at INTEGER)` table. Each migration is already idempotent, so worst case is a fast no-op.
 
-**Acceptance:** a fresh checkout + first `apply_jobs.py` run leaves `linkedin_jobs.db` fully migrated with no manual step.
+**Fix (this PR):**
+- New `scripts/migrations/runner.py:run_pending_migrations(db_path)` — discovers `scripts/migrations/NNN_*.py` in sorted order, runs any whose stem is absent from `schema_migrations(id TEXT PRIMARY KEY, applied_at INTEGER)`, and records each stem **only after that migration's own `migrate()` has committed** (a migration that raises leaves the tracking table untouched and the error propagates). Migration module contract documented in `scripts/migrations/__init__.py`: each `NNN_*.py` exposes `migrate(db_path)` (already true of `001_indexes.py` / `002_schema.py` — their `if __name__ == "__main__"` blocks still work).
+- **DB backup**: before the first pending migration of a run, `linkedin_jobs.db` → `linkedin_jobs.db.bak-<epoch>` (WAL checkpointed first so the plain copy is complete). Gated on there being ≥1 pending migration — an up-to-date startup takes no backup. `.gitignore`'s `linkedin_jobs.db*` covers the backup name.
+- New `scripts/create_db.py:ensure_db_ready(conn, cursor)` — the single "bring the DB fully current" entry point: `create_tables()` (fresh DDL + `ensure_schema_current` + indexes + WAL) then `run_pending_migrations()`. Derives the DB path from the connection (`PRAGMA database_list`); an in-memory / temp DB with no path skips the numbered-migration step (step 1 already made it current).
+- Wired at **every** entry point that opens the DB: `search_retriever.py`, `details_retriever.py`, `scripts/dagster_retrievers.py` (`search_jobs_op`, `fetch_job_details_op` — the apply op shells out to `apply_jobs.py` so it inherits the CLI path), and `apply_jobs.py:main()`. Each previously called `create_tables` / `migrate_db` directly; those calls are now `ensure_db_ready`. `apply_jobs._ensure_apply_schema` (hit per-call by `get_pending_jobs`) stays the cheap `ensure_schema_current`-only path — migration discovery + backup run once per process from `main()`.
+- New `tests/test_migration_runner.py` (11 cases): all-pending → both applied + recorded; one-time backup; second call no-op (no re-apply, no new backup); partial state (`001` pre-recorded → only `002` runs); no backup when nothing pending; discovery sorted + filtered; `ensure_db_ready` on a bare pre-migrations DB / in-memory DB / idempotency; plus the T24 cases below.
+
+**Acceptance:** ✅ a fresh checkout + first `apply_jobs.py` (or retriever / Dagster op) run leaves `linkedin_jobs.db` fully migrated with no manual step; subsequent startups are a sub-millisecond no-op.
 
 ---
 
@@ -356,11 +363,13 @@ New `tests/test_session_blocked_domains.py` (15 cases): operator row blocks end-
 
 ## T24 — Backfill re-run gate can't detect permanently-unparseable rows
 
-**Phase:** follow-up (fold into T19) · **Risk:** low · **Occurrence:** 0 in current data · Raised by log-bug-detector during Wave 2 QA.
+**Phase:** follow-up (folded into T19) · **Risk:** low · **Occurrence:** 0 in current data · **Status:** ✅ fixed (folded into T19) · Raised by log-bug-detector during Wave 2 QA.
 
 `ensure_schema_current()` gates the `listed_epoch` backfill behind `SELECT 1 FROM jobs WHERE listed_epoch IS NULL LIMIT 1`. Rows whose `original_listed_time`/`listed_time` are both unparseable stay `NULL` after the `CASE ... ELSE NULL` backfill, so they keep satisfying the probe → the full-table backfill `UPDATE` (scan + write lock) runs on every `ensure_schema_current()` call and never converges. Current `linkedin_jobs.db`: 1263/1263 parse, so zero impact. Fix: narrow the probe to rows the backfill *can* fix (mirror `_epoch_case` conditions), or sentinel-mark unfixable rows. Fold into T19.
 
-**Acceptance:** on a DB with an unparseable-timestamp row, `ensure_schema_current()` runs the backfill at most once.
+**Fix (folded into T19):** chose the **narrow-the-probe** option (no data mutation, smallest change). New `scripts/create_db.py:_epoch_fixable(col)` returns a SQL boolean mirroring the two `WHEN` arms of `_epoch_case` **exactly** — including that `strftime('%s', <invalid-iso>)` is `NULL`, so a row matching the ISO `LIKE` shape but holding an unparseable date is correctly *not* fixable. `LISTED_EPOCH_PENDING_PROBE_SQL` = `listed_epoch IS NULL AND (_epoch_fixable(original_listed_time) OR _epoch_fixable(listed_time))`, and `ensure_schema_current`'s re-run gate now uses it. A row whose both source columns are permanently unparseable no longer satisfies the probe, so the backfill converges after one pass. The `_column_exists`-just-added branch still runs the backfill unconditionally once (correct — a fresh column always needs its first fill).
+
+**Acceptance:** ✅ `tests/test_migration_runner.py::test_ensure_schema_current_backfills_at_most_once_with_unparseable_row` — a DB with one fixable + one permanently-unparseable NULL row: first `ensure_schema_current()` issues the backfill `UPDATE`, second call does not (spied on `cursor.execute`).
 
 ---
 
