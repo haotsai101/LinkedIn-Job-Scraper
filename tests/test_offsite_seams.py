@@ -666,13 +666,52 @@ def test_execute_fill_shares_forced_filled_dict():
     assert ff.get("eeo-gender") == "Prefer not to say"
 
 
-# ── T31/T32 numeric coercion stays in the orchestrator, unchanged ───────
+# ── T31: numeric coercion runs in the orchestrator via _coerce_fill_value ──
+# (_execute_action itself is untouched — the dispatch still gets a clean value.)
 
 def test_coerce_numeric_answer_still_reduces_prose_to_bare_int():
-    # _execute_action does NOT touch this — it runs in _llm_guided_apply before
-    # the dispatch. Guard that the helper the orchestrator calls is intact.
+    # Guard that the helper the orchestrator's _coerce_fill_value calls is intact.
     out = linkedin_apply._coerce_numeric_answer(
         "Rate your Python experience (1-10)",
         "I'd rate my Python experience about an 8 out of 10", "text", {},
     )
     assert out == "8"
+
+
+def _flow_with_profile(profile):
+    f = _offsite()
+    f.profile = profile
+    return f
+
+
+def test_coerce_fill_value_resolves_field_type_from_the_snapshot():
+    flow = _flow_with_profile({"years_experience": "4"})
+    snap = {"fields": [
+        {"id": "q7", "name": "q7", "label": "Rate your Python (1-10)", "type": "text"},
+    ]}
+    # selector matches a snapshot field -> prose collapsed to the bare int.
+    assert flow._coerce_fill_value("#q7", "", "I'd rate it around an 8", snap) == "8"
+    # a <textarea> in the snapshot -> _coerce_numeric_answer passes it straight
+    # through even though the label says "years".
+    snap_ta = {"fields": [
+        {"id": "q7", "label": "How many years with Django; describe", "type": "textarea"},
+    ]}
+    prose = "I have about 4 years with Django, mostly on large REST backends."
+    assert flow._coerce_fill_value("#q7", "", prose, snap_ta) == prose
+
+
+def test_coerce_fill_value_text_hint_fallback_is_extraction_only():
+    # selector resolves to no snapshot field (CSS-class / xpath / :has-text).
+    flow = _flow_with_profile({"years_experience": "10"})
+    snap = {"fields": []}
+    # digit already present + short -> extracted.
+    assert flow._coerce_fill_value(
+        ".css-1a2b3c", "Years of experience", "an 8 out of 10", snap) == "8"
+    # a genuine free-text paragraph with NO digit -> preserved, NOT fabricated
+    # into the profile's overall years figure ("10").
+    para = "I have led data teams for a long time and shipped several platforms"
+    assert flow._coerce_fill_value(
+        ".css-1a2b3c", "Tell us about your years of experience", para, snap) == para
+    # long value, even with a digit -> preserved (not a bare-number field).
+    long_v = "Honestly I'd put my hands-on experience at around an 8, maybe 9 on a good day"
+    assert flow._coerce_fill_value(".x", "rate 1-10", long_v, snap) == long_v

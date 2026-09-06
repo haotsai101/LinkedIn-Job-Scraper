@@ -565,20 +565,61 @@ def _get_profile_value(profile: dict, label: str, kind: str = "text") -> str | N
         "transformer", "diffusion model", "reinforcement learning",
     )) and kind in ("text", "number"):
         return "1"
-    if any(k in l for k in ("how many years", "how many months")) and kind in ("text", "number"):
-        # Unmapped technology-specific "years with <X>" question (T32). "0" reads
-        # as "no experience at all" and gets the applicant auto-filtered; for a
-        # plausible adjacent skill a conservative real figure is safer. Cap an
-        # unrecognised skill at 2 years and never exceed the applicant's overall
-        # experience — and fall back to "1" (matching the recognised-AI/ML branch
-        # above) when the profile has no usable total, so an *unrecognised* skill
-        # never claims MORE than a recognised one. Does not fabricate expertise;
-        # just stops "0 years of Data Engineering" for a data-focused applicant.
+    if (any(k in l for k in ("how many years", "how many months", "years of", "years with",
+                             "yrs of experience", "yrs experience"))
+            and not any(k in l for k in ("relevant", "total"))
+            and kind in ("text", "number")):
+        # Unmapped "years of <specific skill>" question (T32). "0" reads as "no
+        # experience at all" and gets the applicant auto-filtered, so it is never
+        # returned here — a truthful zero is only produced when the answer text
+        # positively says so (_coerce_numeric_answer's negative-phrase guard).
+        # Tiered so we neither undersell nor fabricate tenure for a skill the
+        # applicant has never touched:
+        #   * a skill the applicant actually lists  -> their full tenure, still
+        #     capped at the overall years_experience figure (never inflated);
+        #   * a skill *adjacent* to their background (a content word from the
+        #     question also shows up in their title / headline / summary / skill
+        #     list) -> capped at 2 years;
+        #   * anything genuinely unrecognised (COBOL, "management" for an IC, …)
+        #     -> "1", a minimal non-zero floor that still dodges the auto-filter
+        #     without claiming experience that isn't there — matches the AI/ML
+        #     branch above and the no-overall-figure case below.
+        # ("relevant" / "total" experience questions are excluded — they want the
+        # full figure and are handled by the "total years" branch further down.)
         try:
             _tot_years = int(float(str(p.get("years_experience", "")).strip() or 0))
         except (TypeError, ValueError):
             _tot_years = 0
-        return str(min(_tot_years, 2)) if _tot_years > 0 else "1"
+        if _tot_years <= 0:
+            return "1"
+        _skills = p.get("skills") or []
+        if isinstance(_skills, str):
+            _skills = re.split(r"[,;]", _skills)
+        _skill_parts = [
+            _part.strip()
+            for _sk in _skills
+            for _part in re.split(r"[/,]", str(_sk).lower())
+            if len(_part.strip()) >= 2
+        ]
+        # Tier 1: the question names a skill the applicant explicitly lists.
+        for _part in _skill_parts:
+            if re.search(r"(?<![a-z0-9+#.])" + re.escape(_part) + r"(?![a-z0-9+#.])", l):
+                return str(_tot_years)
+        # Tier 2: adjacency — a substantive word from the question (>=4 chars,
+        # not application-form boilerplate) appears in the applicant's own
+        # title / headline / summary / skill list.
+        _bg = " ".join(str(p.get(_k) or "") for _k in
+                       ("current_title", "headline", "summary")).lower()
+        _bg += " " + " ".join(_skill_parts)
+        _STOP = {"years", "year", "months", "month", "experience", "many",
+                 "with", "have", "your", "using", "working", "work", "professional",
+                 "hands", "practical", "level", "developing", "development",
+                 "about", "please", "tell", "describe", "paragraph"}
+        _adjacent = any(
+            len(_w) >= 4 and _w not in _STOP and _w in _bg
+            for _w in re.findall(r"[a-z]+", l)
+        )
+        return str(min(_tot_years, 2)) if _adjacent else "1"
     # "Are you currently on OPT or STEM OPT?" → Yes if profile work_authorization is OPT/STEM
     if any(k in l for k in ("opt or stem", "opt/stem", "stem opt", "currently on opt")) \
             and kind in ("select", "select-one", "radio"):
@@ -1145,6 +1186,10 @@ async def _ask_llm(model: str, profile: dict, field: dict) -> str | None:
             "If radio/select, reply with exactly one of the listed options — always pick one, never leave blank. "
             "For Yes/No experience or skill questions, pick the truthful answer based on the profile, or 'No' as a safe default if unknown. "
             "For ANY numeric/years/experience text field, always reply with a number — never leave blank. "
+            "For a 'years of <skill>' or 'how many years' question, reply with just a number "
+            "and never 0 unless the profile clearly shows no experience with that skill — "
+            "give a reasonable non-zero figure that does not exceed the applicant's overall "
+            "years of experience. "
             "CRITICAL: Never fabricate URLs, social media handles, usernames, or specific data not in the profile. "
             "For URL/link fields (Twitter, Instagram, Facebook, personal blog, etc.) not explicitly in the profile, reply with an empty string. "
             "If the profile has no relevant info for a non-select/non-radio non-numeric field, reply with an empty string. "
@@ -2800,6 +2845,10 @@ class OffsiteApplyFlow:
             "Never re-fill a field already in 'Actions taken so far'. Never Cancel/Sign-out. "
             "Never fill or upload to any field labeled 'Cover Letter' or 'Covering Letter' — skip entirely. "
             f"Sponsorship questions: answer '{_sponsor_val}'. Work authorization: always 'Yes'. "
+            "For a 'years of <skill>' or 'how many years' field, fill just a number — never 0 "
+            "unless the profile clearly shows no experience with that skill; give a reasonable "
+            "non-zero figure that does not exceed the applicant's overall years of experience "
+            "(yrs=...). "
             "CRITICAL: Never fabricate URLs, social media handles, usernames, or any information not in the profile. "
             "For any field where you have no value (optional URL, referral email, social handle, portfolio, etc.) — do NOT issue a fill action at all. Skip that field entirely and move to the next [EMPTY] field or click Submit. Never fill a field with an empty string (value='') — an empty fill does nothing useful and can trigger browser validation errors. "
             "If all [EMPTY] fields are filled and a submit button is listed as (offscreen), use action=click with its selector to click it — do not scroll first. "
@@ -3074,6 +3123,41 @@ class OffsiteApplyFlow:
             job_summary=job_summary, context_notes=context_notes,
             override_filled=override_filled,
         )
+
+    # ── Seam: coerce_fill_value ────────────────────────────────────────────
+    def _coerce_fill_value(self, selector: str, text: str, value: str,
+                           snapshot: dict) -> str:
+        """T31: reduce a prose fill answer to a bare integer when the target is a
+        numeric / 1-N-scale field. Runs in the orchestrator before the action is
+        dispatched to :meth:`_execute_action` (which is left untouched).
+
+        Two resolution paths:
+
+        * **snapshot field** — match the action ``selector`` (``#id`` / ``[name]``)
+          against a field in the snapshot. This gives the real field ``type``, so
+          :func:`_coerce_numeric_answer` passes a ``<textarea>`` straight through.
+        * **``text`` hint fallback** — when the selector is a CSS-class / xpath /
+          ``:has-text`` pattern that resolves to no snapshot field. ``text`` is the
+          LLM action's click-target hint, not a field label, so this is
+          best-effort and deliberately conservative: only when the value already
+          contains a digit and is short (≤ 40 chars) — pure extraction
+          (``"…an 8 out of 10"`` → ``"8"``), never fabricating a number from the
+          profile and never collapsing a genuine free-text paragraph.
+        """
+        _tgt = next(
+            (f for f in snapshot.get("fields", [])
+             if (f.get("id") and selector and f["id"] in selector)
+             or (f.get("name") and selector and f["name"] in selector)),
+            None,
+        )
+        if _tgt:
+            return _coerce_numeric_answer(
+                _tgt.get("label") or "", value,
+                _tgt.get("type", "text"), self.profile,
+            )
+        if text and re.search(r"\d", value) and len(value) <= 40:
+            return _coerce_numeric_answer(text, value, "text", self.profile)
+        return value
 
     # ── Seam: detect_terminal_state ────────────────────────────────────────
     def _classify_domain(self, netloc: str, *, include_dead_end: bool = False) -> str | None:
@@ -3600,20 +3684,9 @@ class OffsiteApplyFlow:
             text = action.get("text", "")
             value = action.get("value", "")
             # T31: if the LLM is filling a numeric / 1-N-scale field with prose,
-            # reduce it to the bare integer. Resolve the target field from the
-            # snapshot by matching its id/name against the selector.
-            if action_type == "fill" and value and selector:
-                _tgt = next(
-                    (f for f in snapshot.get("fields", [])
-                     if (f.get("id") and f["id"] in selector)
-                     or (f.get("name") and f["name"] in selector)),
-                    None,
-                )
-                if _tgt:
-                    value = _coerce_numeric_answer(
-                        _tgt.get("label") or "", value,
-                        _tgt.get("type", "text"), self.profile,
-                    )
+            # reduce it to the bare integer before it is typed.
+            if action_type == "fill" and value:
+                value = self._coerce_fill_value(selector, text, value, snapshot)
             # Capture per-step observation and append to running context
             update = action.get("update", "").strip()
             if update:

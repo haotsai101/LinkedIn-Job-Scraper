@@ -63,7 +63,12 @@ import llm
 import nim_client
 from common import prune_debug_screenshots, rotate_llm_log
 from common import write_llm_log as _write_llm_log
-from linkedin_apply import EasyApplyFlow, OffsiteApplyFlow, _get_profile_value
+from linkedin_apply import (
+    EasyApplyFlow,
+    OffsiteApplyFlow,
+    _coerce_numeric_answer,
+    _get_profile_value,
+)
 from scripts.create_db import BLOCKED_ENTITIES_SEED, ensure_schema_current
 
 sys.stdout.reconfigure(line_buffering=True)
@@ -175,6 +180,11 @@ async def _llm_fill_focused(page, profile: dict):
         except Exception as e:
             print(f"  [f] LLM error: {e}")
             return
+
+    # T31: a numeric / 1-N-scale field must get a bare integer, never prose
+    # ("I'd rate my experience an 8 out of 10…"). No-op for genuine free text
+    # and for select/radio/checkbox kinds.
+    value = _coerce_numeric_answer(label, value or "", kind, profile)
 
     if not value:
         print(f"  [f] No value determined for '{label}' — leaving blank.")
