@@ -124,7 +124,20 @@ def search_jobs_op(context) -> dict:
     return result
 
 
-@op(config_schema={"max_updates": int, "sleep_time": int})
+@op(
+    config_schema={
+        "max_updates": Field(
+            Int,
+            default_value=25,
+            description="Max jobs to update per run.",
+        ),
+        "sleep_time": Field(
+            Int,
+            default_value=30,
+            description="Sleep time between batches in seconds.",
+        ),
+    }
+)
 def fetch_job_details_op(context) -> dict:
     """
     Fetch detailed information for jobs without details yet.

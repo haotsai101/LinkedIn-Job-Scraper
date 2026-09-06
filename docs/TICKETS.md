@@ -320,7 +320,7 @@ T8's indexes + WAL and T9's schema changes only take effect when the operator ma
 
 ## T21 — `fetch_job_details_op` required-config bug
 
-**Phase:** follow-up · **Risk:** low · **Deps:** none · Raised by the T6 reviewer.
+**Phase:** follow-up · **Risk:** low · **Deps:** none · **Status:** ✅ fixed (PR pending) · Raised by the T6 reviewer.
 
 `scripts/dagster_retrievers.py:fetch_job_details_op` has `config_schema={"max_updates": int, "sleep_time": int}` with both fields required, but `details_schedule` (`default_status=RUNNING`) supplies no `run_config` — so scheduled enrichment fails config validation every 12h (only `unscraped_jobs_sensor` provides config). Same class of bug T6 fixed for `search_jobs_op`. Apply the same `Field(default_value=...)` treatment: `max_updates=25`, `sleep_time=30` (match the existing `.get()` fallbacks + the sensor's values). `search_and_fetch_jobs` (unscheduled) also benefits.
 
