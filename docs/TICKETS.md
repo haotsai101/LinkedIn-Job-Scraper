@@ -50,7 +50,7 @@ WHERE applied = -1
 | T19 | P2 | Auto-run pending migrations at *every* entrypoint (not just apply). Consolidate `_ensure_apply_schema` / `migrate_db` / `ensure_schema_current`. Add DB backup before migration. |
 | T20 | P3 | `ruff` not in the interpreter that runs the agent — document/bootstrap lint. |
 | T21 | P2 | ✅ **CLOSED** (#33, QA'd 2026-09-06) — `fetch_job_details_op` had the same required-config bug T6 fixed for `search_jobs_op`; `details_schedule` (`RUNNING`, no run_config) failed config validation every 12h. Fixed with `Field(Int, default_value=25/30)`. |
-| T22 | P2 | `blocked_entities.ats_domain` rows are seeded but `run_session` still reads `BLOCKED_DOMAINS` from the Python constant — table not wired for domain blocks. |
+| T22 | P2 | ✅ fixed (PR pending) — `run_session` now loads `ats_domain` rows from `blocked_entities` once per session (`load_session_blocked_domains`, unioned with the seed constant) and the per-job URL check reads that set; operator-added domain blocks are honoured with no code change. |
 | T24 | P3 | `ensure_schema_current` backfill gate can't distinguish "unparseable" from "not yet done" — a permanently-NULL `listed_epoch` row would re-trigger the full-table backfill every startup. Zero impact on current data. Fold into T19. |
 
 ## Dependency graph
@@ -331,11 +331,13 @@ T8's indexes + WAL and T9's schema changes only take effect when the operator ma
 
 ## T22 — Wire `blocked_entities.ats_domain` to `run_session`
 
-**Phase:** follow-up · **Risk:** low · **Deps:** T9 (done) · Raised by the T9 reviewer.
+**Phase:** follow-up · **Risk:** low · **Deps:** T9 (done) · **Status:** ✅ fixed (PR pending) · Raised by the T9 reviewer.
 
 T9 created `blocked_entities` and seeds `ats_domain` rows, but `run_session`'s URL check still reads `BLOCKED_DOMAINS` (derived from the frozen `BLOCKED_ENTITIES_SEED` Python constant), so an operator adding an `ats_domain` row to the table is silently ignored. Have `run_session` load `ats_domain` patterns from the table once per session (mirror the `get_pending_jobs` approach), making the table authoritative for domain blocks too.
 
-**Acceptance:** adding an `ats_domain` row to `blocked_entities` blocks that domain on the next apply session with no code change.
+**Fix (this PR):** new module helper `apply_jobs.load_session_blocked_domains(cursor)` returns `BLOCKED_DOMAINS | {pattern FROM blocked_entities WHERE kind = 'ats_domain'}`, lowercased/stripped. `run_session` calls it once at session start (`session_blocked_domains`, next to the classifier-breaker setup — the `cursor` is already in scope) and the per-job application-URL check (`apply_jobs.py:~1262`) iterates that set instead of the module constant. Union keeps the seed constant authoritative on a not-yet-migrated DB; a missing `blocked_entities` table → `sqlite3.OperationalError` caught → falls back to the constant (same degrade-when-schema-behind pattern as the rest of the agent). `BLOCKED_COMPANIES` has no analogous staleness — it is not read anywhere in `run_session`; company blocks are already fully table-authoritative via `get_pending_jobs`'s `NOT EXISTS`. New `tests/test_session_blocked_domains.py` (6 cases): operator-added row blocks with no code change, seed still blocks via the union, table-missing falls back, patterns normalised, and an `inspect.getsource` guard that the URL check reads `session_blocked_domains` and no longer iterates `BLOCKED_DOMAINS`. `pytest tests/` 250 green; `ruff check apply_jobs.py` finding count unchanged (43 pre-existing, 0 added).
+
+**Acceptance:** ✅ adding an `ats_domain` row to `blocked_entities` blocks that domain on the next apply session with no code change.
 
 ---
 

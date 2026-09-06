@@ -898,6 +898,35 @@ def _has_index(cursor, name: str) -> bool:
     ).fetchone() is not None
 
 
+def load_session_blocked_domains(cursor) -> set[str]:
+    """ATS-domain blocklist patterns for the in-process URL check in ``run_session``.
+
+    ``BLOCKED_DOMAINS`` (the module constant derived from ``BLOCKED_ENTITIES_SEED``)
+    is only the *seed*; the live blocklist is the ``blocked_entities`` table, which
+    is seed rows **plus** anything an operator has added (T22). ``get_pending_jobs``
+    already filters pending candidates against the table with a parameterized
+    NOT EXISTS, but the mid-session per-job URL check still read the frozen
+    constant, so operator-added ``ats_domain`` rows were silently ignored there.
+
+    Returns the union of the constant and the table's ``kind = 'ats_domain'``
+    patterns. The constant is always included as belt-and-suspenders: a fresh DB
+    whose migration has not run yet (no ``blocked_entities`` table) still gets the
+    seed set. Missing table / schema behind → ``sqlite3.OperationalError``, caught,
+    fall back to just the constant (mirrors how the rest of the agent degrades
+    when the schema is behind).
+    """
+    domains = set(BLOCKED_DOMAINS)
+    try:
+        rows = cursor.execute(
+            "SELECT pattern FROM blocked_entities "
+            "WHERE kind = 'ats_domain' AND pattern <> ''"
+        ).fetchall()
+        domains.update(r[0].strip().lower() for r in rows if r[0])
+    except sqlite3.OperationalError:
+        pass  # table not migrated yet — the seed constant is enough
+    return domains
+
+
 def get_pending_jobs(cursor, limit=None, apply_type=None, include_failed=False):
     """Return pending apply candidates, newest first.
 
@@ -1096,6 +1125,12 @@ async def run_session(
     # NIM-route circuit breaker — session-scoped, resets each run_session.
     classifier_breaker = _new_classifier_breaker()
 
+    # ATS-domain blocklist for the per-job application-URL check below. Loaded
+    # once per session from the ``blocked_entities`` table (seed + operator
+    # additions), unioned with the seed constant so a not-yet-migrated DB still
+    # blocks the seed set (T22).
+    session_blocked_domains = load_session_blocked_domains(cursor)
+
     inbox = EmailInbox(gmail_user, gmail_pass) if gmail_user and gmail_pass else None
 
     started_at   = datetime.now(timezone.utc).isoformat()
@@ -1230,7 +1265,7 @@ async def run_session(
                 # Skip jobs whose application URL is on a blocked domain
                 from urllib.parse import urlparse as _urlparse
                 _app_url = url or ""
-                if any(bd in _urlparse(_app_url).netloc for bd in BLOCKED_DOMAINS):
+                if any(bd in _urlparse(_app_url).netloc for bd in session_blocked_domains):
                     mark_job(conn, cursor, job_id, -1)
                     skipped_count += 1
                     print(f"  [~] Application domain blocked — skipped.")
