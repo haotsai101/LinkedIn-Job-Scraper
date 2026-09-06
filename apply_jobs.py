@@ -118,6 +118,27 @@ _OFFSITE_SPAM = (
 )
 
 
+def _host_of(raw: str) -> str:
+    """Bare lowercase hostname from a domain string or a full URL. ``""`` if empty.
+
+    ``"https://sub.acme.com/x"`` → ``"sub.acme.com"``; ``"Sub.Acme.com"`` →
+    ``"sub.acme.com"``; ``"user@host:443"`` → ``"host"``.
+    """
+    value = (raw or "").strip().lower()
+    if not value:
+        return ""
+    host = urlparse(value).netloc if "//" in value else value.split("/", 1)[0]
+    return host.split("@")[-1].split(":")[0]
+
+
+def _host_matches(host: str, patterns) -> bool:
+    """Host-suffix match: ``rex.zone`` matches ``rex.zone`` / ``foo.rex.zone`` but
+    not ``forex.zone``. Empty ``host`` or empty patterns never match."""
+    return bool(host) and any(
+        host == d or host.endswith("." + d) for d in patterns if d
+    )
+
+
 def _match_spam_domain(*candidates: str) -> str | None:
     """Return the first host among *candidates* that matches ``_OFFSITE_SPAM``.
 
@@ -125,12 +146,24 @@ def _match_spam_domain(*candidates: str) -> str | None:
     returns ``None`` when nothing matches.
     """
     for raw in candidates:
-        value = (raw or "").strip().lower()
-        if not value:
-            continue
-        host = urlparse(value).netloc if "//" in value else value.split("/", 1)[0]
-        host = host.split("@")[-1].split(":")[0]
-        if host and any(host == d or host.endswith("." + d) for d in _OFFSITE_SPAM):
+        host = _host_of(raw)
+        if _host_matches(host, _OFFSITE_SPAM):
+            return host
+    return None
+
+
+def _match_blocked_domain(blocked_domains, *candidates: str) -> str | None:
+    """Return the first host among *candidates* that matches an ``ats_domain``
+    block pattern in *blocked_domains* (seed constant + operator-added
+    ``blocked_entities`` rows — see ``load_session_blocked_domains``).
+
+    Same host-suffix matching as ``_match_spam_domain`` (never a bare substring
+    ``in`` test). Accepts bare domains (``posting_domain``) or full URLs
+    (``application_url``). ``None`` when nothing matches.
+    """
+    for raw in candidates:
+        host = _host_of(raw)
+        if _host_matches(host, blocked_domains):
             return host
     return None
 
@@ -909,21 +942,29 @@ def load_session_blocked_domains(cursor) -> set[str]:
     constant, so operator-added ``ats_domain`` rows were silently ignored there.
 
     Returns the union of the constant and the table's ``kind = 'ats_domain'``
-    patterns. The constant is always included as belt-and-suspenders: a fresh DB
-    whose migration has not run yet (no ``blocked_entities`` table) still gets the
-    seed set. Missing table / schema behind → ``sqlite3.OperationalError``, caught,
-    fall back to just the constant (mirrors how the rest of the agent degrades
-    when the schema is behind).
+    patterns, each ``.strip().lower()``-normalised. The constant is always
+    included as belt-and-suspenders: a fresh DB whose migration has not run yet
+    (no ``blocked_entities`` table) still gets the seed set. Missing table /
+    schema behind → ``sqlite3.OperationalError``, caught, fall back to just the
+    constant (mirrors how the rest of the agent degrades when the schema is
+    behind).
+
+    Whitespace-only patterns are dropped *after* stripping: a bare ``'   '`` row
+    (plausible operator typo) normalises to ``""``, which any substring/prefix
+    check would treat as a match-everything wildcard. Excluded here, and
+    ``_host_matches`` skips falsy patterns too.
     """
     domains = set(BLOCKED_DOMAINS)
     try:
         rows = cursor.execute(
-            "SELECT pattern FROM blocked_entities "
-            "WHERE kind = 'ats_domain' AND pattern <> ''"
+            "SELECT pattern FROM blocked_entities WHERE kind = 'ats_domain'"
         ).fetchall()
-        domains.update(r[0].strip().lower() for r in rows if r[0])
+        domains.update(
+            p.strip().lower() for (p,) in rows if p and p.strip()
+        )
     except sqlite3.OperationalError:
         pass  # table not migrated yet — the seed constant is enough
+    domains.discard("")
     return domains
 
 
@@ -1262,13 +1303,21 @@ async def run_session(
                     print(f"  [cap] Reached max-apply limit ({max_apply}). Stopping applications.")
                     break
 
-                # Skip jobs whose application URL is on a blocked domain
-                from urllib.parse import urlparse as _urlparse
-                _app_url = url or ""
-                if any(bd in _urlparse(_app_url).netloc for bd in session_blocked_domains):
-                    mark_job(conn, cursor, job_id, -1)
-                    skipped_count += 1
-                    print(f"  [~] Application domain blocked — skipped.")
+                # Block jobs whose ATS host matches an ``ats_domain`` pattern
+                # (seed constant + operator-added ``blocked_entities`` rows).
+                # Checked against ``posting_domain`` / ``application_url`` — the
+                # same inputs the spam filter uses — NOT ``url``, which is always
+                # a ``linkedin.com/jobs/view`` link. An operator adding a block
+                # row means "never attempt this", so it goes to -3 (blocked,
+                # excluded from --reset-failed), not -1.
+                _blocked_host = _match_blocked_domain(
+                    session_blocked_domains, posting_domain, application_url
+                )
+                if _blocked_host:
+                    mark_job(conn, cursor, job_id, -3)
+                    blocked_count += 1
+                    print(f"  [~] Application domain blocked ({_blocked_host}) — "
+                          f"not attempting (needs a human).")
                     continue
 
                 # ── Build callbacks ────────────────────────────────────────────
