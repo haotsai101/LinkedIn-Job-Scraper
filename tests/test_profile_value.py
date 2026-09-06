@@ -19,6 +19,7 @@ import linkedin_apply as la
 
 _gpv = la._get_profile_value
 _coerce = la._coerce_numeric_answer
+_label_is_numeric = la._label_is_numeric
 
 
 # A synthetic profile shaped like ``user_profile.json`` (see PROFILE_QUESTIONS in
@@ -186,6 +187,47 @@ def test_coerce_numeric_answer_detection_is_scoped_to_real_numeric_fields():
     assert _coerce("What interests you about this role?",
                    "I have shipped 3 production systems", "text") == \
         "I have shipped 3 production systems"
+
+
+# ── T37: shared _label_is_numeric predicate (used by _ask_llm + _coerce) ──────
+
+def test_label_is_numeric_matches_long_labelled_scale_fields():
+    # The live-QA failure: a 90+ char label the old _ask_llm tuple never matched.
+    long_scale = ("Rate your experience (1-10) designing and building production "
+                  "data pipelines using SQL and Python.")
+    assert len(long_scale) > 60
+    assert _label_is_numeric(long_scale, "text") is True
+    assert _label_is_numeric(
+        "How would you rate your Python skills on a scale of 1 to 5?", "text") is True
+    assert _label_is_numeric("Years of experience with Kubernetes", "text") is True
+    assert _label_is_numeric("Experience level", "number") is True
+
+
+def test_label_is_numeric_leaves_genuine_free_text_alone():
+    # All >60 chars, none numeric — must still take the prose path.
+    assert _label_is_numeric(
+        "Describe your experience building and operating data pipelines at scale",
+        "text") is False
+    assert _label_is_numeric(
+        "Why do you want to work at Acme and what draws you to this role?",
+        "text") is False
+    assert _label_is_numeric(
+        "Tell us about a time you overcame a significant technical challenge",
+        "text") is False
+    # Choices / long-form kinds are excluded regardless of label wording.
+    assert _label_is_numeric("Rate your experience", "select") is False
+    assert _label_is_numeric("Rate your experience (1-10) ...", "textarea") is False
+
+
+def test_coerce_numeric_answer_handles_long_labelled_scale_prose():
+    # End-to-end: the exact live-QA prose answers -> bare, range-clamped ints.
+    label = ("Rate your experience (1-10) designing and building production "
+             "data pipelines using SQL and Python.")
+    assert _coerce(label, "I would rate my experience a 7. Over the last...", "text") == "7"
+    assert _coerce(label, "6 — I have hands-on experience building...", "text") == "6"
+    assert _coerce("Rate your experience (1-10) with distributed systems architecture "
+                   "and event-driven design", "I would rate my experience a 12 out of 10",
+                   "text") == "10"
 
 
 # ── T32: unmapped "years of <skill>" never falls back to 0 ───────────────

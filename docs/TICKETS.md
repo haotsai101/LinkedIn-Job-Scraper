@@ -27,6 +27,7 @@ Baseline captured 2026-08-28. `docs/baseline/db_state.baseline.txt` holds the DB
 | T31 | P2 | ✅ fixed (PR pending) — see `## T31 / T32` below. Numeric/scale free-text fields got prose instead of a bare number. |
 | T32 | P2 | ✅ fixed (PR pending) — see `## T31 / T32` below. Unmapped "years of &lt;skill&gt;" fields undersold to `0`. |
 | T36 | P3 | (split out of T32) Playwright tab crash mid-fill → `applied=-2` auto-fail. Browser-stability concern, not form-answer quality — needs its own ticket. |
+| T37 | P2 | ✅ fixed (PR pending) — see `## T37` below. Live QA of PR #34 found `_ask_llm`'s local numeric detection out of sync with `_coerce_numeric_answer` — long-labelled "Rate … (1-10)" scale fields still got prose. |
 | — | P3 | (T14b reviewer note) Watch for orphaned `claude` processes after timeout-heavy runs — `asyncio.wait_for` on `llm.query` cancels the SDK generator mid-iteration; subprocess cleanup then depends on the SDK's `GeneratorExit` handling. |
 
 **T27 .env:** classifier model must be `meta/llama-3.2-11b-vision-instruct` (via `CLASSIFIER_MODEL` or the legacy `CLASSIFIER_LLM_MODEL`) — done 2026-09-02.
@@ -458,7 +459,7 @@ Note the **login-wall-with-credentials-that-fail-to-log-in** branch (also ~3316-
 
 ## T31 / T32 — form answer quality (numeric fields + undersold "years of X")
 
-**Phase:** T33 follow-up · **Risk:** low · **Status:** ✅ fixed (PR pending) · From the T27/T14b live apply runs 2026-09-01/02.
+**Phase:** T33 follow-up · **Risk:** low · **Status:** ✅ **CLOSED** — merged (PR #34). **Follow-up:** live QA of PR #34 found the T31 symptom still reproducing on the EasyApply path for *long-labelled* scale fields — `_ask_llm`'s own local numeric-question detection had never been brought in sync with `_coerce_numeric_answer`. Closed by **T37**. The PR #34 work itself (the `_get_profile_value` tiering, the `_coerce_fill_value` seam) is sound and untouched by T37. · From the T27/T14b live apply runs 2026-09-01/02.
 
 Both bugs live in the same code area (form answer generation), so they ship together. T33 (PR #25) landed a first pass — the `_coerce_numeric_answer` helper and a capped `_get_profile_value` "how many years" branch. This PR closes the paths that pass left uncovered.
 
@@ -485,3 +486,21 @@ Reviewer feedback addressed: the earlier revision returned a blanket `min(tot, 2
 **Tests:** `tests/test_profile_value.py` — numeric detection positive + negative, the tiered "years of X" fallback (listed → full tenure, adjacent → 2, unrecognised/COBOL/management → 1, no figure → 1), "relevant"/"total" still full, genuine-`0` regression. `tests/test_offsite_seams.py` — `_coerce_fill_value` resolves the field type from the snapshot (textarea passes through), and the `text`-hint fallback is extraction-only (prose paragraph preserved, long value preserved, digit-bearing short value extracted). Full suite: **238 passed**. `ruff check .`: 512 = 512 (pre-existing repo lint debt untouched).
 
 **Out of scope / follow-up:** T32's original row also noted a Playwright tab crash mid-fill → `applied=-2` — that's a browser-stability concern, not form-answer quality. Split out as **T36** (P3) in the follow-up table; no quick guard added here.
+
+---
+
+## T37 — `_ask_llm` routes long-labelled scale questions to prose, bypassing T31 coercion
+
+**Phase:** T31/T32 follow-up · **Risk:** low · **Status:** ✅ fixed (PR pending) · Found by live QA of PR #34 (T31/T32), EasyApply path.
+
+**Symptom (still live after PR #34):** a job with three fields labelled `"Rate your experience (1-10) designing and building production data pipelines using SQL and Python."` (and near-identical variants) got filled with prose — `"I would rate my experience a 7. Over the…"`, `"6 — I have hands-on experience building…"`, `"I would rate my experience a 7 out of 10…"` — instead of a bare `7` / `6`. This is exactly the T31 failure mode, on a field T31's shared `_coerce_numeric_answer` already recognises.
+
+**Root cause:** `_ask_llm` (`linkedin_apply.py`) did its *own* numeric-question detection with a narrow hardcoded tuple (`"how many years"`, `"years of experience"`, `"years experience"`, `"how many months"`) that never matched `"rate your experience (1-10) …"`. With that check False and the label 90+ chars, `is_long_form = (… or len(label) > 60) and not _is_numeric_question …` evaluated True → the field took the "write a professional 2-4 sentence answer" prompt, and then `if not is_long_form:` skipped the `_coerce_numeric_answer(...)` call entirely. Meanwhile `_coerce_numeric_answer` and its `_NUMERIC_LABEL_HINTS` constant already correctly recognise `"(1-10)"`, `"rate your"`, `"on a scale"`, `"1 to 10"`, etc. and would have extracted the range-clamped digit — the two detections had simply drifted apart. (T33 wired `_coerce_numeric_answer` *into* `_ask_llm`; it did not unify the `is_long_form` gate's own numeric test with it.)
+
+**Fix:** extracted `_coerce_numeric_answer`'s field-is-numeric predicate into a module-level `_label_is_numeric(label, kind) -> bool` (the `_NUMERIC_LABEL_HINTS` membership test + the `\brate\b|\brating\b` regex + the up-front select/radio/checkbox/textarea/contenteditable exclusion). Both `_ask_llm` (for the `is_long_form` exclusion) and `_coerce_numeric_answer` (for its `is_numeric` gate) now call it — single source of truth, cannot drift again. Net behaviour: `"Rate your experience (1-10) designing and building production data pipelines…"` with `kind="text"` → `_label_is_numeric` True → `is_long_form` False → non-long-form prompt → `_coerce_numeric_answer` runs → range-clamped bare integer. Genuine long free-text prompts (`"Describe your experience building data pipelines"`, `"Why do you want to work at Acme?"`, `"Tell us about a time you…"`) contain none of the numeric hints and are unaffected — they still get the 2-4 sentence prose path.
+
+**Also folded in (QA hygiene, same PR):** `apply_jobs.write_session_log` did `existing = json.loads(...)` then `existing["sessions"].append(report)`. Valid JSON of the wrong shape (e.g. a bare `[]`) slips past the `except Exception` parse guard and then raises `TypeError: list indices must be integers or slices, not str`, crashing the post-session bookkeeping of an otherwise-successful run. Added a one-line shape check: after loading, `if not isinstance(existing, dict) or "sessions" not in existing: existing = {"sessions": []}`.
+
+**Tests:** `tests/test_profile_value.py` — `_label_is_numeric` positive (long-labelled `(1-10)`, `"on a scale of 1 to 5"`, `"years of experience"`, `kind="number"`) and negative (long free-text `"Describe…"` / `"Why do you want to work at Acme?"` / `"Tell us about a time…"`, plus `select` / `textarea` kinds), and an end-to-end `_coerce_numeric_answer` check on the exact live-QA prose answers. `tests/test_offsite_llm.py` — `_ask_llm` with a mocked `llm.query` returning prose for a `"Rate … (1-10) …"` field yields a bare integer and does *not* use the 2-4-sentence prompt; a genuine long free-text field still does. `tests/test_write_session_log.py` (new) — bare-`[]` file, dict-without-`sessions`, well-formed append, missing file, corrupt JSON. Full suite: **254 passed**. `ruff check .`: 511 vs 512 pre-change (one fewer — the old `is_long_form` one-liner shrank; no new findings).
+
+**Acceptance:** a `kind in ("text","number")` field whose label matches `_coerce_numeric_answer`'s numeric hints (regardless of label length) never takes the long-form prose path in `_ask_llm` and always passes through `_coerce_numeric_answer`; genuine free-text fields still get prose; `write_session_log` does not raise on a valid-but-wrong-shape `application_log.json`; `pytest tests/` green.

@@ -833,6 +833,32 @@ _NUMERIC_LABEL_HINTS = (
 )
 
 
+def _label_is_numeric(label: str, kind: str = "text") -> bool:
+    """Whether a form field is really asking for a bare number / 1-N scale value.
+
+    Single source of truth shared by :func:`_coerce_numeric_answer` (its
+    ``is_numeric`` gate) and :func:`_ask_llm` (its ``is_long_form`` exclusion) so
+    the two detections can never drift apart again (T37 — a long-labelled
+    "Rate your experience (1-10) …" field slipped past ``_ask_llm``'s old narrow
+    hardcoded tuple, so it took the 2-4-sentence prose path *and* had coercion
+    skipped by the ``if not is_long_form`` guard).
+
+    Every select/radio/checkbox and every genuine long-form field
+    (``textarea``/``contenteditable``) is excluded up front, so a real free-text
+    prompt ("Describe your experience …", "Why do you want to work here?") is
+    never misclassified as numeric.
+    """
+    if kind in ("select", "select-one", "select-multiple", "radio", "checkbox",
+                "textarea", "contenteditable"):
+        return False
+    lab = re.sub(r"\s+", " ", (label or "").lower()).strip()
+    return (
+        kind == "number"
+        or any(h in lab for h in _NUMERIC_LABEL_HINTS)
+        or bool(re.search(r"\brate\b|\brating\b", lab))
+    )
+
+
 def _coerce_numeric_answer(label: str, answer: str, kind: str = "text",
                            profile: dict | None = None) -> str:
     """Reduce a prose answer to a bare integer when the field is numeric/scale (T31).
@@ -848,21 +874,14 @@ def _coerce_numeric_answer(label: str, answer: str, kind: str = "text",
     """
     if not answer or not isinstance(answer, str):
         return answer
-    # Never touch a genuine long-form field. "textarea"/"contenteditable" is the
-    # guided-apply fill branch's only guard (it has no ``is_long_form`` check),
-    # so keeping them here makes the helper safe to call unconditionally.
-    if kind in ("select", "select-one", "select-multiple", "radio", "checkbox",
-                "textarea", "contenteditable"):
-        return answer
-    lab = re.sub(r"\s+", " ", (label or "").lower()).strip()
-    is_numeric = (
-        kind == "number"
-        or any(h in lab for h in _NUMERIC_LABEL_HINTS)
-        or bool(re.search(r"\brate\b|\brating\b", lab))
-    )
-    if not is_numeric:
+    # Numeric-field detection (incl. the select/radio/checkbox/textarea/
+    # contenteditable exclusion that keeps this helper safe to call
+    # unconditionally) lives in the shared ``_label_is_numeric`` predicate so
+    # ``_ask_llm``'s ``is_long_form`` exclusion can never drift from it (T37).
+    if not _label_is_numeric(label, kind):
         return answer
 
+    lab = re.sub(r"\s+", " ", (label or "").lower()).strip()
     s = answer.strip()
     rng = re.search(r"(\d+)\s*(?:-|–|to)\s*(\d+)", lab)
     lo, hi = (int(rng.group(1)), int(rng.group(2))) if rng else (None, None)
@@ -1157,12 +1176,10 @@ async def _ask_llm(model: str, profile: dict, field: dict) -> str | None:
         return None
     options = field.get("options", [])
     kind = field.get("kind", "text")
-    label_lower = label.lower()
-    # "How many years..." and "years of experience" questions expect a number, not a sentence
-    _is_numeric_question = (
-        any(k in label_lower for k in ("how many years", "years of experience", "years experience", "how many months"))
-        and kind in ("text", "number")
-    )
+    # A numeric / 1-N-scale field (incl. long-labelled "Rate your experience
+    # (1-10) …" prompts) expects a bare number, not a sentence — use the same
+    # predicate ``_coerce_numeric_answer`` gates on so the two stay in sync (T37).
+    _is_numeric_question = _label_is_numeric(label, kind)
     # Select/radio with options is never long-form regardless of label length
     _is_choice = kind in ("select", "select-one", "select-multiple", "radio") or bool(options)
     is_long_form = (kind in ("textarea", "contenteditable") or len(label) > 60) and not _is_numeric_question and not _is_choice
