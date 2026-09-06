@@ -201,12 +201,13 @@ def get_classifier_route() -> ClassifierRoute:
     on the ``"nim"`` route.
     """
     _load_dotenv()
-    raw = (os.environ.get("CLASSIFIER_ROUTE") or "").strip().lower()
+    original = os.environ.get("CLASSIFIER_ROUTE")
+    raw = (original or "").strip().lower()
     if not raw:
         return _DEFAULT_CLASSIFIER_ROUTE
     if raw not in ("agent", "nim"):
         warnings.warn(
-            f"CLASSIFIER_ROUTE={raw!r} is not 'agent' or 'nim'; using "
+            f"CLASSIFIER_ROUTE={original!r} is not 'agent' or 'nim'; using "
             f"{_DEFAULT_CLASSIFIER_ROUTE!r}",
             RuntimeWarning,
             stacklevel=2,

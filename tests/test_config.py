@@ -153,9 +153,19 @@ def test_classifier_route_blank_falls_through_to_agent(monkeypatch):
 
 
 def test_classifier_route_bad_value_warns_and_defaults(monkeypatch):
-    monkeypatch.setenv("CLASSIFIER_ROUTE", "openai")
-    with pytest.warns(RuntimeWarning):
+    monkeypatch.setenv("CLASSIFIER_ROUTE", "OpenAI")
+    with pytest.warns(RuntimeWarning, match="OpenAI"):
         assert config.get_classifier_route() == "agent"
+
+
+def test_apply_jobs_nim_flag_defaults_off_on_clean_import():
+    """The T38 contract: a clean-env import of apply_jobs resolves the NIM
+    classifier route OFF, so no CLASSIFIER_API is needed by default. (The
+    routing suite's autouse fixture forces it True; nothing else pins the
+    default.)"""
+    import apply_jobs
+
+    assert apply_jobs._NIM_CLASSIFIER_ENABLED is False
 
 
 # ── guards ─────────────────────────────────────────────────────────────────────

@@ -305,9 +305,11 @@ def load_env():
 
     # No LLM_* / LLM_URL hard requirement any more (T14b). Each LLM role resolves
     # its own config:
-    #   * classifier   — OffsiteApply → nim_client (config.get_llm_config("classifier"),
-    #                    honours CLASSIFIER_* + legacy aliases); Easy Apply → Claude
-    #                    Agent SDK subscription auth.
+    #   * classifier   — Claude Agent SDK subscription auth by default for every
+    #                    application_type (T38). OffsiteApply jobs route to
+    #                    nim_client (config.get_llm_config("classifier"), honours
+    #                    CLASSIFIER_* + legacy aliases) only when
+    #                    CLASSIFIER_ROUTE=nim.
     #   * browser agent (OffsiteApplyFlow / EasyApplyFlow) → Claude Agent SDK
     #                    subscription auth (config "guided_apply").
     # LLM_API / LLM_URL / LLM_MODEL are now optional — read here only for the
