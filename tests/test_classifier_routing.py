@@ -1,11 +1,17 @@
 """Unit tests for ``apply_jobs.JobAgent.classify`` routing (T14 part 1).
 
-Routing contract:
+Routing contract (T38 — Agent SDK is the default for every job):
   * citizenship / clearance keyword in the description → immediate skip, no LLM
     call on either backend
-  * application_type == "OffsiteApply"                  → NIM (nim_client)
-  * SimpleOnsiteApply / ComplexOnsiteApply / other / None → Claude Agent SDK
-    one-shot isolated call (llm.query_json)
+  * default (``CLASSIFIER_ROUTE`` unset / ``_NIM_CLASSIFIER_ENABLED`` False) →
+    every job, incl. OffsiteApply, goes to the Claude Agent SDK
+    (``llm.query_json``, one-shot isolated call)
+  * opt-in (``_NIM_CLASSIFIER_ENABLED`` True): application_type == "OffsiteApply"
+    → NIM (nim_client); everything else → Agent SDK
+
+Most tests in this module exercise the opt-in NIM route, so the ``_nim_enabled``
+fixture below is ``autouse`` and flips ``apply_jobs._NIM_CLASSIFIER_ENABLED`` on;
+the "default route" tests turn it back off explicitly.
 
 Both backends are mocked — no network, no ``claude`` CLI, no OpenAI calls.
 """
@@ -36,6 +42,17 @@ def agent():
 def _fast_retry(monkeypatch):
     """Kill the 2 s retry sleep so failure-path tests are instant."""
     monkeypatch.setattr(apply_jobs.JobAgent, "_RETRY_DELAY_S", 0.0)
+
+
+@pytest.fixture(autouse=True)
+def _nim_enabled(monkeypatch):
+    """Enable the opt-in NIM classifier route for this module (T38).
+
+    The default is Agent-SDK-for-everything; the NIM-route and circuit-breaker
+    tests here need the opt-in flag on. The "default route" tests override this
+    with ``monkeypatch.setattr(apply_jobs, "_NIM_CLASSIFIER_ENABLED", False)``.
+    """
+    monkeypatch.setattr(apply_jobs, "_NIM_CLASSIFIER_ENABLED", True)
 
 
 def _boom(*args, **kwargs):
@@ -140,6 +157,80 @@ def test_nim_config_error_is_not_retried(agent, monkeypatch):
     with pytest.raises(nim_client.NimConfigError):
         asyncio.run(agent.classify("X", "desc", "OffsiteApply"))
     assert attempts["n"] == 1  # deterministic — no retry
+
+
+# ── T38: default route (NIM disabled) → Agent SDK for everything ─────────────
+
+@pytest.fixture
+def _nim_disabled(monkeypatch):
+    monkeypatch.setattr(apply_jobs, "_NIM_CLASSIFIER_ENABLED", False)
+
+
+@pytest.mark.parametrize(
+    "app_type", ["OffsiteApply", "SimpleOnsiteApply", "ComplexOnsiteApply", "", None]
+)
+def test_default_route_sends_every_type_to_agent_sdk(
+    agent, monkeypatch, _nim_disabled, app_type
+):
+    calls: list = []
+    _patch_agent_sdk(monkeypatch, calls=calls)
+    monkeypatch.setattr(nim_client, "resolve_classifier", _boom)
+    monkeypatch.setattr(nim_client, "classify_via_nim", _boom)
+
+    relevant, reason, _cit = asyncio.run(
+        agent.classify("Backend Engineer", "Go, Postgres, k8s", app_type)
+    )
+    assert relevant is True
+    assert len(calls) == 1
+    assert "Backend Engineer" in calls[0]
+
+
+def test_default_route_ignores_prefer_agent_sdk_flag(agent, monkeypatch, _nim_disabled):
+    """prefer_agent_sdk is a no-op when NIM is off — still the Agent SDK."""
+    calls: list = []
+    _patch_agent_sdk(monkeypatch, calls=calls)
+    monkeypatch.setattr(nim_client, "resolve_classifier", _boom)
+
+    asyncio.run(agent.classify("SWE", "desc", "OffsiteApply", prefer_agent_sdk=True))
+    assert len(calls) == 1
+
+
+def test_circuit_breaker_is_passthrough_when_nim_disabled(monkeypatch, _nim_disabled):
+    """With NIM off, classify_with_circuit_breaker never touches the NIM client
+    or the breaker state — straight to agent.classify."""
+    resolve_calls = {"n": 0}
+
+    def resolve(cfg=None):
+        resolve_calls["n"] += 1
+        raise AssertionError("resolve_classifier must not be called")
+
+    monkeypatch.setattr(nim_client, "resolve_classifier", resolve)
+
+    seen: list = []
+
+    class _Agent:
+        async def classify(self, title, description, application_type,
+                           *, prefer_agent_sdk=False):
+            seen.append((application_type, prefer_agent_sdk))
+            return (True, "ok", False)
+
+    breaker = apply_jobs._new_classifier_breaker()
+    out = asyncio.run(apply_jobs.classify_with_circuit_breaker(
+        _Agent(), breaker, "T", "d", "OffsiteApply"))
+
+    assert out == (True, "ok", False)
+    assert resolve_calls["n"] == 0
+    assert seen == [("OffsiteApply", False)]
+    assert breaker == apply_jobs._new_classifier_breaker()  # untouched
+
+
+def test_offsite_apply_opt_in_still_routes_to_nim(agent, monkeypatch):
+    """Sanity: with the (autouse) flag on, OffsiteApply still hits NIM."""
+    calls: list = []
+    _patch_nim(monkeypatch, calls=calls)
+    monkeypatch.setattr(llm, "query_json", _boom)
+    asyncio.run(agent.classify("Data Engineer", "pipelines", "OffsiteApply"))
+    assert calls and calls[0][0] == "NIM_CLIENT"
 
 
 # ── Easy Apply → Claude Agent SDK (one-shot) ────────────────────────────────

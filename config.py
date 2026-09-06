@@ -9,8 +9,11 @@ hunting for hardcoded strings across ``apply_jobs.py`` / ``linkedin_apply.py``.
 
 Three LLM *roles*, each with its own model plus (optionally) its own endpoint:
 
-    classifier    -- job relevance scoring; a small / fast model on an
-                     OpenAI-compatible endpoint (NVIDIA NIM by default).
+    classifier    -- job relevance scoring. Defaults to the Claude Agent SDK
+                     (see ``get_classifier_route``); this role's model / key /
+                     URL are only used on the opt-in ``CLASSIFIER_ROUTE=nim``
+                     path (a small / fast model on an OpenAI-compatible
+                     endpoint, NVIDIA NIM by default).
     browser_use   -- form-filling / DOM reasoning during offsite apply; an
                      OpenAI-compatible endpoint (NVIDIA NIM by default).
     guided_apply  -- LinkedIn Easy Apply via the Claude Agent SDK, which uses
@@ -35,6 +38,7 @@ from pathlib import Path
 from typing import Literal, Optional
 
 Role = Literal["classifier", "browser_use", "guided_apply"]
+ClassifierRoute = Literal["agent", "nim"]
 
 _NIM_BASE_URL = "https://integrate.api.nvidia.com/v1"
 
@@ -176,6 +180,41 @@ def get_llm_config(role: Role) -> LLMConfig:
     return LLMConfig(model=model, api_key=api_key, base_url=base_url)
 
 
+# ── Classifier route ───────────────────────────────────────────────────────────
+
+_DEFAULT_CLASSIFIER_ROUTE: ClassifierRoute = "agent"
+
+
+def get_classifier_route() -> ClassifierRoute:
+    """Which backend classifies job relevance.
+
+    * ``"agent"`` (default) — the Claude Agent SDK (``llm.query_json``,
+      subscription auth, no per-token cost). Reliable on the 6–8K-char job
+      descriptions real postings carry.
+    * ``"nim"`` — the free OpenAI-compatible NVIDIA NIM endpoint resolved from
+      ``get_llm_config("classifier")``. Opt-in only: it returns an empty body
+      for descriptions over ~4–5K chars (T38), which is most real jobs.
+
+    Set with ``CLASSIFIER_ROUTE`` in ``.env`` (or a real env var). An empty or
+    unrecognised value resolves to ``"agent"`` (with a warning for a non-empty
+    bad value). The ``CLASSIFIER_*`` model / key / URL vars are only consulted
+    on the ``"nim"`` route.
+    """
+    _load_dotenv()
+    raw = (os.environ.get("CLASSIFIER_ROUTE") or "").strip().lower()
+    if not raw:
+        return _DEFAULT_CLASSIFIER_ROUTE
+    if raw not in ("agent", "nim"):
+        warnings.warn(
+            f"CLASSIFIER_ROUTE={raw!r} is not 'agent' or 'nim'; using "
+            f"{_DEFAULT_CLASSIFIER_ROUTE!r}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return _DEFAULT_CLASSIFIER_ROUTE
+    return raw  # type: ignore[return-value]
+
+
 # ── Non-LLM config ─────────────────────────────────────────────────────────────
 
 @dataclass(frozen=True)
@@ -210,4 +249,5 @@ def get_config() -> AppConfig:
 if __name__ == "__main__":  # pragma: no cover - manual smoke check
     for _role in ("classifier", "browser_use", "guided_apply"):
         print(f"{_role:>13}: {get_llm_config(_role)}")  # type: ignore[arg-type]
+    print(f"{'route':>13}: {get_classifier_route()}")
     print(f"{'app':>13}: {get_config()}")

@@ -89,6 +89,16 @@ PROFILE_PATH = "user_profile.json"
 LOG_PATH     = "application_log.json"
 ACCOUNTS_PATH = "created_accounts.json"
 
+# T38: the relevance classifier defaults to the Claude Agent SDK for *every*
+# job. The free NIM route (``_classify_nim`` → ``nim_client``) returns an
+# empty/whitespace body for job descriptions over ~4–5K chars, and real
+# postings are routinely 6–8K — so on the NIM route most OffsiteApply jobs fail
+# to classify, three in a row abort the session, and the T27 circuit breaker
+# only catches timeouts, not parse failures. NIM stays in the tree as an opt-in
+# route: set ``CLASSIFIER_ROUTE=nim`` in ``.env`` to re-enable it (see
+# ``config.get_classifier_route``). Resolved once at import.
+_NIM_CLASSIFIER_ENABLED = config.get_classifier_route() == "nim"
+
 # Domains we never open a browser tab for: pure aggregators, contractor-only
 # platforms, assessment mills, and known scam/broker sites. Checked against a
 # job's ``posting_domain`` / ``application_url`` BEFORE the relevance classifier
@@ -627,14 +637,17 @@ class JobAgent:
 
     * citizenship / clearance keyword in the description  → immediate skip,
       no LLM call on either backend.
-    * ``application_type == "OffsiteApply"``              → NIM (OpenAI-compatible,
+    * everything else, by default                         → Claude Agent SDK
+      (``llm.query_json``, one isolated one-shot session per job, subscription
+      auth). Reliable on the 6–8K-char descriptions real postings carry, and
+      rides the Claude subscription (no per-token cost). This is the default
+      for *all* ``application_type`` values (T38).
+    * ``application_type == "OffsiteApply"`` **and** ``CLASSIFIER_ROUTE=nim``
+      (opt-in, ``_NIM_CLASSIFIER_ENABLED``)              → NIM (OpenAI-compatible,
       ``config.get_llm_config("classifier")`` → meta/llama-3.2-11b-vision-instruct
       @ NVIDIA NIM). Free. ``run_session`` may override this to the Agent SDK for
       the rest of a session once the NIM route trips its circuit breaker
       (see :func:`classify_with_circuit_breaker`).
-    * ``SimpleOnsiteApply`` / ``ComplexOnsiteApply`` / anything else (incl.
-      ``None``)                                          → Claude Agent SDK
-      (``llm.query_json``, one isolated one-shot session per job, subscription auth).
 
     Both LLM paths ask for structured JSON output but still salvage a stray code
     fence / prose wrapper before giving up. Each LLM call is retried once on a
@@ -643,7 +656,8 @@ class JobAgent:
     after several classifications fail in a row.
     """
 
-    # Cheap Claude model for the Agent-SDK classifier path (Easy Apply jobs).
+    # Cheap Claude model for the Agent-SDK classifier path (the default for
+    # every job; OffsiteApply too unless CLASSIFIER_ROUTE=nim).
     _AGENT_MODEL = "claude-haiku-4-5"
 
     _SYSTEM = """You are a job application assistant helping the user review LinkedIn job listings.
@@ -716,7 +730,9 @@ Be accurate and concise. Never fabricate information not in the user's profile."
 
         ``prefer_agent_sdk`` forces the Claude Agent SDK route even for
         ``OffsiteApply`` jobs — used by ``run_session`` after the NIM classifier
-        route trips its circuit breaker. The citizenship keyword fast-path still
+        route trips its circuit breaker. It is a no-op unless the opt-in NIM
+        route is enabled (``_NIM_CLASSIFIER_ENABLED``); by default every job
+        goes to the Agent SDK anyway. The citizenship keyword fast-path still
         runs first regardless.
         """
         desc = description or ""
@@ -730,7 +746,11 @@ Be accurate and concise. Never fabricate information not in the user's profile."
                           {"relevant": False, "reason": reason, "citizenship_required": True})
                 return False, reason, True
 
-        if application_type == "OffsiteApply" and not prefer_agent_sdk:
+        if (
+            _NIM_CLASSIFIER_ENABLED
+            and application_type == "OffsiteApply"
+            and not prefer_agent_sdk
+        ):
             return await self._classify_nim(title, desc)
         return await self._classify_agent(title, desc)
 
@@ -828,6 +848,10 @@ Be accurate and concise. Never fabricate information not in the user's profile."
 
 # ── Classifier circuit breaker ─────────────────────────────────────────────────
 
+# Only relevant on the opt-in NIM classifier route (``CLASSIFIER_ROUTE=nim`` /
+# ``_NIM_CLASSIFIER_ENABLED``). With the default Agent SDK route,
+# ``classify_with_circuit_breaker`` short-circuits before any of this runs.
+#
 # Consecutive NIM-route classify timeouts within one session before every
 # remaining OffsiteApply job is routed through the Agent SDK instead.
 _MAX_NIM_TIMEOUT_STREAK = 2
@@ -863,7 +887,16 @@ async def classify_with_circuit_breaker(
     A NIM timeout that the Agent SDK then classifies successfully does NOT raise
     — so the caller does not count it as a classifier failure. Only a genuine
     failure (Agent SDK also fails, or a non-timeout error) propagates.
+
+    When the NIM route is not enabled (``_NIM_CLASSIFIER_ENABLED`` is false —
+    the default, ``CLASSIFIER_ROUTE`` unset), this is a thin pass-through to
+    ``agent.classify``: every job goes straight to the Agent SDK and the
+    breaker state is never touched (``agent.classify`` ignores the OffsiteApply
+    branch in that mode, so ``prefer_agent_sdk`` is moot).
     """
+    if not _NIM_CLASSIFIER_ENABLED:
+        return await agent.classify(title, description, application_type)
+
     is_offsite = (application_type or "") == "OffsiteApply"
 
     if not is_offsite or breaker["nim_route_degraded"]:
