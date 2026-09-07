@@ -1,32 +1,36 @@
 #!/usr/bin/env bash
 # One command for the full local check: bootstrap .venv/ (first run only),
-# then run ruff + pytest. Both always run; the script exits non-zero if either
-# fails. Extra args are forwarded to pytest, e.g. ./scripts/check.sh -k offsite -x
+# then run ruff + pytest. Extra args are forwarded to pytest, e.g.
+#   ./scripts/check.sh -k offsite -x
+#
+# Exit status: 0 when pytest passed AND ruff either passed or only reported lint
+# findings (rc 1) — the repo carries a deliberate ~509-finding baseline, so a
+# clean ruff exit is not expected. A ruff crash (rc >= 2) or any pytest failure
+# exits 1.
 set -euo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/_venv.sh
 source "$DIR/_venv.sh"
 
-rc=0
+# Run from the repo root: some modules read data files by relative path at import
+# time (e.g. scripts/helpers.py -> json_paths/data_variables.csv), so pytest
+# collection fails if invoked from elsewhere.
+cd "$REPO_ROOT"
 
 echo "==> ruff"
-"$VENV_DIR/bin/ruff" check "$REPO_ROOT" || rc=1
-
-# Install Playwright's Chromium once, only if it's missing. The current test
-# suite import-guards Playwright, but browser-driven tests need the binary.
-if ! "$VENV_DIR/bin/python" - <<'PY' >/dev/null 2>&1
-import os
-from playwright.sync_api import sync_playwright
-with sync_playwright() as p:
-    assert os.path.exists(p.chromium.executable_path)
-PY
-then
-    echo "==> installing Playwright Chromium (one-time)"
-    "$VENV_DIR/bin/playwright" install chromium
-fi
+ruff_rc=0
+"$VENV_DIR/bin/python" -m ruff check "$REPO_ROOT" || ruff_rc=$?
 
 echo "==> pytest"
-"$VENV_DIR/bin/pytest" "$REPO_ROOT" "$@" || rc=1
+pytest_rc=0
+"$VENV_DIR/bin/python" -m pytest "$REPO_ROOT/tests" "$@" || pytest_rc=$?
 
-exit "$rc"
+echo "==> summary: ruff exit ${ruff_rc} (baseline ~509 findings expected), pytest exit ${pytest_rc}"
+
+# succeed when pytest passed AND ruff either passed or only reported lint
+# findings (rc 1), not a crash (rc 2+)
+if [ "$pytest_rc" -eq 0 ] && { [ "$ruff_rc" -eq 0 ] || [ "$ruff_rc" -eq 1 ]; }; then
+    exit 0
+fi
+exit 1

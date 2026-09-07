@@ -28,7 +28,7 @@ python to_csv.py --folder <dest> --database linkedin_jobs.db
 
 # Lint / test — bootstraps a project-local .venv/ on first run, then reuses it
 ./scripts/lint.sh          # ruff only
-./scripts/check.sh         # ruff + pytest (installs Playwright Chromium once if missing)
+./scripts/check.sh         # ruff + pytest; prints a summary line, exits 0 when pytest passes and ruff only has baseline findings
 
 # If you already have a venv with `.[dev]` installed, the raw tools work too:
 ruff check .

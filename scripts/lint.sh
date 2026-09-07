@@ -7,4 +7,5 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/_venv.sh
 source "$DIR/_venv.sh"
 
-exec "$VENV_DIR/bin/ruff" check "$REPO_ROOT" "$@"
+cd "$REPO_ROOT"  # keep cwd deterministic regardless of where the script is called from
+exec "$VENV_DIR/bin/python" -m ruff check "$REPO_ROOT" "$@"

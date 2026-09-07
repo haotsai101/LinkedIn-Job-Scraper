@@ -333,10 +333,10 @@ T8's indexes + WAL and T9's schema changes only take effect when the operator ma
 **Acceptance:** `ruff check .` runs from the documented dev setup with one obvious command.
 
 **Fix (this PR):**
-- `scripts/_venv.sh` (sourced helper) — creates a project-local `.venv/` if absent, then `pip install -q -e ".[dev]"` (idempotent; venv never recreated once it exists). Exports `REPO_ROOT` / `VENV_DIR`.
+- `scripts/_venv.sh` (sourced helper) — refuses direct execution (`(return 0 2>/dev/null) || exit 1`), creates a project-local `.venv/` if absent, then `python -m pip install -q -e ".[dev]"` (module form survives a partially-broken venv; idempotent; venv never recreated once it exists). Exports `REPO_ROOT` / `VENV_DIR`.
 - `scripts/lint.sh` — `source _venv.sh` then `exec .venv/bin/ruff check <repo>` (forwards extra args, e.g. `--fix`).
-- `scripts/check.sh` — same bootstrap, then `ruff` + `pytest`; installs Playwright Chromium once only if the binary is missing (current suite import-guards Playwright, but browser tests need it).
-- `pyproject.toml` `dev` extra pinned: `ruff>=0.16.6,<0.17`, `pytest>=9.1,<10` — keeps `ruff check` findings reproducible across machines/CI.
+- `scripts/check.sh` — same bootstrap, then `ruff` + `pytest` (both via `python -m`); prints a `==> summary: ruff exit N … pytest exit N` line and exits 0 when pytest passed and ruff either passed or only reported lint findings (rc 1), non-zero on a ruff crash (rc ≥ 2) or any pytest failure. No Chromium probe — no test drives a browser yet; the first browser test lands `playwright install` with real context.
+- `pyproject.toml` `dev` extra: `ruff>=0.16.6,<0.17` (single minor — a ruff minor can add/retire rules and break the lint-parity baseline), `pytest>=8.0,<10` (floor + major ceiling; suite only uses raises/warns/parametrize/fixture/MonkeyPatch).
 - `CLAUDE.md` "Lint / test" now points at `./scripts/lint.sh` / `./scripts/check.sh`, keeping the raw `ruff check .` / `pytest` lines for anyone with an active `.[dev]` venv.
 - `.venv/` + `*.pyc` already covered by `.gitignore` (`/.venv/`, `*.pyc`) — no change needed. No CI (`.github/workflows/` absent). No `.py` changes; existing ~500 ruff findings untouched (out of scope).
 

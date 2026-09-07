@@ -6,6 +6,10 @@
 #
 # Exports: REPO_ROOT, VENV_DIR  (for the caller to run .venv/bin/<tool>).
 
+# Guard against direct execution: this file only makes sense sourced (it exports
+# vars for the caller), and running it standalone would silently do nothing useful.
+(return 0 2>/dev/null) || { echo "scripts/_venv.sh must be sourced, not executed" >&2; exit 1; }
+
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -17,4 +21,6 @@ if [ ! -x "$VENV_DIR/bin/python" ]; then
 fi
 
 echo "==> installing dev dependencies (pip no-op if already satisfied)"
-"$VENV_DIR/bin/pip" install -q -e "$REPO_ROOT[dev]"
+# `python -m pip` (not the bin/pip shim) so this still works if the venv's
+# console scripts are stale/broken after an interpreter move.
+"$VENV_DIR/bin/python" -m pip install -q -e "$REPO_ROOT[dev]"
