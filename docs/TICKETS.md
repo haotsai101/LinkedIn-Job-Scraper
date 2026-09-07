@@ -634,3 +634,17 @@ Affected tokens: `ai`, `ml`, `go`, `ui`, `ux`, `qa`, `bi`, `r`, `c` (and any ≤
 3. **Did step 3(b)** — a single-char span token that is an *exact* (case-insensitive, not substring) entry in the skills list is treated as not-foreign. Cheap and safe: `"...with R"` → full figure for a profile listing `R`; `"...with C"` stays `"1"` when only `C#` is listed.
 
 Live before/after against the real `user_profile.json` (`years_experience: 4`): `"How many years of experience do you have in AI / ML?"` `"1"` → `"4"`; `"...in AI"` `"1"` → `"4"`; `"...with R"` `"1"` → `"4"`; `"...with Go"` `"4"` → `"4"` (unchanged); `"...with COBOL"` `"1"` → `"1"` (unchanged); `"...as a Lead"` `"1"` → `"1"` (unchanged). `"...in ML"` *alone* stays `"1"` on the real profile (no `ml` token anywhere in its text) — accepted, the headline "AI / ML" case is the one that matters and it now resolves via the `"ai"` token. Tests: +3 cases in `tests/test_profile_value.py` (`_T42_PROFILE`), `pytest tests/` 322 green, `ruff` findings unchanged (383, all pre-existing).
+
+**Status:** ✅ **merged** (PR #45, `17ae6d4`). QA sign-off folded into the T39/T40/T42 combined apply-QA.
+
+---
+
+## T43 — `_get_profile_value`: a "City, State" label resolves to state only
+
+**Phase:** T41 follow-up · **Risk:** low · **Status:** open · **Sev:** P4 · Found by the T41 (PR #48) reviewer.
+
+**Symptom:** a form field labelled literally `"City, State"` (or `"City/State"`) returns `profile["state"]` (e.g. `"Utah"`) instead of the full location string (`"Salt Lake City, Utah"`) or the city. The state-of-residence branch (`_get_profile_value` ~line 689) matches `"state"` and wins on ordering over the city branch (~line 738).
+
+**Pre-existing** — identical on `master`, out of scope for T41 (which only anchored the `"city"` substring to fix the `"capacity"` collision). Now locked by `test_city_state_labels_resolve_to_a_location_value` so the behavior is characterized, not silently drifting.
+
+**Suggested fix:** before the individual `city` / `state` branches, add a combined check — if the label contains both `\bcity\b` and `\bstate\b` (or the `"city, state"` / `"city/state"` phrases already in the location tuple), return the full `profile["location"]` string. Add tests for `"City, State"`, `"City / State"`, `"City and State"`, `"City, State, Zip"`.
