@@ -531,8 +531,29 @@ def _years_label_names_a_foreign_role_or_skill(l: str, profile: dict) -> bool:
     bg = " ".join(str(profile.get(k) or "") for k in
                   ("current_title", "headline", "summary", "skills")).lower()
 
+    # Exact (case-insensitive) skill-list entries, for the single-char check
+    # below ("...experience with R" for someone whose skills list has "R").
+    _skills_raw = profile.get("skills") or []
+    if isinstance(_skills_raw, str):
+        _skills_raw = re.split(r"[,;]", _skills_raw)
+    skill_entries = {str(s).strip().lower() for s in _skills_raw if str(s).strip()}
+
+    def _anchored_in_bg(token: str) -> bool:
+        # Whole-token match against the profile text, not a substring: "go"
+        # matches "Go" / "and Go," but not "golang" or "category".
+        return bool(re.search(
+            r'(?<![a-z0-9+#.])' + re.escape(token) + r'(?![a-z0-9+#.])', bg))
+
     for span in spans:
-        words = [w.strip(".,?!:;()'\"") for w in span.split()]
+        # Whole-span match first: a multi-token acronym pair ("ai/ml", "ai ml",
+        # "a/b testing") that appears verbatim in the profile text or skills
+        # list, but whose individual tokens are too short to match on their own.
+        norm = re.sub(r'\s*/\s*', '/', re.sub(r'\s+', ' ', span)).strip()
+        if any(len(f) >= 2 and _anchored_in_bg(f)
+               for f in {norm, norm.replace('/', ' ')}):
+            continue
+        # Split on whitespace AND slashes so "ai/ml" -> ["ai", "ml"].
+        words = [w.strip(".,?!:;()'\"") for w in re.split(r'[\s/]+', span)]
         words = [w for w in words if w and w not in _QUALIFIER_CONNECTIVES]
         if not words:
             continue
@@ -540,10 +561,16 @@ def _years_label_names_a_foreign_role_or_skill(l: str, profile: dict) -> bool:
         if any(w in _GENERIC_QUALIFIER_WORDS for w in words):
             continue
         # The qualifier names something already in the applicant's background
-        # -> genuine experience, keep the full figure.
-        if any(len(w) >= 3
-               and re.search(r'(?<![a-z0-9+#.])' + re.escape(w) + r'(?![a-z0-9+#.])', bg)
-               for w in words):
+        # -> genuine experience, keep the full figure. 2-char tokens (ai, ml,
+        # ui, ux, bi, go, qa) ARE checked here: this is an anchored regex
+        # against real profile prose, so "ai" matching "AI applications" is a
+        # true positive. Single letters stay out (too noisy) -- except an
+        # exact skill-list entry ("R", "C"), handled just below.
+        if any(len(w) >= 2 and _anchored_in_bg(w) for w in words):
+            continue
+        # A single-char qualifier that is *exactly* a listed skill ("...with R"
+        # for someone who lists "R") -> genuine experience, keep the full figure.
+        if any(len(w) == 1 and w in skill_entries for w in words):
             continue
         # Otherwise: a concrete role / skill / domain foreign to the applicant.
         return True
