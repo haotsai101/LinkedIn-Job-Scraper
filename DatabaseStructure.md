@@ -132,6 +132,13 @@ Indexes:
 | currency | TEXT |  |  |  |
 | compensation_type | TEXT |  |  |  |
 
+## schema_migrations
+
+| Column | Type | Not Null | Default | PK |
+| --- | --- | --- | --- | --- |
+| id | TEXT |  |  | 1 |
+| applied_at | INTEGER |  |  |  |
+
 ## skills
 
 | Column | Type | Not Null | Default | PK |

@@ -16,10 +16,22 @@ and the failure is loud.
 
 The migration id is the file stem (``001_indexes``, ``002_schema``).
 
+Concurrency
+-----------
+The discover → backup → apply → record critical section is serialised with an
+advisory file lock (``<db>.migrate.lock``, ``fcntl.flock``). Dagster's
+multiprocess executor can start ``search_jobs_op`` and ``fetch_job_details_op``
+concurrently, and both call this on a not-yet-migrated DB. Without the lock the
+two racing ``002_schema`` runs hit ``duplicate column name: listed_epoch`` (its
+check-then-``ALTER`` is not atomic). With the lock the loser blocks, then
+re-reads ``schema_migrations`` inside the lock, finds nothing pending, and
+returns clean.
+
 Backups
 -------
-Before the first pending migration of a run, the DB file is copied to
-``<name>.bak-<epoch>`` (``.gitignore`` covers ``linkedin_jobs.db*``). A startup
+Before the first pending migration of a run, the DB is snapshotted to
+``<name>.bak-<epoch>`` with the SQLite online-backup API (consistent even with
+other open connections). ``.gitignore`` covers ``linkedin_jobs.db*``. A startup
 where every migration is already applied does no backup and no work.
 
 Usage:
@@ -27,13 +39,25 @@ Usage:
 """
 from __future__ import annotations
 
+import contextlib
 import importlib.util
-import shutil
 import sqlite3
 import sys
+import threading
 import time
 from pathlib import Path
 from types import ModuleType
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX (Windows); this project is macOS
+    fcntl = None
+
+# In-process serialisation. ``fcntl.flock`` guards *cross-process* races
+# (Dagster's multiprocess executor runs search + details ops in separate
+# processes); flock's semantics for multiple threads of one process sharing a
+# path are murky, so this lock covers that case unambiguously.
+_INPROC_LOCK = threading.Lock()
 
 _MIGRATIONS_DIR = Path(__file__).resolve().parent
 _REPO_ROOT = _MIGRATIONS_DIR.parents[1]
@@ -56,7 +80,7 @@ _MIGRATION_GLOB = "[0-9][0-9][0-9]_*.py"
 def discover_migrations(migrations_dir: Path | None = None) -> list[Path]:
     """Return the ``NNN_*.py`` migration files, sorted by name (== by number)."""
     migrations_dir = migrations_dir or _MIGRATIONS_DIR
-    return sorted(migrations_dir.glob(_MIGRATION_GLOB))
+    return sorted(Path(migrations_dir).glob(_MIGRATION_GLOB))
 
 
 def _applied_ids(db_path: Path) -> set[str]:
@@ -75,6 +99,11 @@ def _applied_ids(db_path: Path) -> set[str]:
         conn.close()
 
 
+def _pending(db_path: Path, migrations: list[Path]) -> list[Path]:
+    applied = _applied_ids(db_path)
+    return [p for p in migrations if p.stem not in applied]
+
+
 def _record_applied(db_path: Path, migration_id: str) -> None:
     conn = sqlite3.connect(str(db_path))
     try:
@@ -87,21 +116,45 @@ def _record_applied(db_path: Path, migration_id: str) -> None:
         conn.close()
 
 
-def _backup(db_path: Path, log) -> Path:
-    """Checkpoint the WAL and copy the DB file to ``<name>.bak-<epoch>``."""
-    conn = sqlite3.connect(str(db_path))
-    try:
-        # Fold any pending WAL frames into the main file so the plain copy is
-        # complete. No-op / harmless error on a non-WAL DB.
-        try:
-            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        except sqlite3.Error:
-            pass
-    finally:
-        conn.close()
+@contextlib.contextmanager
+def _migration_lock(db_path: Path):
+    """Hold an exclusive advisory lock for the discover+apply critical section.
 
+    No-op (best effort) if ``fcntl`` is unavailable. The lock file
+    (``<db>.migrate.lock``) is created next to the DB and left in place — it
+    carries no state, only the flock.
+    """
+    with _INPROC_LOCK:
+        if fcntl is None:
+            yield
+            return
+        lock_path = db_path.with_name(db_path.name + ".migrate.lock")
+        lock_file = open(lock_path, "a")  # noqa: SIM115 - released in finally
+        try:
+            fcntl.flock(lock_file, fcntl.LOCK_EX)
+            yield
+        finally:
+            try:
+                fcntl.flock(lock_file, fcntl.LOCK_UN)
+            finally:
+                lock_file.close()
+
+
+def _backup(db_path: Path, log) -> Path:
+    """Snapshot the DB to ``<name>.bak-<epoch>`` via the SQLite online-backup API.
+
+    Consistent even if another connection is mid-write — unlike a plain file
+    copy, which can catch a torn WAL / an incomplete checkpoint.
+    """
     backup_path = db_path.with_name(f"{db_path.name}.bak-{int(time.time())}")
-    shutil.copy2(db_path, backup_path)
+    src = sqlite3.connect(str(db_path))
+    dst = sqlite3.connect(str(backup_path))
+    try:
+        with dst:
+            src.backup(dst)
+    finally:
+        dst.close()
+        src.close()
     log(f"[migrations] backed up {db_path.name} -> {backup_path.name}")
     return backup_path
 
@@ -134,32 +187,37 @@ def run_pending_migrations(
     if not migrations:
         return []
 
-    applied = _applied_ids(db_path)
-    pending = [p for p in migrations if p.stem not in applied]
-    if not pending:
+    # Cheap unlocked pre-check: the overwhelmingly common startup is "all
+    # applied", and there is no point taking the lock for it.
+    if not _pending(db_path, migrations):
         return []
 
-    log(
-        f"[migrations] {len(pending)} pending: "
-        + ", ".join(p.stem for p in pending)
-    )
-    _backup(db_path, log)
+    with _migration_lock(db_path):
+        # Re-read inside the lock — a concurrent runner may have applied
+        # everything while we were blocked on flock().
+        pending = _pending(db_path, migrations)
+        if not pending:
+            return []
 
-    done: list[str] = []
-    for path in pending:
-        module = _load_migration(path)
-        migrate_fn = getattr(module, "migrate", None)
-        if not callable(migrate_fn):
-            raise RuntimeError(
-                f"migration {path.name} has no callable migrate(db_path) entrypoint"
-            )
-        log(f"[migrations] applying {path.stem} ...")
-        migrate_fn(str(db_path))          # owns its own connection + commit
-        _record_applied(db_path, path.stem)  # only after the migration committed
-        done.append(path.stem)
-        log(f"[migrations] recorded {path.stem}")
+        log(f"[migrations] {len(pending)} pending: "
+            + ", ".join(p.stem for p in pending))
+        _backup(db_path, log)
 
-    return done
+        done: list[str] = []
+        for path in pending:
+            module = _load_migration(path)
+            migrate_fn = getattr(module, "migrate", None)
+            if not callable(migrate_fn):
+                raise RuntimeError(
+                    f"migration {path.name} has no callable migrate(db_path) entrypoint"
+                )
+            log(f"[migrations] applying {path.stem} ...")
+            migrate_fn(str(db_path))          # owns its own connection + commit
+            _record_applied(db_path, path.stem)  # only after the migration committed
+            done.append(path.stem)
+            log(f"[migrations] recorded {path.stem}")
+
+        return done
 
 
 if __name__ == "__main__":
