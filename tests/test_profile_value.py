@@ -374,6 +374,89 @@ def test_relevant_and_total_experience_questions_keep_the_full_figure():
     assert _gpv(PROFILE, "Years of relevant experience", "text") == "10"
 
 
+# ── T40: "years of experience" catch-all must not swallow role/skill qualifiers ─
+
+# Live scenario from the 2026-09-06 QA run (job 12, Infinite Computer Solutions):
+# "How many years of experience do you have as a Lead ?" was answered "4" — the
+# applicant's whole career — because the bare-experience catch-all matched the
+# substring "years of experience" before the T32 tiered branch could floor a
+# role the applicant (title "Software Engineer") has never held.
+#
+# The fix only diverts a "years of experience" label to the tiered (flooring)
+# branch when the role/skill/domain named is *foreign* to the applicant's
+# profile. Generic phrasing ("...as a whole", "...in a professional setting")
+# and the applicant's own role/skills keep the full figure — an under-claimed
+# "1"/"2" can trip a "minimum N years" knockout filter (the exact T32 hazard).
+_T40_PROFILE = {
+    "current_title": "Software Engineer",
+    "headline": "Software Engineer | Backend & AI",
+    "summary": "Backend engineer. I build and ship services, and work with LLMs.",
+    "years_experience": 4,
+    "skills": "Python, SQL, AI/ML, LLMs",
+}
+
+
+def test_foreign_role_qualified_years_question_is_floored():
+    # "...as a Lead" must NOT return the full career figure. The applicant has no
+    # "Lead" in title/headline/summary/skills -> tier 3 floor "1" (never "0").
+    got = _gpv(_T40_PROFILE, "How many years of experience do you have as a Lead?", "text")
+    assert got not in ("4", "0", None)
+    assert got == "1"
+    # A trailing-space "... as a Lead ?" (exactly as seen live) normalizes the same.
+    assert _gpv(_T40_PROFILE, "How many years of experience do you have as a Lead ?", "text") == "1"
+    # Same overclaim, PROFILE fixture (10-yr career): still must not return "10".
+    assert _gpv(PROFILE, "How many years of experience do you have as a Lead?", "text") != "10"
+
+
+def test_foreign_skill_or_domain_qualified_years_question_is_floored():
+    # An unrecognised skill / domain floors at "1" (never "0", never full figure).
+    assert _gpv(_T40_PROFILE, "Years of experience with COBOL", "text") == "1"
+    assert _gpv(_T40_PROFILE, "How many years of experience do you have with Salesforce?",
+                "text") == "1"
+    assert _gpv(_T40_PROFILE, "Years of experience in the insurance sector", "text") == "1"
+
+
+def test_bare_years_of_experience_still_returns_the_full_figure():
+    # Regression guard: the catch-all must keep answering bare/overall questions.
+    assert _gpv(_T40_PROFILE, "Years of experience", "number") == "4"
+    assert _gpv(_T40_PROFILE, "How many years of experience do you have?", "number") == "4"
+    assert _gpv(_T40_PROFILE, "Total years of professional experience", "text") == "4"
+    assert _gpv(_T40_PROFILE, "Years of work experience", "text") == "4"
+    # "in total" is a filler, not a domain qualifier.
+    assert _gpv(_T40_PROFILE, "How many years of experience do you have in total?", "text") == "4"
+
+
+def test_generic_role_or_domain_phrasing_keeps_the_full_figure():
+    # None of these name a concrete role/skill the applicant lacks — they are
+    # generic English, so the answer stays the full career figure (NOT floored).
+    for label in (
+        "How many years of experience do you have as a whole?",
+        "Years of experience as a professional",
+        "How many years of experience do you have, working as a team?",
+        "Years of experience in the software industry",
+        "Years of experience in a professional setting",
+        "Years of experience in a leadership role",
+        "Years of experience in the US",
+        "How many years of experience do you have in a senior position?",
+        "Years of experience as a contributor",
+        "How many years of experience do you have as an employee?",
+        "Years of experience as an individual contributor",
+        "Years of experience in the tech sector",       # applicant's own industry
+        "Years of experience in technology",
+        "Years of experience in IT",
+    ):
+        assert _gpv(_T40_PROFILE, label, "text") == "4", label
+
+
+def test_applicants_own_role_or_skill_keeps_the_full_figure():
+    # "...as a Software Engineer" for a Software Engineer, "...in AI/ML" for an ML
+    # engineer -> genuine experience, full figure (never floored to "1"/"2").
+    assert _gpv(_T40_PROFILE, "Years of experience as a Software Engineer", "text") == "4"
+    assert _gpv(_T40_PROFILE, "Years of experience in AI/ML", "text") == "4"
+    assert _gpv(_T40_PROFILE, "How many years of experience do you have in AI / ML?", "text") == "4"
+    assert _gpv(PROFILE, "Years of experience as a Software Engineer", "text") == "10"
+
+
 # ── work authorization / visa / citizenship ───────────────────────────────────
 
 def test_work_authorization_and_visa():
