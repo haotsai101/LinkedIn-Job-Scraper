@@ -374,6 +374,53 @@ def test_relevant_and_total_experience_questions_keep_the_full_figure():
     assert _gpv(PROFILE, "Years of relevant experience", "text") == "10"
 
 
+# ── T40: "years of experience" catch-all must not swallow role/skill qualifiers ─
+
+# Live scenario from the 2026-09-06 QA run (job 12, Infinite Computer Solutions):
+# "How many years of experience do you have as a Lead ?" was answered "4" — the
+# applicant's whole career — because the bare-experience catch-all matched the
+# substring "years of experience" before the T32 tiered branch could floor a
+# role the applicant (title "Software Engineer") has never held.
+_T40_PROFILE = {
+    "current_title": "Software Engineer",
+    "headline": "Software Engineer | Backend & AI",
+    "summary": "Backend engineer. I build and ship services, and work with LLMs.",
+    "years_experience": 4,
+    "skills": "Python, SQL, AI/ML, LLMs",
+}
+
+
+def test_role_qualified_years_question_goes_through_the_tiered_branch():
+    # "...as a Lead" must NOT return the full career figure. The applicant has no
+    # "Lead" in title/headline/summary -> tier 3 floor "1" (never "0").
+    got = _gpv(_T40_PROFILE, "How many years of experience do you have as a Lead?", "text")
+    assert got not in ("4", "0", None)
+    assert got == "1"
+    # A trailing-space "... as a Lead ?" (exactly as seen live) normalizes the same.
+    assert _gpv(_T40_PROFILE, "How many years of experience do you have as a Lead ?", "text") == "1"
+
+
+def test_bare_years_of_experience_still_returns_the_full_figure():
+    # Regression guard: the catch-all must keep answering bare/overall questions.
+    assert _gpv(_T40_PROFILE, "Years of experience", "number") == "4"
+    assert _gpv(_T40_PROFILE, "How many years of experience do you have?", "number") == "4"
+    assert _gpv(_T40_PROFILE, "Total years of professional experience", "text") == "4"
+    assert _gpv(_T40_PROFILE, "Years of work experience", "text") == "4"
+    # "in total" is a filler, not a domain qualifier.
+    assert _gpv(_T40_PROFILE, "How many years of experience do you have in total?", "text") == "4"
+
+
+def test_skill_qualified_years_question_goes_through_the_tiered_branch():
+    # A listed skill still earns the applicant's real tenure (tier 1), not the
+    # AI-skills "1" floor and not the bare catch-all short-circuit.
+    assert _gpv(_T40_PROFILE, "Years of experience in AI/ML", "text") == "4"
+    assert _gpv(_T40_PROFILE, "How many years of experience do you have in AI / ML?", "text") == "4"
+    # An unrecognised skill floors at "1" (never "0", never the full figure).
+    assert _gpv(_T40_PROFILE, "Years of experience with COBOL", "text") == "1"
+    assert _gpv(_T40_PROFILE, "How many years of experience do you have with Salesforce?",
+                "text") == "1"
+
+
 # ── work authorization / visa / citizenship ───────────────────────────────────
 
 def test_work_authorization_and_visa():

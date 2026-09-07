@@ -450,6 +450,57 @@ def _degree_rank(deg: str) -> int:
     return 0
 
 
+# Words that can follow "with"/"in"/"using" in a *bare* overall-experience
+# question ("...experience in total", "...experience in general") — they name no
+# concrete skill or domain, so the label is still an overall-experience question
+# and stays with the catch-all.
+_EXPERIENCE_QUALIFIER_STOPWORDS = {
+    "total", "general", "any", "this", "that", "which", "what", "it", "all",
+    "such", "your", "these", "those", "here", "role", "roles", "position",
+    "field", "area", "industry", "years", "months",
+}
+
+# Adjectives that can sit between "years of" and "experience" without turning an
+# overall-experience question into a skill/role-qualified one — the label still
+# asks for the applicant's whole career length. ("total" / "relevant" are left
+# out on purpose: the dedicated "total / relevant experience" branch further
+# down owns those, with its own default.)
+_BARE_EXPERIENCE_FILLERS = (
+    "professional", "work", "working", "industry", "overall",
+    "full-time", "full time", "fulltime", "paid", "hands-on",
+    "hands on", "prior", "previous", "combined", "cumulative",
+)
+
+
+def _years_label_names_a_role_or_skill(l: str) -> bool:
+    """True when a "years of experience" label also pins the experience to a
+    specific role ("...as a Lead") or a concrete skill / domain ("...experience
+    with Kafka", "...experience in fintech", "...in AI/ML").
+
+    Such labels must be routed through the T32 tiered "years of <skill/role>"
+    branch in ``_get_profile_value``, which caps or floors tenure for things the
+    applicant has never done. The bare-experience catch-alls (``"years of
+    experience"`` / ``"total experience"``) would instead return the applicant's
+    *entire* career length — asserting a full career in a role they have never
+    held (T40 — observed live: "How many years of experience do you have as a
+    Lead?" -> "4" for a "Software Engineer").
+
+    ``l`` is the already-normalized (lower-cased, whitespace-collapsed) label.
+    """
+    # "...as a Lead" / "...as an Architect" — a role qualifier anywhere.
+    if re.search(r'\bas\s+an?\s+[a-z]', l):
+        return True
+    # "experience with/in/using <something concrete>" — the qualifier must come
+    # after the word "experience" so an unrelated "in"/"with" from another clause
+    # doesn't trip it.
+    m = re.search(r'\bexperience\b.*?\b(?:with|in|using)\s+(.+)', l)
+    if m:
+        target = [w for w in m.group(1).split() if w not in ("the", "a", "an")]
+        if target and target[0].strip(".,?!:;") not in _EXPERIENCE_QUALIFIER_STOPWORDS:
+            return True
+    return False
+
+
 def _get_profile_value(profile: dict, label: str, kind: str = "text") -> str | None:
     """Map a form field label to a profile value. Returns None if no confident match."""
     # Collapse all whitespace (including embedded newlines from DOM textContent),
@@ -552,7 +603,19 @@ def _get_profile_value(profile: dict, label: str, kind: str = "text") -> str | N
         return p.get("headline") or p.get("current_title")
     if any(k in l for k in ("summary", "professional summary", "about me", "bio")):
         return p.get("summary") or p.get("cover_letter_text")
-    if any(k in l for k in ("years of experience", "years experience", "total experience")):
+    # Bare / overall "years of experience" question -> the applicant's full
+    # tenure. Covers filler phrasings that still mean "overall" ("years of
+    # professional / work / total experience"). A role- or skill-qualified
+    # phrasing ("...experience as a Lead", "...experience with Kafka",
+    # "...experience in AI/ML") must fall through to the T32 tiered branch below
+    # instead — otherwise this catch-all asserts the applicant's whole career in
+    # a role/skill they may never have touched (T40).
+    _bare_years_exp = (
+        any(k in l for k in ("years of experience", "years experience", "total experience"))
+        or any(f"years of {f} experience" in l for f in _BARE_EXPERIENCE_FILLERS)
+        or any(f"years {f} experience" in l for f in _BARE_EXPERIENCE_FILLERS)
+    )
+    if _bare_years_exp and not _years_label_names_a_role_or_skill(l):
         return str(p.get("years_experience", ""))
     if any(k in l for k in (
         "generative ai", "gen ai", "llm", "large language model",
@@ -563,7 +626,11 @@ def _get_profile_value(profile: dict, label: str, kind: str = "text") -> str | N
         "data science", "data scientist", "model training", "model development",
         "model deployment", "ai/ml", "ai agent", "ai engineer", "prompt engineer",
         "transformer", "diffusion model", "reinforcement learning",
-    )) and kind in ("text", "number"):
+    )) and kind in ("text", "number") \
+            and not (_is_years_q and _years_label_names_a_role_or_skill(l)):
+        # ...but a *skill-qualified* "years of experience in AI/ML" still goes to
+        # the tiered branch below, so a skill the applicant actually lists earns
+        # their real tenure instead of this "1" floor (T40).
         return "1"
     if (any(k in l for k in ("how many years", "how many months", "years of", "years with",
                              "yrs of experience", "yrs experience"))
@@ -748,7 +815,12 @@ def _get_profile_value(profile: dict, label: str, kind: str = "text") -> str | N
         return "No"
     if any(k in l for k in ("notice period", "notice days", "days notice")):
         return "14"
-    if any(k in l for k in ("total years", "total experience", "years of relevant", "relevant experience", "total it experience")):
+    # "total" / "relevant" experience wants the full figure — but only when it is
+    # still a *bare* overall question. "total experience as a Lead" is a
+    # role-qualified overclaim and must not resolve here either (T40).
+    if any(k in l for k in ("total years", "total experience", "years of relevant",
+                            "relevant experience", "total it experience")) \
+            and not _years_label_names_a_role_or_skill(l):
         return str(p.get("years_experience", "4"))
     # IC / hands-on role comfort questions
     if any(k in l for k in ("individual contributor", "hands-on-keyboard", "hands on keyboard", "ic role", "hands-on engineer")):
