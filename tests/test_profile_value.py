@@ -15,6 +15,8 @@ functions. The module's ``openai`` / ``playwright`` imports are import-guarded s
 works even when those packages are absent.
 """
 
+import pytest
+
 import linkedin_apply as la
 
 _gpv = la._get_profile_value
@@ -516,6 +518,69 @@ def test_single_char_skill_token_matches_exact_skill_entry_only():
                 "text") == "4"
     # "C" is NOT listed (only "C#" would be) -> still foreign, floored to "1".
     assert _gpv(_T42_PROFILE, "Years of experience with C", "text") == "1"
+
+
+# ── T41: the location branch must not substring-match "city" inside "capacity" ─
+#
+# `_get_profile_value`'s city/location branch keyed "city" as a bare substring,
+# which also fires inside "capacity". That branch runs well before the
+# years-of-experience logic, so a label like "years of experience in a
+# professional/leadership capacity" returned profile["location"] (or None when
+# the profile has no location) instead of a tenure figure.
+#
+# Fix: "city" is matched on a word boundary (re.search(r"\bcity\b", l)); the
+# multi-word location phrases stay as substring checks. \bcity\b still matches
+# inside "city, state" / "city/state" (correct — those ARE location labels).
+
+_T41_CAPACITY_LABELS = (
+    "How many years of experience do you have in a professional capacity?",
+    "years of experience in a leadership capacity",
+    "capacity planning experience (years)",
+)
+
+
+@pytest.mark.parametrize("label", _T41_CAPACITY_LABELS)
+def test_capacity_label_does_not_hit_the_location_branch(label):
+    # The bug: "capacity" contains "city" -> location branch -> the applicant's
+    # location string typed into a years-of-experience field. Post-fix the label
+    # falls through to the years logic (a tenure figure) or, when nothing else
+    # matches, None. It must NEVER return the location.
+    for prof in (PROFILE, _T40_PROFILE):
+        got = _gpv(prof, label, "text")
+        if prof.get("location"):
+            assert got != prof["location"], f"{label!r} (prof loc) -> {got!r}"
+        assert got in (None, "10", "4", "1"), f"{label!r} -> {got!r}"
+    # The two "years of experience ..." phrasings still resolve to the full
+    # career figure (the qualifier "capacity" is generic, not a foreign domain).
+    assert _gpv(PROFILE, _T41_CAPACITY_LABELS[0], "text") == "10"
+    assert _gpv(PROFILE, _T41_CAPACITY_LABELS[1], "text") == "10"
+    assert _gpv(_T40_PROFILE, _T41_CAPACITY_LABELS[0], "text") == "4"
+
+
+# Regression guard: every genuine location/address label still resolves through
+# the same branch (or, pre-existing, an earlier one) to the same value it does
+# on master. Locks the branch so a future edit to the keying can't silently
+# break which labels count as "location".
+@pytest.mark.parametrize("label", [
+    "City",
+    "Current City",
+    "What city do you live in?",
+    "Your location",
+    "Current location",
+    "Where are you located?",
+    "What is your current location?",
+])
+def test_genuine_location_labels_still_return_the_location(label):
+    assert _gpv(PROFILE, label, "text") == "Salt Lake City, Utah", label
+
+
+@pytest.mark.parametrize("label", ["City, State", "City/State"])
+def test_city_state_labels_resolve_to_a_location_value(label):
+    # Pre-existing quirk (unchanged by T41): these contain the word "state", so
+    # the earlier state-of-residence branch answers first with profile["state"].
+    # \bcity\b matches them too, but the state branch wins on ordering. Either
+    # way the value typed is a real location component, never a years figure.
+    assert _gpv(PROFILE, label, "text") == "Utah", label
 
 
 # ── work authorization / visa / citizenship ───────────────────────────────────

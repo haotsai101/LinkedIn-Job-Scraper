@@ -724,7 +724,18 @@ def _get_profile_value(profile: dict, label: str, kind: str = "text") -> str | N
         return ""
     if "country" in l and "relocat" not in l:
         return p.get("country", "United States")
-    if any(k in l for k in ("city", "location", "where are you", "your location", "current location", "what is your current location", "city, state", "city/state")) and "relocat" not in l:
+    # T41: "city" is matched on a word boundary, not as a bare substring — a
+    # substring test also fires inside "capacity", so a label like "years of
+    # experience in a professional/leadership capacity" was wrongly diverted
+    # here (this branch runs well before the years-of-experience logic) and
+    # returned profile["location"] (or None when the profile has no location)
+    # instead of a tenure figure. The multi-word phrases below stay as substring
+    # checks. A literal \bcity\b also matches inside "city, state" / "city/state"
+    # (',' and '/' are word boundaries), which is correct — those ARE location
+    # labels — so they need no separate tuple entry.
+    _loc_phrases = ("location", "where are you", "your location", "current location",
+                    "what is your current location", "city, state", "city/state")
+    if (re.search(r'\bcity\b', l) or any(k in l for k in _loc_phrases)) and "relocat" not in l:
         return p.get("location") or p.get("city")
     # Only match postal/physical address fields — avoid "addressed", "redress", "address it", etc.
     if any(k in l for k in ("mailing address", "home address", "postal address", "billing address", "current address", "your address")) or l.strip() == "address":
