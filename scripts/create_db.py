@@ -1,3 +1,5 @@
+import sqlite3
+
 # ── blocked_entities: canonical store for apply-agent blocklist patterns ───────
 # Single source of truth for the DDL — imported by scripts/migrations/002_schema.py
 # and by apply_jobs._ensure_apply_schema. ``kind`` partitions the patterns:
@@ -267,14 +269,20 @@ def ensure_schema_current(conn, cursor):
     # write lock and full-scan on every retriever / Dagster startup. Run it only
     # when the column was just added, or when a cheap ``LIMIT 1`` probe shows
     # there is still work to do.
+    #
+    # T24: the probe is ``LISTED_EPOCH_PENDING_PROBE_SQL``, not a bare
+    # ``listed_epoch IS NULL`` — it also requires that at least one source column
+    # is actually parseable by the backfill ``CASE``. A row whose
+    # ``original_listed_time`` *and* ``listed_time`` are both permanently
+    # unparseable stays NULL forever; the bare predicate would keep matching it
+    # and re-run the full-table UPDATE on every startup and never converge. With
+    # T19 running this at every entrypoint, that non-convergence matters.
     cols = {row[1] for row in cursor.execute("PRAGMA table_info(jobs)").fetchall()}
     if "listed_epoch" not in cols:
         cursor.execute("ALTER TABLE jobs ADD COLUMN listed_epoch INTEGER")
         schema_changed = True
         cursor.execute(LISTED_EPOCH_BACKFILL_SQL)
-    elif cursor.execute(
-        "SELECT 1 FROM jobs WHERE listed_epoch IS NULL LIMIT 1"
-    ).fetchone():
+    elif cursor.execute(LISTED_EPOCH_PENDING_PROBE_SQL).fetchone():
         cursor.execute(LISTED_EPOCH_BACKFILL_SQL)
 
     # ── 3. drop a stale idx_jobs_listed so it is rebuilt on the new shape ────
@@ -346,6 +354,36 @@ LISTED_EPOCH_BACKFILL_SQL = (
 )
 
 
+def _epoch_fixable(col: str) -> str:
+    """SQL boolean — true for a row the ``listed_epoch`` backfill CASE can turn
+    non-NULL from ``col``.
+
+    Mirrors the two ``WHEN`` arms of ``_epoch_case`` exactly, *including* the
+    fact that ``strftime('%s', <invalid-iso>)`` evaluates to NULL — so a row
+    that matches the ISO ``LIKE`` shape but holds an unparseable date
+    (``'1234-56-78'``) is correctly reported as **not** fixable. ``col`` is a
+    hard-coded column name, never user input.
+    """
+    return (
+        f"(({col} IS NOT NULL AND {col} <> '' AND {col} NOT GLOB '*[^0-9]*') "
+        f"OR ({col} LIKE '____-__-__%' AND strftime('%s', {col}) IS NOT NULL))"
+    )
+
+
+# T24: re-run gate for the listed_epoch backfill. A row is "pending" only if it
+# is still NULL *and* at least one source column is parseable by the backfill
+# CASE. Rows whose original_listed_time and listed_time are both permanently
+# unparseable are excluded, so they can never keep the full-table backfill
+# UPDATE firing on every ensure_schema_current() call.
+LISTED_EPOCH_PENDING_PROBE_SQL = (
+    "SELECT 1 FROM jobs WHERE listed_epoch IS NULL AND ("
+    + _epoch_fixable("original_listed_time")
+    + " OR "
+    + _epoch_fixable("listed_time")
+    + ") LIMIT 1"
+)
+
+
 def create_indexes(conn, cursor):
     """Create the secondary indexes that back the apply-agent's hot pending-jobs
     query. Additive and idempotent (CREATE INDEX IF NOT EXISTS).
@@ -369,3 +407,60 @@ def enable_wal(conn, cursor):
     conn.commit()
     mode = cursor.execute("PRAGMA journal_mode=WAL").fetchone()
     return mode[0] if mode else None
+
+
+def _db_path_of(conn):
+    """Return the on-disk path of ``conn``'s main database, or ``None`` for an
+    in-memory / temp database (``PRAGMA database_list`` reports an empty file
+    for those)."""
+    try:
+        for _seq, name, filename in conn.execute("PRAGMA database_list").fetchall():
+            if name == "main":
+                return filename or None
+    except sqlite3.Error:
+        pass
+    return None
+
+
+def ensure_db_ready(conn, cursor, *, db_path=None, run_migrations=True):
+    """The single "bring linkedin_jobs.db fully up to date" entry point.
+
+    Every process that opens the database — ``search_retriever``,
+    ``details_retriever``, the Dagster ops, and ``apply_jobs`` — calls this once
+    at startup instead of wiring up schema setup piecemeal (T19). It does two
+    things, in order:
+
+    1. ``create_tables(conn, cursor)`` — the fresh-DB DDL (all
+       ``CREATE TABLE IF NOT EXISTS``), then ``ensure_schema_current()``
+       (``jobs.listed_epoch`` + backfill, ``blocked_entities`` + seed, stale
+       index cleanup), ``create_indexes()`` and ``enable_wal()``. All idempotent.
+    2. ``run_pending_migrations(db_path)`` — discovers ``scripts/migrations/
+       NNN_*.py``, runs any whose id is not yet in the ``schema_migrations``
+       tracking table, and records each after it commits. Takes a one-time
+       backup of the DB file before the first pending migration of a run; a
+       startup where every migration is already applied does no backup and no
+       work.
+
+    ``db_path`` defaults to ``conn``'s own file. An in-memory / temp DB with no
+    file path skips step 2 (the numbered migration scripts reconnect by path and
+    cannot see an in-memory DB) — step 1 already brought such a DB current.
+    ``run_migrations=False`` also skips step 2, for callers that only need the
+    DDL.
+
+    Returns the list of migration ids applied this call (empty on a no-op).
+    """
+    create_tables(conn, cursor)
+
+    if not run_migrations:
+        return []
+
+    if db_path is None:
+        db_path = _db_path_of(conn)
+    if not db_path:
+        return []
+
+    # Deferred import: scripts/migrations/002_schema.py imports from this module,
+    # so importing the runner at module load would be circular.
+    from scripts.migrations.runner import run_pending_migrations
+
+    return run_pending_migrations(db_path)

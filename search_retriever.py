@@ -1,4 +1,4 @@
-from scripts.create_db import create_tables
+from scripts.create_db import ensure_db_ready
 from scripts.database_scripts import insert_job_postings
 from scripts.fetch import JobSearchRetriever
 from scripts.search_config import SEARCH_KEYWORDS
@@ -15,7 +15,7 @@ sleep_factor = 3
 conn = sqlite3.connect('linkedin_jobs.db')
 cursor = conn.cursor()
 
-create_tables(conn, cursor)
+ensure_db_ready(conn, cursor)
 
 
 KEYWORDS = SEARCH_KEYWORDS  # single source of truth: scripts/search_config.py

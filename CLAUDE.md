@@ -99,6 +99,17 @@ Single database file. Key `jobs` columns:
 - `application_type`: `SimpleOnsiteApply`, `ComplexOnsiteApply`, `OffsiteApply`
 - `remote_allowed`, `location`: used to filter apply candidates (remote or Utah)
 
+**Schema is self-updating (T19).** Every process that opens the DB —
+`search_retriever.py`, `details_retriever.py`, the scraper Dagster ops, and
+`apply_jobs.py` — calls `scripts.create_db.ensure_db_ready(conn, cursor)` at
+startup: it runs the fresh-DB DDL + `ensure_schema_current()` (idempotent schema
+modernization) and then `scripts.migrations.runner.run_pending_migrations()`,
+which applies any `scripts/migrations/NNN_*.py` whose stem is not yet in the
+`schema_migrations(id TEXT PRIMARY KEY, applied_at INTEGER)` table. Before the
+first pending migration of a run it copies the DB to `linkedin_jobs.db.bak-<epoch>`;
+an already-current startup is a sub-millisecond no-op with no backup. Each
+migration module exposes `migrate(db_path)` and must be idempotent.
+
 ## Configuration files
 
 | File | Purpose |
