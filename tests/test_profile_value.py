@@ -381,6 +381,12 @@ def test_relevant_and_total_experience_questions_keep_the_full_figure():
 # applicant's whole career — because the bare-experience catch-all matched the
 # substring "years of experience" before the T32 tiered branch could floor a
 # role the applicant (title "Software Engineer") has never held.
+#
+# The fix only diverts a "years of experience" label to the tiered (flooring)
+# branch when the role/skill/domain named is *foreign* to the applicant's
+# profile. Generic phrasing ("...as a whole", "...in a professional setting")
+# and the applicant's own role/skills keep the full figure — an under-claimed
+# "1"/"2" can trip a "minimum N years" knockout filter (the exact T32 hazard).
 _T40_PROFILE = {
     "current_title": "Software Engineer",
     "headline": "Software Engineer | Backend & AI",
@@ -390,14 +396,24 @@ _T40_PROFILE = {
 }
 
 
-def test_role_qualified_years_question_goes_through_the_tiered_branch():
+def test_foreign_role_qualified_years_question_is_floored():
     # "...as a Lead" must NOT return the full career figure. The applicant has no
-    # "Lead" in title/headline/summary -> tier 3 floor "1" (never "0").
+    # "Lead" in title/headline/summary/skills -> tier 3 floor "1" (never "0").
     got = _gpv(_T40_PROFILE, "How many years of experience do you have as a Lead?", "text")
     assert got not in ("4", "0", None)
     assert got == "1"
     # A trailing-space "... as a Lead ?" (exactly as seen live) normalizes the same.
     assert _gpv(_T40_PROFILE, "How many years of experience do you have as a Lead ?", "text") == "1"
+    # Same overclaim, PROFILE fixture (10-yr career): still must not return "10".
+    assert _gpv(PROFILE, "How many years of experience do you have as a Lead?", "text") != "10"
+
+
+def test_foreign_skill_or_domain_qualified_years_question_is_floored():
+    # An unrecognised skill / domain floors at "1" (never "0", never full figure).
+    assert _gpv(_T40_PROFILE, "Years of experience with COBOL", "text") == "1"
+    assert _gpv(_T40_PROFILE, "How many years of experience do you have with Salesforce?",
+                "text") == "1"
+    assert _gpv(_T40_PROFILE, "Years of experience in the insurance sector", "text") == "1"
 
 
 def test_bare_years_of_experience_still_returns_the_full_figure():
@@ -410,15 +426,29 @@ def test_bare_years_of_experience_still_returns_the_full_figure():
     assert _gpv(_T40_PROFILE, "How many years of experience do you have in total?", "text") == "4"
 
 
-def test_skill_qualified_years_question_goes_through_the_tiered_branch():
-    # A listed skill still earns the applicant's real tenure (tier 1), not the
-    # AI-skills "1" floor and not the bare catch-all short-circuit.
+def test_generic_role_or_domain_phrasing_keeps_the_full_figure():
+    # None of these name a concrete role/skill the applicant lacks — they are
+    # generic English, so the answer stays the full career figure (NOT floored).
+    for label in (
+        "How many years of experience do you have as a whole?",
+        "Years of experience as a professional",
+        "How many years of experience do you have, working as a team?",
+        "Years of experience in the software industry",
+        "Years of experience in a professional setting",
+        "Years of experience in a leadership role",
+        "Years of experience in the US",
+        "How many years of experience do you have in a senior position?",
+    ):
+        assert _gpv(_T40_PROFILE, label, "text") == "4", label
+
+
+def test_applicants_own_role_or_skill_keeps_the_full_figure():
+    # "...as a Software Engineer" for a Software Engineer, "...in AI/ML" for an ML
+    # engineer -> genuine experience, full figure (never floored to "1"/"2").
+    assert _gpv(_T40_PROFILE, "Years of experience as a Software Engineer", "text") == "4"
     assert _gpv(_T40_PROFILE, "Years of experience in AI/ML", "text") == "4"
     assert _gpv(_T40_PROFILE, "How many years of experience do you have in AI / ML?", "text") == "4"
-    # An unrecognised skill floors at "1" (never "0", never the full figure).
-    assert _gpv(_T40_PROFILE, "Years of experience with COBOL", "text") == "1"
-    assert _gpv(_T40_PROFILE, "How many years of experience do you have with Salesforce?",
-                "text") == "1"
+    assert _gpv(PROFILE, "Years of experience as a Software Engineer", "text") == "10"
 
 
 # ── work authorization / visa / citizenship ───────────────────────────────────
