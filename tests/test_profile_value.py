@@ -457,6 +457,67 @@ def test_applicants_own_role_or_skill_keeps_the_full_figure():
     assert _gpv(PROFILE, "Years of experience as a Software Engineer", "text") == "10"
 
 
+# ── T42: the "foreign skill?" check must not ignore 2-char skill tokens ────────
+#
+# T40's _years_label_names_a_foreign_role_or_skill guarded its "does this
+# qualifier appear in the applicant's background?" check with `len(w) >= 3`, so a
+# 2-char token (ai, ml, ui, ux, go, qa, bi) was never matched against the
+# profile -> always classified "foreign" -> floored to "1". Live repro: an
+# applicant with "AI applications" in the summary and RAG / Vector-DB / LLM
+# skills got "1" for "years of experience in AI / ML".
+#
+# This fixture mirrors the real user_profile.json shape: "ai" appears only in
+# the *summary* prose (not spelled out as a skill), and "R" is a bare
+# single-char skill-list entry.
+_T42_PROFILE = {
+    "current_title": "Software Engineer",
+    "headline": "",
+    "summary": (
+        "Software engineer with 4+ years of experience in full-stack systems "
+        "and AI applications. Expert in Go, AWS, and Kubernetes. Completed a "
+        "Master's in Data Science, focusing on advanced AI applications."
+    ),
+    "years_experience": 4,
+    "skills": "Python, Go, Kubernetes, AWS, RAG Architectures, "
+              "Vector Databases, LLM Fine-tuning, R",
+}
+
+
+def test_two_char_skill_token_in_background_keeps_the_full_figure():
+    # "ai" is a standalone word in the summary -> genuine experience, not
+    # foreign. Was "1" before T42 (the len>=3 guard skipped the 2-char token).
+    for label in (
+        "How many years of experience do you have in AI / ML?",
+        "Years of experience in AI/ML",
+        "Years of experience in AI",
+    ):
+        got = _gpv(_T42_PROFILE, label, "text")
+        assert got not in ("0", "1", None), f"{label!r} -> {got!r}"
+        assert got == "4", f"{label!r} -> {got!r}"
+
+
+def test_two_char_skill_token_regression_guards():
+    # "go" is in the summary ("Expert in Go") -> full figure (was already
+    # correct via an earlier skill-name branch; must stay correct).
+    assert _gpv(_T42_PROFILE, "Years of experience with Go", "text") == "4"
+    # A genuinely foreign skill still floors at "1" -- the 2-char relaxation
+    # must not let unfamiliar tenure through.
+    assert _gpv(_T42_PROFILE, "Years of experience with COBOL", "text") == "1"
+    # T40's original target: a role the applicant never held.
+    assert _gpv(_T42_PROFILE, "How many years of experience do you have as a Lead?",
+                "text") == "1"
+    # Generic phrasing keeps the full figure (not a concrete foreign skill).
+    assert _gpv(_T42_PROFILE, "Years of experience in a leadership role", "text") == "4"
+
+
+def test_single_char_skill_token_matches_exact_skill_entry_only():
+    # "R" is an exact skill-list entry -> genuine experience, full figure.
+    assert _gpv(_T42_PROFILE, "How many years of experience do you have with R?",
+                "text") == "4"
+    # "C" is NOT listed (only "C#" would be) -> still foreign, floored to "1".
+    assert _gpv(_T42_PROFILE, "Years of experience with C", "text") == "1"
+
+
 # ── work authorization / visa / citizenship ───────────────────────────────────
 
 def test_work_authorization_and_visa():
