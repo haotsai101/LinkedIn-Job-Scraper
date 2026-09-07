@@ -10,6 +10,8 @@ Scrapes a continuous stream of LinkedIn job postings, stores them in SQLite, and
 pip install -e '.[dev]'   # runtime + dev tools (ruff, pytest); deps are defined in pyproject.toml (quote '.[dev]' for zsh)
 playwright install chromium
 
+./scripts/check.sh        # bootstraps .venv/, runs ruff + pytest
+
 # Copy and fill in credentials
 cp .env.template .env
 cp logins.csv.template logins.csv
