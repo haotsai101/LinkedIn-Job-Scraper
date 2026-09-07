@@ -110,6 +110,70 @@ _FORM_DOMAINS = (
     "smartrecruiters.com", "jobvite.com", "breezy.hr",
 )
 
+# Greenhouse board / embed hosts. A LinkedIn "OffsiteApply" job whose
+# ``application_url`` points at one of these normally renders the application
+# form directly — but some large employers configure the board host to
+# 30x-redirect to a company-branded careers SPA that hides the apply CTA behind
+# a click (T39 — MongoDB: boards.greenhouse.io/mongodb/jobs/<id> →
+# www.mongodb.com/careers/jobs/<id>). ``job-boards.greenhouse.io/<slug>/jobs/<id>``
+# always renders the bare form with no company wrapper, so it is the canonical
+# retry target when that redirect is detected.
+_GREENHOUSE_HOSTS = (
+    "boards.greenhouse.io", "job-boards.greenhouse.io",
+    "boards.eu.greenhouse.io", "job-boards.eu.greenhouse.io",
+    "grnh.se",
+)
+
+
+def _host_is_greenhouse(host: str) -> bool:
+    host = (host or "").lower()
+    return host == "grnh.se" or host == "greenhouse.io" or host.endswith(".greenhouse.io")
+
+
+def _parse_greenhouse_job(url: str) -> tuple[str, str] | None:
+    """Extract ``(slug, job_id)`` from a Greenhouse board / embed URL.
+
+    Handles the common shapes:
+      * ``boards.greenhouse.io/<slug>/jobs/<id>``
+      * ``job-boards.greenhouse.io/<slug>/jobs/<id>`` (and the ``.eu`` hosts)
+      * ``…/embed/job_app?token=<id>&for=<slug>``
+      * any greenhouse host carrying ``?gh_jid=<id>`` with the slug as the first
+        path segment or in ``?for=``
+
+    Returns ``None`` when a slug + numeric id can't both be recovered.
+    """
+    try:
+        parsed = urlparse(url or "")
+    except Exception:
+        return None
+    if not _host_is_greenhouse(parsed.netloc):
+        return None
+    qs = parse_qs(parsed.query)
+    segments = [s for s in parsed.path.split("/") if s]
+
+    slug = None
+    job_id = None
+
+    # Path form: /<slug>/jobs/<id>
+    if len(segments) >= 3 and segments[-2] == "jobs" and segments[-1].isdigit():
+        slug, job_id = segments[-3], segments[-1]
+    elif segments and segments[0] not in ("embed", "jobs") and not segments[0].isdigit():
+        slug = segments[0]
+
+    # Query fallbacks for the id
+    if not job_id:
+        for key in ("gh_jid", "token", "job_id", "jobId"):
+            if qs.get(key) and qs[key][0].isdigit():
+                job_id = qs[key][0]
+                break
+    # Query fallback for the slug
+    if not slug and qs.get("for"):
+        slug = qs["for"][0]
+
+    if slug and job_id:
+        return slug, job_id
+    return None
+
 
 def _clean_linkedin_url(url: str) -> str:
     """Strip LinkedIn tracking params (?trk=...) from job URLs so the page renders in standard view."""
@@ -3581,6 +3645,12 @@ class OffsiteApplyFlow:
         unchanged_steps = 0
         _submit_clicked = False  # a real submit-type button has been clicked at least once
         last_action_type = None  # used to not penalize fill/select/upload for not changing URL
+        # T39: has the loop ever engaged the form? True once a snapshot exposes
+        # form fields OR a non-scroll action (fill/select/upload/click) runs.
+        # Distinguishes a navigation dead-end (only ever scrolled, never a field
+        # → "blocked"/-3, no auto-retry) from a genuine mid-form stall
+        # (fields seen / fills happened → "failed"/-2, retryable).
+        _form_engaged = False
         consecutive_duplicates = 0  # consecutive duplicate-fill guard firings without URL change
         _selector_attempts: dict[str, int] = {}  # per-selector retry count; skip after 3 failures
         _exhausted_selectors: set[str] = set()  # selectors permanently blocked after 3 failed attempts
@@ -3598,6 +3668,41 @@ class OffsiteApplyFlow:
             print(f"  [LLM] Blocked auto-apply domain ({_landing_domain}) — needs a human, "
                   f"marking blocked (no auto-retry)")
             return "blocked"
+
+        # T39 — Canonical Greenhouse embed retry. Some employers point their
+        # LinkedIn OffsiteApply ``application_url`` at a *.greenhouse.io board
+        # host that 30x-redirects to a company-branded careers SPA where the
+        # apply CTA opens an embedded form on click and is unreachable by the
+        # step-loop (it only ever scrolls, then the stuck guard fires → -2, and
+        # -2 re-burns on every --auto run). If the ORIGINAL application_url was a
+        # greenhouse host and we landed cross-host on a non-greenhouse host,
+        # retry once against job-boards.greenhouse.io/<slug>/jobs/<id>, which
+        # renders the bare form with no company wrapper.
+        _orig_url = getattr(self, "application_url", "") or ""
+        _orig_host = urlparse(_orig_url).netloc.lower()
+        _gh_job = _parse_greenhouse_job(_orig_url)
+        if (
+            _gh_job
+            and _host_is_greenhouse(_orig_host)
+            and not _host_is_greenhouse(_landing_domain)
+            and _landing_domain != _orig_host
+        ):
+            _gh_slug, _gh_id = _gh_job
+            _canonical = f"https://job-boards.greenhouse.io/{_gh_slug}/jobs/{_gh_id}"
+            print(f"  [Offsite] Greenhouse board URL redirected to {_landing_domain} — "
+                  f"retrying canonical embed job-boards.greenhouse.io/{_gh_slug}/jobs/{_gh_id}")
+            try:
+                await page.goto(_canonical, wait_until="domcontentloaded", timeout=20000)
+                await asyncio.sleep(2)
+            except Exception as _gh_re:
+                print(f"  [Offsite] Canonical Greenhouse retry navigation failed ({_gh_re}) — "
+                      f"continuing from redirected page")
+            _landing_domain = urlparse(page.url).netloc.lower()
+            if _host_is_greenhouse(_landing_domain):
+                print(f"  [Offsite] Canonical Greenhouse embed loaded → {page.url}")
+            else:
+                print(f"  [Offsite] Canonical embed also redirected ({_landing_domain}) "
+                      f"— falling through to step loop")
 
         # Lever listing-page fast-path: jobs.lever.co/<company>/<id> is a listing page with no form.
         # Append /apply to navigate directly to the application form, saving a wasted step-loop iteration.
@@ -3812,6 +3917,11 @@ class OffsiteApplyFlow:
                 print("  [LLM] Page still blank after retries — skipping")
                 return "expired"
 
+            # T39: a snapshot that exposes form fields means the form is reachable
+            # from here — a later stall is a mid-form failure (-2), not a dead end.
+            if snapshot.get("fields"):
+                _form_engaged = True
+
             # Mid-loop login-wall check: a password field is a login gate. Try
             # stored credentials; else it needs a human.
             _auth = await self._handle_auth(page, phase="form")
@@ -3847,6 +3957,22 @@ class OffsiteApplyFlow:
                                 return await self._handle_submit(page, _sbtn)
                         except Exception:
                             continue
+                    # T39: distinguish a navigation dead-end from a mid-form stall.
+                    # If the loop only ever scrolled and never saw a form field or
+                    # ran a fill/select/upload/click, and we're not on a known ATS
+                    # form host, this is an unreachable apply CTA (e.g. a careers
+                    # SPA) — mark blocked (-3, no auto-retry) instead of failed
+                    # (-2), which would re-burn the same ~40s + LLM calls every run.
+                    _stuck_host = urlparse(page.url).netloc.lower()
+                    _on_ats_host = any(
+                        d in _stuck_host
+                        for d in (*_FORM_DOMAINS, *_ATS_REQUIRE_APPLY_PATH)
+                    )
+                    if not _form_engaged and not _on_ats_host:
+                        print(f"  [Offsite] No form or reachable apply control after "
+                              f"{unchanged_steps} scrolls on {_stuck_host} — marking blocked "
+                              f"(needs a human, no auto-retry)")
+                        return "blocked"
                     print(f"  [LLM] URL unchanged for 3 consecutive steps — browser is stuck, giving up")
                     return "failed"
             else:
@@ -4059,6 +4185,10 @@ class OffsiteApplyFlow:
             if len(action_history) > 10:
                 action_history = action_history[-10:]
             last_action_type = action_type
+            # T39: a non-scroll action means we engaged the form / a control —
+            # a subsequent stall is a mid-form failure (-2), not a dead end (-3).
+            if action_type in ("fill", "select", "upload", "click"):
+                _form_engaged = True
 
         print("  [LLM] Reached step limit without completion")
         return "failed"
