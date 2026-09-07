@@ -51,11 +51,11 @@ WHERE applied = -1
 
 | # | Sev | Summary |
 |---|---|---|
-| T19 | P2 | ✅ fixed (PR pending) — `scripts/migrations/runner.py:run_pending_migrations` + `scripts/create_db.py:ensure_db_ready` run pending `NNN_*.py` migrations (tracked in `schema_migrations`, one-time DB backup) at every entrypoint: both retrievers, both scraper Dagster ops, and `apply_jobs.main`. |
+| T19 | P2 | ✅ **CLOSED** (#40, QA 2026-09-06) — `scripts/migrations/runner.py:run_pending_migrations` + `scripts/create_db.py:ensure_db_ready` run pending `NNN_*.py` migrations (tracked in `schema_migrations`, one-time online-backup, `threading.Lock`+`fcntl.flock` serialised) at every entrypoint: both retrievers, both scraper Dagster ops, and `apply_jobs.main`. QA: first run on the live production DB re-ran `001`/`002` as clean no-ops + recorded both + one backup, `integrity_check` ok; second run fully silent (no re-apply, no backup). Two reviewers verified idempotency on a prod-shape DB and deadlock-free concurrency under fork+spawn multiprocess + multithread stress. |
 | T20 | P3 | `ruff` not in the interpreter that runs the agent — document/bootstrap lint. |
 | T21 | P2 | ✅ **CLOSED** (#33, QA'd 2026-09-06) — `fetch_job_details_op` had the same required-config bug T6 fixed for `search_jobs_op`; `details_schedule` (`RUNNING`, no run_config) failed config validation every 12h. Fixed with `Field(Int, default_value=25/30)`. |
 | T22 | P2 | ✅ **CLOSED** (#37, QA 2026-09-06) — `run_session` loads `ats_domain` rows from `blocked_entities` once per session and the per-job check matches them (host-suffix) against `posting_domain`/`application_url`, marking a hit `applied=-3`. Operator-added domain blocks now fire with no code change. |
-| T24 | P3 | ✅ fixed (folded into T19) — `ensure_schema_current`'s backfill re-run gate is now `LISTED_EPOCH_PENDING_PROBE_SQL` (`_epoch_fixable` mirrors the `_epoch_case` `WHEN` arms), so a permanently-unparseable `listed_epoch IS NULL` row no longer re-triggers the full-table backfill. |
+| T24 | P3 | ✅ **CLOSED** (folded into T19 / #40, QA 2026-09-06) — `ensure_schema_current`'s backfill re-run gate is now `LISTED_EPOCH_PENDING_PROBE_SQL` (`_epoch_fixable` mirrors the `_epoch_case` `WHEN` arms), so a permanently-unparseable `listed_epoch IS NULL` row no longer re-triggers the full-table backfill. Reviewer added `test_epoch_fixable_probe_never_drifts_from_backfill` (14 edge values, asserts probe-hit ⇔ backfill-fills-row). |
 
 ## Dependency graph
 
