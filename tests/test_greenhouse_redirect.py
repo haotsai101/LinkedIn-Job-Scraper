@@ -148,6 +148,17 @@ def _always(action):
     return _decide
 
 
+def _sequence(*actions):
+    """Return each action once, then repeat the last one forever."""
+    box = {"i": 0}
+
+    async def _decide(self, *_a, **_k):
+        i = box["i"]
+        box["i"] = i + 1
+        return dict(actions[min(i, len(actions) - 1)])
+    return _decide
+
+
 # ── Part 1 — canonical embed retry ────────────────────────────────────────
 
 def test_greenhouse_cross_host_redirect_triggers_canonical_retry(monkeypatch):
@@ -198,13 +209,35 @@ def test_non_greenhouse_redirect_no_greenhouse_retry(monkeypatch):
 
 
 # ── Part 2 — stuck guard: blocked vs failed ───────────────────────────────
+#
+# _form_engaged is set ONLY by a non-scroll action executing — never by the
+# page snapshot (see the flag's comment in linkedin_apply.py). So the snapshot
+# a test hands the loop is irrelevant to the blocked/failed verdict; what
+# matters is whether _decide_action ever returned something other than scroll.
 
 def test_scroll_only_deadend_on_non_ats_host_returns_blocked(monkeypatch):
-    """Loop only ever scrolled, never saw a field, host is a company SPA →
+    """Loop only ever scrolled, never ran a fill/click, host is a company SPA →
     navigation dead end → blocked (-3, no auto-retry)."""
     _install_common(monkeypatch, snapshot_fields=[])
     monkeypatch.setattr(linkedin_apply.OffsiteApplyFlow, "_decide_action",
                         _always({"action": "scroll", "reason": "look for apply"}))
+    page = _FakePage("https://www.mongodb.com/careers/jobs/8161512")
+    flow = _offsite(application_url="https://www.mongodb.com/careers/jobs/8161512")
+    out = asyncio.run(flow._llm_guided_apply(page))
+    assert out == "blocked"
+
+
+def test_scroll_only_deadend_with_lone_nav_input_returns_blocked(monkeypatch):
+    """Regression for the review: a company careers SPA routinely has a lone
+    non-form input (nav search box, footer "Job alerts" email signup). That
+    makes the snapshot's `fields` truthy, but it is NOT the application form —
+    a scroll-only run must still end blocked (-3), not failed (-2)."""
+    _install_common(monkeypatch, snapshot_fields=[
+        {"selector": "#site-search", "type": "search", "label": "Search"},
+        {"selector": "#ja-email", "type": "email", "label": "Get job alerts"},
+    ])
+    monkeypatch.setattr(linkedin_apply.OffsiteApplyFlow, "_decide_action",
+                        _always({"action": "scroll", "reason": "hunting for apply"}))
     page = _FakePage("https://www.mongodb.com/careers/jobs/8161512")
     flow = _offsite(application_url="https://www.mongodb.com/careers/jobs/8161512")
     out = asyncio.run(flow._llm_guided_apply(page))
@@ -224,12 +257,13 @@ def test_scroll_only_stall_on_ats_form_host_stays_failed(monkeypatch):
 
 
 def test_stall_after_form_engaged_stays_failed(monkeypatch):
-    """A snapshot exposed form fields (form was reachable) then the loop
-    stalled — a genuine transient mid-form failure, must stay -2."""
-    _install_common(monkeypatch,
-                    snapshot_fields=[{"selector": "#name", "label": "Name"}])
-    monkeypatch.setattr(linkedin_apply.OffsiteApplyFlow, "_decide_action",
-                        _always({"action": "scroll", "reason": "scrolling"}))
+    """The loop engaged a control (a click executed) then stalled — a genuine
+    transient mid-form failure, must stay -2 even on a non-ATS host."""
+    _install_common(monkeypatch, snapshot_fields=[])
+    monkeypatch.setattr(
+        linkedin_apply.OffsiteApplyFlow, "_decide_action",
+        _sequence({"action": "click", "selector": "#open-form-btn", "reason": "open form"},
+                  {"action": "scroll", "reason": "scrolling"}))
     page = _FakePage("https://www.mongodb.com/careers/jobs/8161512")
     flow = _offsite(application_url="https://www.mongodb.com/careers/jobs/8161512")
     out = asyncio.run(flow._llm_guided_apply(page))

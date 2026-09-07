@@ -127,20 +127,20 @@ _GREENHOUSE_HOSTS = (
 
 def _host_is_greenhouse(host: str) -> bool:
     host = (host or "").lower()
-    return host == "grnh.se" or host == "greenhouse.io" or host.endswith(".greenhouse.io")
+    return host in _GREENHOUSE_HOSTS or host == "greenhouse.io" or host.endswith(".greenhouse.io")
 
 
 def _parse_greenhouse_job(url: str) -> tuple[str, str] | None:
     """Extract ``(slug, job_id)`` from a Greenhouse board / embed URL.
 
-    Handles the common shapes:
-      * ``boards.greenhouse.io/<slug>/jobs/<id>``
-      * ``job-boards.greenhouse.io/<slug>/jobs/<id>`` (and the ``.eu`` hosts)
+    Only the *recognized* shapes yield a result — a bare first path segment is
+    never guessed to be a board slug (that produced junk canonical URLs):
+      * ``boards.greenhouse.io/<slug>/jobs/<id>`` (``?gh_jid=`` / ``.eu`` / the
+        ``job-boards`` host are all the same path shape)
       * ``…/embed/job_app?token=<id>&for=<slug>``
-      * any greenhouse host carrying ``?gh_jid=<id>`` with the slug as the first
-        path segment or in ``?for=``
 
-    Returns ``None`` when a slug + numeric id can't both be recovered.
+    Returns ``None`` when a slug + numeric id can't both be recovered from one
+    of those.
     """
     try:
         parsed = urlparse(url or "")
@@ -157,16 +157,14 @@ def _parse_greenhouse_job(url: str) -> tuple[str, str] | None:
     # Path form: /<slug>/jobs/<id>
     if len(segments) >= 3 and segments[-2] == "jobs" and segments[-1].isdigit():
         slug, job_id = segments[-3], segments[-1]
-    elif segments and segments[0] not in ("embed", "jobs") and not segments[0].isdigit():
-        slug = segments[0]
 
-    # Query fallbacks for the id
+    # Query fallback for the id (embed/job_app?token=, ?gh_jid=, …)
     if not job_id:
         for key in ("gh_jid", "token", "job_id", "jobId"):
             if qs.get(key) and qs[key][0].isdigit():
                 job_id = qs[key][0]
                 break
-    # Query fallback for the slug
+    # Query fallback for the slug — a recognized shape (?for=), never segments[0]
     if not slug and qs.get("for"):
         slug = qs["for"][0]
 
@@ -3645,11 +3643,14 @@ class OffsiteApplyFlow:
         unchanged_steps = 0
         _submit_clicked = False  # a real submit-type button has been clicked at least once
         last_action_type = None  # used to not penalize fill/select/upload for not changing URL
-        # T39: has the loop ever engaged the form? True once a snapshot exposes
-        # form fields OR a non-scroll action (fill/select/upload/click) runs.
-        # Distinguishes a navigation dead-end (only ever scrolled, never a field
-        # → "blocked"/-3, no auto-retry) from a genuine mid-form stall
-        # (fields seen / fills happened → "failed"/-2, retryable).
+        # T39: has the loop ever engaged the form? True once a non-scroll action
+        # (fill/select/upload/click) executes. Deliberately NOT set from a page
+        # snapshot exposing `fields` — `_get_page_snapshot` returns every visible
+        # input on the page, so a careers-SPA nav search box or footer "job
+        # alerts" signup would falsely mark the form engaged. If the LLM sees a
+        # real actionable field it acts on it; a run of pure scrolls means the
+        # form was genuinely unreachable. Distinguishes a navigation dead-end
+        # (→ "blocked"/-3, no auto-retry) from a mid-form stall (→ "failed"/-2).
         _form_engaged = False
         consecutive_duplicates = 0  # consecutive duplicate-fill guard firings without URL change
         _selector_attempts: dict[str, int] = {}  # per-selector retry count; skip after 3 failures
@@ -3678,6 +3679,9 @@ class OffsiteApplyFlow:
         # greenhouse host and we landed cross-host on a non-greenhouse host,
         # retry once against job-boards.greenhouse.io/<slug>/jobs/<id>, which
         # renders the bare form with no company wrapper.
+        # Intentionally placed AFTER the spam / blocked-domain pre-check above:
+        # if the SPA host is itself a skip/blocked domain we want that verdict,
+        # not a canonical retry.
         _orig_url = getattr(self, "application_url", "") or ""
         _orig_host = urlparse(_orig_url).netloc.lower()
         _gh_job = _parse_greenhouse_job(_orig_url)
@@ -3916,11 +3920,6 @@ class OffsiteApplyFlow:
             if _snap_empty:
                 print("  [LLM] Page still blank after retries — skipping")
                 return "expired"
-
-            # T39: a snapshot that exposes form fields means the form is reachable
-            # from here — a later stall is a mid-form failure (-2), not a dead end.
-            if snapshot.get("fields"):
-                _form_engaged = True
 
             # Mid-loop login-wall check: a password field is a login gate. Try
             # stored credentials; else it needs a human.
