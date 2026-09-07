@@ -477,6 +477,9 @@ _GENERIC_QUALIFIER_WORDS = {
     "manner", "level", "levels", "way", "matter", "job", "jobs", "this",
     "that", "which", "what", "all", "such", "these", "those", "here", "your",
     "years", "months", "year", "month", "us", "usa", "america", "any",
+    # generic job words + the applicant's own industry (not literally in the
+    # profile text, so the background check below would miss them)
+    "contributor", "employee", "individual", "tech", "technology", "it",
 }
 # NB: "sector" / "domain" / "market" are deliberately NOT generic — "in the
 # insurance sector", "in the payments domain" are real domain qualifiers.
@@ -513,13 +516,18 @@ def _years_label_names_a_foreign_role_or_skill(l: str, profile: dict) -> bool:
     m_role = re.search(r'\bas\s+an?\s+([a-z0-9.#+][a-z0-9 &/.+#-]*)', l)
     if m_role:
         spans.append(m_role.group(1))
-    m_skill = re.search(r'\bexperience\b.*?\b(?:with|in|using)\s+([a-z0-9.#+][a-z0-9 &/.+#-]*)', l)
+    m_skill = re.search(
+        r'\bexperience\b.*?\b(?:with|in|using)\s+([a-z0-9.#+][a-z0-9 &/.+#-]*)', l)
     if m_skill:
         spans.append(m_skill.group(1))
     if not spans:
         return False
 
-    # Text the applicant can legitimately claim tenure in.
+    # Text the applicant can legitimately claim tenure in. ``summary`` is free
+    # prose, so this set is deliberately permissive — any tech name-dropped in
+    # the summary reads as non-foreign (a mild overclaim, the agreed-safe
+    # direction here). Drop ``summary`` for a tighter check if overclaim ever
+    # becomes the bigger concern than the "minimum N years" knockout.
     bg = " ".join(str(profile.get(k) or "") for k in
                   ("current_title", "headline", "summary", "skills")).lower()
 

@@ -438,6 +438,12 @@ def test_generic_role_or_domain_phrasing_keeps_the_full_figure():
         "Years of experience in a leadership role",
         "Years of experience in the US",
         "How many years of experience do you have in a senior position?",
+        "Years of experience as a contributor",
+        "How many years of experience do you have as an employee?",
+        "Years of experience as an individual contributor",
+        "Years of experience in the tech sector",       # applicant's own industry
+        "Years of experience in technology",
+        "Years of experience in IT",
     ):
         assert _gpv(_T40_PROFILE, label, "text") == "4", label
 
