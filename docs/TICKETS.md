@@ -15,7 +15,7 @@ Baseline captured 2026-08-28. `docs/baseline/db_state.baseline.txt` holds the DB
 | 4/5 | **T33** — OffsiteApply flow reliability | ✅ **CLOSED** — merged (PR #25). Unified `verify_submission` (Rippling `/jobs?page=0` false-negative), blocked-domain jobs → `-3` not auto-fail. First pass at T31/T32; the rest split to their own PR (see `## T31 / T32`). |
 | 5 — Phase 4 | **T16b** — decompose `_llm_guided_apply` on the Agent SDK (primary OffsiteApply path) + retire `ScriptApplyEngine` | ✅ **CLOSED** 2026-09-05 — PR 1 (#30) + PR 2 (#31) merged, QA passed (live run: 3 real applications inc. multi-step Rippling, 2 correct `-3` blocks, 0 errors). `ScriptApplyEngine` gone; OffsiteApply is a single decomposed step-loop engine. |
 | 6 — Phase 5 | T17 — scraper cleanup | needs T12 ✓ |
-| Follow-ups | T19 ✅ + T24 ✅ (PR pending) · T22 ✅ (PR pending) · T21 **CLOSED** (#33) · T20 open · T30 **CLOSED — superseded by T38** (NIM classifier now opt-in; Agent SDK is the default) | P2–P3 |
+| Follow-ups | T19 ✅ + T24 ✅ (PR pending) · T22 ✅ (PR pending) · T21 **CLOSED** (#33) · T20 ✅ (PR pending) · T30 **CLOSED — superseded by T38** (NIM classifier now opt-in; Agent SDK is the default) | P2–P3 |
 
 **Direction change (2026-09-03):** T14b live-QA runs confirmed the Agent SDK classifier is 100% reliable where NIM's model isn't (T30), but NIM stays for OffsiteApply classification with the circuit breaker as the safety net. The browser-use spike (T15) is dropped — the free NIM tier can't host an agentic browser model reliably. Remaining apply-agent work goes straight to hardening + decomposing `_llm_guided_apply` on the Agent SDK.
 
@@ -54,7 +54,7 @@ WHERE applied = -1
 | # | Sev | Summary |
 |---|---|---|
 | T19 | P2 | ✅ **CLOSED** (#40, QA 2026-09-06) — `scripts/migrations/runner.py:run_pending_migrations` + `scripts/create_db.py:ensure_db_ready` run pending `NNN_*.py` migrations (tracked in `schema_migrations`, one-time online-backup, `threading.Lock`+`fcntl.flock` serialised) at every entrypoint: both retrievers, both scraper Dagster ops, and `apply_jobs.main`. QA: first run on the live production DB re-ran `001`/`002` as clean no-ops + recorded both + one backup, `integrity_check` ok; second run fully silent (no re-apply, no backup). Two reviewers verified idempotency on a prod-shape DB and deadlock-free concurrency under fork+spawn multiprocess + multithread stress. |
-| T20 | P3 | `ruff` not in the interpreter that runs the agent — document/bootstrap lint. |
+| T20 | P3 | ✅ **fixed (PR pending)** — `scripts/lint.sh` / `scripts/check.sh` bootstrap a project-local `.venv/` and run `ruff` (+ `pytest`); `ruff`/`pytest` pinned to a minor in `pyproject.toml`'s `dev` extra; `CLAUDE.md` "Lint / test" points at the scripts. Tooling/docs only, no functional change. |
 | T21 | P2 | ✅ **CLOSED** (#33, QA'd 2026-09-06) — `fetch_job_details_op` had the same required-config bug T6 fixed for `search_jobs_op`; `details_schedule` (`RUNNING`, no run_config) failed config validation every 12h. Fixed with `Field(Int, default_value=25/30)`. |
 | T22 | P2 | ✅ **CLOSED** (#37, QA 2026-09-06) — `run_session` loads `ats_domain` rows from `blocked_entities` once per session and the per-job check matches them (host-suffix) against `posting_domain`/`application_url`, marking a hit `applied=-3`. Operator-added domain blocks now fire with no code change. |
 | T24 | P3 | ✅ **CLOSED** (folded into T19 / #40, QA 2026-09-06) — `ensure_schema_current`'s backfill re-run gate is now `LISTED_EPOCH_PENDING_PROBE_SQL` (`_epoch_fixable` mirrors the `_epoch_case` `WHEN` arms), so a permanently-unparseable `listed_epoch IS NULL` row no longer re-triggers the full-table backfill. Reviewer added `test_epoch_fixable_probe_never_drifts_from_backfill` (14 edge values, asserts probe-hit ⇔ backfill-fills-row). |
@@ -326,11 +326,19 @@ T8's indexes + WAL and T9's schema changes only take effect when the operator ma
 
 ## T20 — Pin `ruff` into the interpreter that runs the agent
 
-**Phase:** P3 · **Risk:** trivial · **Deps:** T1 · Raised by log-bug-detector during Wave 1 QA.
+**Phase:** P3 · **Risk:** trivial · **Deps:** T1 · **Status:** ✅ fixed (PR pending) · Raised by log-bug-detector during Wave 1 QA.
 
 `ruff` is in `[project.optional-dependencies].dev` but the `/opt/anaconda3/bin/python` env that actually runs the agent doesn't have it, so `ruff check .` only works in a fresh venv. Either document that lint runs in the venv, add a `make lint` / `scripts/lint.sh` that bootstraps it, or install it into the anaconda env and note that in `CLAUDE.md`.
 
 **Acceptance:** `ruff check .` runs from the documented dev setup with one obvious command.
+
+**Fix (this PR):**
+- `scripts/_venv.sh` (sourced helper) — creates a project-local `.venv/` if absent, then `pip install -q -e ".[dev]"` (idempotent; venv never recreated once it exists). Exports `REPO_ROOT` / `VENV_DIR`.
+- `scripts/lint.sh` — `source _venv.sh` then `exec .venv/bin/ruff check <repo>` (forwards extra args, e.g. `--fix`).
+- `scripts/check.sh` — same bootstrap, then `ruff` + `pytest`; installs Playwright Chromium once only if the binary is missing (current suite import-guards Playwright, but browser tests need it).
+- `pyproject.toml` `dev` extra pinned: `ruff>=0.16.6,<0.17`, `pytest>=9.1,<10` — keeps `ruff check` findings reproducible across machines/CI.
+- `CLAUDE.md` "Lint / test" now points at `./scripts/lint.sh` / `./scripts/check.sh`, keeping the raw `ruff check .` / `pytest` lines for anyone with an active `.[dev]` venv.
+- `.venv/` + `*.pyc` already covered by `.gitignore` (`/.venv/`, `*.pyc`) — no change needed. No CI (`.github/workflows/` absent). No `.py` changes; existing ~500 ruff findings untouched (out of scope).
 
 ---
 

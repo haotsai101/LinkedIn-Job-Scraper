@@ -26,8 +26,11 @@ dependencies = [
     "claude-agent-sdk>=0.2.140,<0.3",  # Easy Apply classifier + browser agent (subscription auth, no API key) — T14/T14b. Pinned <0.3: relies on ClaudeAgentOptions.output_format + one-shot query() session isolation.
 ]
 
+# Pinned to a specific minor so `ruff check` findings stay stable across
+# machines/CI. Bump deliberately (a new ruff minor can add/retire rules).
+# `scripts/lint.sh` / `scripts/check.sh` install these into a project-local .venv/.
 [project.optional-dependencies]
-dev = ["pytest>=7.0", "ruff"]
+dev = ["pytest>=9.1,<10", "ruff>=0.16.6,<0.17"]
 
 [tool.dagster]
 module_name = "scripts.definitions"
