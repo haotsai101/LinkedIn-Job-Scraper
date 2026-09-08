@@ -680,6 +680,9 @@ def test_safe_selector_dot_in_id_rewritten():
 def test_safe_selector_escapes_quote_and_backslash_in_id():
     assert _safe('#id-with"quote') == '[id="id-with\\"quote"]'
     assert _safe('#id\\slash') == '[id="id\\\\slash"]'
+    # both in one id — regresses if the two .replace() calls are reordered
+    # (backslash must be doubled *before* the quote is escaped)
+    assert _safe(r'#a\b"c') == r'[id="a\\b\"c"]'
 
 
 def test_safe_selector_non_id_selector_untouched():
@@ -706,6 +709,22 @@ def test_execute_fill_colon_id_selector_targets_the_right_locator():
     # the normalised [id="…"] locator resolved to our field and got filled —
     # a raw "#…:…:-input" would have raised SyntaxError in page.locator()
     assert field.filled == ["United States"]
+    # normalised form written back to history (consistent with `select` branch)
+    assert st.selector == '[id="react-select-:R1abc:-input"]'
+
+
+def test_execute_select_colon_id_selector_targets_the_right_locator():
+    # the `select` twin of the fill test — the LLM can emit a `select` action
+    # against the same react-select combobox ids (T44 reviewer follow-up).
+    field = _ExecLoc(count=1, visible=True, tag="input",
+                     attrs={"id": "react-select-:R1abc:-input"})
+    page = _ExecPage("https://ats.example.com/form")
+    page._locators = {'[id="react-select-:R1abc:-input"]': field}
+    flow = _offsite()
+    st = _SS(page, "#react-select-:R1abc:-input", {}, False)
+    # no SyntaxError at page.locator(); normalised form recorded for history
+    assert _exec(flow, "select", st, value="Yes") is None
+    assert st.selector == '[id="react-select-:R1abc:-input"]'
 
 
 # ── fill: CAPTCHA-exception guard returns "skipped" ─────────────────────

@@ -4350,7 +4350,10 @@ class OffsiteApplyFlow:
                     # the [id="…"] attribute form when the id is not a valid bare
                     # CSS identifier (React 18 useId colon ids, leading digits) —
                     # see its docstring for the deliberate compound-selector limit.
-                    safe_sel = _safe_selector(selector)
+                    # Normalise in place (as the `select` branch does) so the
+                    # `finally` writeback records the same form in step history.
+                    selector = _safe_selector(selector)
+                    safe_sel = selector
                     el = page.locator(safe_sel).first
                     if await el.count() == 0 and text:
                         el = page.locator(f'input[placeholder*="{text}" i], input[name*="{text}" i]').first
@@ -4790,8 +4793,11 @@ class OffsiteApplyFlow:
 
             elif action_type == "select" and selector and value:
                 try:
-                    if selector.startswith("#") and len(selector) > 1 and selector[1].isdigit():
-                        selector = f'[id="{selector[1:]}"]'
+                    # Same normalisation as the `fill` branch — a React 18 useId
+                    # colon id (or any non-bare-CSS id) would otherwise raise
+                    # SyntaxError in page.locator(). The `finally` writeback then
+                    # records the normalised form in step history (T44).
+                    selector = _safe_selector(selector)
                     el = page.locator(selector).first
                     if await el.count() > 0:
                         _sel_done = False
