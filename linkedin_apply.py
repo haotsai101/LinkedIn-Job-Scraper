@@ -254,6 +254,27 @@ def _is_job_listing_url(url: str) -> bool:
     return False
 
 
+def _terminal_state_for_stall(page, *, form_engaged: bool) -> str:
+    """Shared give-up outcome for the OffsiteApply step loop (T45, extends T39).
+
+    A stall where the loop never engaged a real form field on a non-ATS host is a
+    navigation dead end that needs a human -> ``"blocked"`` (``applied=-3``, out
+    of the ``--reset-failed`` retry pool). A stall *after* real form interaction,
+    or on a known ATS form host, is a transient failure worth retrying ->
+    ``"failed"`` (``applied=-2``).
+
+    Mirrors the inline check T39 added at the URL-unchanged stuck guard exactly
+    (same host extraction, same ATS-host set) so all three give-up sites — the
+    URL-unchanged guard, the repeated-action guard and the step-limit exit — reach
+    an identical verdict.
+    """
+    host = urlparse(page.url).netloc.lower()
+    on_ats_host = any(d in host for d in (*_FORM_DOMAINS, *_ATS_REQUIRE_APPLY_PATH))
+    if not form_engaged and not on_ats_host:
+        return "blocked"
+    return "failed"
+
+
 def _load_all_accounts() -> list[dict]:
     path = Path(_ACCOUNTS_PATH)
     if not path.exists():
@@ -2541,14 +2562,20 @@ class _StepState:
     * ``submit_clicked`` — latches True once a real submit button is clicked;
       ``verify_submission`` uses it to tell a real post-submit redirect from a
       stray navigation.
+    * ``click_hit_target`` — set by ``_execute_action``'s ``click`` branch when
+      the click actually resolved a target that was *not* a plain nav link
+      (T45). The orchestrator reads it to decide whether a ``click`` counts as
+      engaging the form (``_form_engaged``): a not-found click or a bare-``<a>``
+      nav-link click ("Apply" / "Working with us" on a careers SPA) must not.
     """
-    __slots__ = ("page", "selector", "forced_filled", "submit_clicked")
+    __slots__ = ("page", "selector", "forced_filled", "submit_clicked", "click_hit_target")
 
     def __init__(self, page, selector, forced_filled, submit_clicked):
         self.page = page
         self.selector = selector
         self.forced_filled = forced_filled
         self.submit_clicked = submit_clicked
+        self.click_hit_target = False
 
 
 class OffsiteApplyFlow:
@@ -4041,24 +4068,21 @@ class OffsiteApplyFlow:
                                 return await self._handle_submit(page, _sbtn)
                         except Exception:
                             continue
-                    # T39: distinguish a navigation dead-end from a mid-form stall.
-                    # If the loop only ever scrolled and never saw a form field or
-                    # ran a fill/select/upload/click, and we're not on a known ATS
-                    # form host, this is an unreachable apply CTA (e.g. a careers
-                    # SPA) — mark blocked (-3, no auto-retry) instead of failed
-                    # (-2), which would re-burn the same ~40s + LLM calls every run.
+                    # T39/T45: distinguish a navigation dead-end from a mid-form
+                    # stall. If the loop never engaged a real form field and we're
+                    # not on a known ATS form host, this is an unreachable apply
+                    # CTA (e.g. a careers SPA) — mark blocked (-3, no auto-retry)
+                    # instead of failed (-2), which would re-burn the same ~40s +
+                    # LLM calls every run. Shared with the other two give-up sites.
                     _stuck_host = urlparse(page.url).netloc.lower()
-                    _on_ats_host = any(
-                        d in _stuck_host
-                        for d in (*_FORM_DOMAINS, *_ATS_REQUIRE_APPLY_PATH)
-                    )
-                    if not _form_engaged and not _on_ats_host:
+                    _terminal = _terminal_state_for_stall(page, form_engaged=_form_engaged)
+                    if _terminal == "blocked":
                         print(f"  [Offsite] No form or reachable apply control after "
                               f"{unchanged_steps} scrolls on {_stuck_host} — marking blocked "
                               f"(needs a human, no auto-retry)")
-                        return "blocked"
-                    print(f"  [LLM] URL unchanged for 3 consecutive steps — browser is stuck, giving up")
-                    return "failed"
+                    else:
+                        print(f"  [LLM] URL unchanged for 3 consecutive steps — browser is stuck, giving up")
+                    return _terminal
             else:
                 unchanged_steps = 0
                 _exhausted_selectors.clear()   # new page — field selectors are no longer relevant
@@ -4200,12 +4224,12 @@ class OffsiteApplyFlow:
                             except Exception:
                                 pass
                             print(f"  [LLM] Action '{hist_key}' already in history — page not advancing, giving up")
-                            return "failed"
+                            return _terminal_state_for_stall(page, form_engaged=_form_engaged)
                         # Page advanced (or we tried to) — skip re-executing the duplicate action
                         continue
                     else:
                         print(f"  [LLM] Action '{hist_key}' already in history — page not advancing, giving up")
-                        return "failed"
+                        return _terminal_state_for_stall(page, form_engaged=_form_engaged)
 
             if action_type == "done":
                 confirmed, conf_reason = await self._check_submission_result(
@@ -4269,13 +4293,21 @@ class OffsiteApplyFlow:
             if len(action_history) > 10:
                 action_history = action_history[-10:]
             last_action_type = action_type
-            # T39: a non-scroll action means we engaged the form / a control —
-            # a subsequent stall is a mid-form failure (-2), not a dead end (-3).
-            if action_type in ("fill", "select", "upload", "click"):
+            # T39/T45: a real form interaction means a later stall is a mid-form
+            # failure (-2, retryable), not a navigation dead end (-3).
+            # fill/select/upload only ever run against a real field. A `click`
+            # counts only if it resolved a non-nav-link target
+            # (_StepState.click_hit_target) — a not-found click or a bare-nav-link
+            # click ("Apply" / "Working with us" on a careers SPA) must not flip
+            # this, or a pure navigation dead end looks form-engaged and gets a
+            # pointless -2 retry every --reset-failed run.
+            if action_type in ("fill", "select", "upload"):
+                _form_engaged = True
+            elif action_type == "click" and _state.click_hit_target:
                 _form_engaged = True
 
         print("  [LLM] Reached step limit without completion")
-        return "failed"
+        return _terminal_state_for_stall(page, form_engaged=_form_engaged)
 
     async def _execute_action(self, action_type: str, text: str, value: str,
                               state: "_StepState") -> str | None:
@@ -5090,6 +5122,10 @@ class OffsiteApplyFlow:
                                     print(f"  [LLM] Submit button is aria-disabled — JS force-click to reveal validation errors")
                                     await el.evaluate("el => el.click()")
                                     await asyncio.sleep(1.5)
+                                    # T45: force-clicking a real submit button on a
+                                    # form (inputs present, else is_submit_btn was
+                                    # already flipped off) is genuine engagement.
+                                    state.click_hit_target = True
                                     # Continue step loop so LLM sees the validation errors
                                     break
                                 return await self._handle_submit(page, el)
@@ -5119,6 +5155,13 @@ class OffsiteApplyFlow:
                             continue
                     if not clicked:
                         print(f"  [LLM] Click target not found: {selector!r} / {text!r}")
+                    # T45: a click "engages the form" only when it resolved a real
+                    # target AND was not a plain nav-link click. A bare <a> is
+                    # marketing/careers chrome ("Apply" / "Working with us" on a
+                    # careers SPA) that only navigates; treating it as engagement
+                    # makes a navigation dead end look like a mid-form stall and
+                    # earns a pointless -2 retry every --reset-failed run.
+                    state.click_hit_target = clicked and not _is_anchor_only
         finally:
             # Terminal returns above unwind straight out; only the fall-through
             # path needs the new-tab / normalised-selector rebinds synced back.

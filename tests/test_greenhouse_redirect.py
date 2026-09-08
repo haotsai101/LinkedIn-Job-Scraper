@@ -257,14 +257,93 @@ def test_scroll_only_stall_on_ats_form_host_stays_failed(monkeypatch):
 
 
 def test_stall_after_form_engaged_stays_failed(monkeypatch):
-    """The loop engaged a control (a click executed) then stalled — a genuine
-    transient mid-form failure, must stay -2 even on a non-ATS host."""
+    """The loop ran a real ``fill`` then stalled (URL unchanged) — a genuine
+    transient mid-form failure, must stay -2 even on a non-ATS host.
+
+    T45: ``fill``/``select``/``upload`` set ``_form_engaged`` unconditionally
+    (they only ever run against a real field)."""
     _install_common(monkeypatch, snapshot_fields=[])
     monkeypatch.setattr(
         linkedin_apply.OffsiteApplyFlow, "_decide_action",
-        _sequence({"action": "click", "selector": "#open-form-btn", "reason": "open form"},
+        _sequence({"action": "fill", "selector": "#full-name", "value": "Ada Lovelace",
+                   "reason": "fill name"},
                   {"action": "scroll", "reason": "scrolling"}))
     page = _FakePage("https://www.mongodb.com/careers/jobs/8161512")
     flow = _offsite(application_url="https://www.mongodb.com/careers/jobs/8161512")
     out = asyncio.run(flow._llm_guided_apply(page))
     assert out == "failed"
+
+
+# ── T45 — give-up path discrimination extended to all three sites ──────────
+#
+# T39 only guarded the URL-unchanged stuck guard. T45 routes the repeated-action
+# and step-limit give-ups through the same _terminal_state_for_stall helper, and
+# stops a not-found / nav-link click from setting _form_engaged. Live case:
+# MedoSync job 4 — an offscreen "Apply" link bounced to the company homepage
+# (URL changed, so the URL-unchanged guard never ran), the loop clicked nav
+# chrome, hit the repeated-action guard → "failed"/-2 → re-run every
+# --reset-failed. After T45 → "blocked"/-3.
+
+def test_terminal_state_for_stall_helper():
+    def mk(u):
+        return type("P", (), {"url": u})()
+    # non-ATS host, never engaged the form → dead end
+    assert GH._terminal_state_for_stall(mk("https://www.medosync.com/"),
+                                        form_engaged=False) == "blocked"
+    # non-ATS host but the form WAS engaged → transient, retryable
+    assert GH._terminal_state_for_stall(mk("https://www.medosync.com/"),
+                                        form_engaged=True) == "failed"
+    # known ATS form host → the form is presumably there → retryable
+    assert GH._terminal_state_for_stall(mk("https://job-boards.greenhouse.io/x/jobs/1"),
+                                        form_engaged=False) == "failed"
+    assert GH._terminal_state_for_stall(mk("https://jobs.lever.co/acme/1"),
+                                        form_engaged=False) == "failed"
+
+
+def test_navlink_only_deadend_repeated_action_returns_blocked(monkeypatch):
+    """MedoSync shape: the loop only ever clicks an unresolved nav link on a
+    non-ATS host, then trips the repeated-action guard → blocked (-3), not the
+    old unconditional failed (-2)."""
+    _install_common(monkeypatch, snapshot_fields=[])
+    monkeypatch.setattr(
+        linkedin_apply.OffsiteApplyFlow, "_decide_action",
+        _always({"action": "click", "selector": 'a:has-text("Working with us")',
+                 "text": "Working with us", "reason": "hunting for the apply form"}))
+    page = _FakePage("https://www.medosync.com/")
+    flow = _offsite(application_url="https://www.medosync.com/careers/backend-developer")
+    out = asyncio.run(flow._llm_guided_apply(page))
+    assert out == "blocked"
+
+
+def test_not_found_click_does_not_engage_form(monkeypatch):
+    """A ``click`` whose target never resolves must not set ``_form_engaged`` —
+    a later scroll stall on a non-ATS host is still a dead end (-3)."""
+    _install_common(monkeypatch, snapshot_fields=[])
+    monkeypatch.setattr(
+        linkedin_apply.OffsiteApplyFlow, "_decide_action",
+        _sequence({"action": "click", "selector": 'button:has-text("Accept")',
+                   "text": "Accept", "reason": "dismiss the cookie banner"},
+                  {"action": "scroll", "reason": "scrolling for apply"}))
+    page = _FakePage("https://www.medosync.com/careers/backend-developer")
+    flow = _offsite(application_url="https://www.medosync.com/careers/backend-developer")
+    out = asyncio.run(flow._llm_guided_apply(page))
+    assert out == "blocked"
+
+
+def test_navlink_only_deadend_step_limit_returns_blocked(monkeypatch):
+    """Same dead end but the URL bumps every step (so the URL-unchanged guard
+    never fires) and every nav-link selector is unique (so the repeated-action
+    guard never fires) — the loop runs to the step limit → blocked (-3)."""
+    _install_common(monkeypatch, snapshot_fields=[])
+    page = _FakePage("https://www.medosync.com/careers")
+    box = {"i": 0}
+
+    async def _decide(self, *_a, **_k):
+        box["i"] += 1
+        page.url = f"https://www.medosync.com/page-{box['i']}"
+        return {"action": "click", "selector": f'a:has-text("Nav {box["i"]}")',
+                "text": f"Nav {box['i']}", "reason": "still hunting"}
+    monkeypatch.setattr(linkedin_apply.OffsiteApplyFlow, "_decide_action", _decide)
+    flow = _offsite(application_url="https://www.medosync.com/careers")
+    out = asyncio.run(flow._llm_guided_apply(page))
+    assert out == "blocked"
