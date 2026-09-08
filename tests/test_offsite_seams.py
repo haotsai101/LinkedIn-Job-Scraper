@@ -879,3 +879,88 @@ def test_coerce_fill_value_text_hint_fallback_is_extraction_only():
     # long value, even with a digit -> preserved (not a bare-number field).
     long_v = "Honestly I'd put my hands-on experience at around an 8, maybe 9 on a good day"
     assert flow._coerce_fill_value(".x", "rate 1-10", long_v, snap) == long_v
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# T36 — Chromium tab / renderer crash handling
+# ══════════════════════════════════════════════════════════════════════════
+#
+# A "Target crashed" / TargetClosedError from a .count()/.fill()/.click() on a
+# memory-heavy ATS SPA must NOT escape _execute_action as a raw exception: it
+# ends the job deliberately as a retryable failure ("failed" -> applied=-2) and
+# latches flow._browser_crashed so run_session rebuilds the shared page.
+
+import pytest  # noqa: E402
+
+_TCE = linkedin_apply._TargetClosedError
+
+
+def test_is_browser_crash_type_and_message_matching():
+    assert linkedin_apply._is_browser_crash(
+        _TCE("Target page, context or browser has been closed"))
+    assert linkedin_apply._is_browser_crash(RuntimeError("Locator.count: Target crashed"))
+    assert linkedin_apply._is_browser_crash(Exception("the page has been closed"))
+    # NOT a crash — a timeout or an unrelated error must stay on its own path
+    assert not linkedin_apply._is_browser_crash(TimeoutError("waiting for selector"))
+    assert not linkedin_apply._is_browser_crash(RuntimeError("hCaptcha challenge frame"))
+
+
+class _CrashLoc(_ExecLoc):
+    """Locator whose .count() dies like a crashed renderer."""
+
+    async def count(self):
+        raise _TCE("Target crashed")
+
+
+def test_execute_fill_browser_crash_returns_failed_not_raise(capsys):
+    page = _ExecPage("https://ats.example.com/form")
+    page._locators = {"#name": _CrashLoc()}
+    flow = _offsite()
+    st = _SS(page, "#name", {}, False)
+    # returns the terminal status — no exception bubbles out
+    assert _exec(flow, "fill", st, value="Jordan") == "failed"
+    assert flow._browser_crashed is True
+    assert "crashed mid-apply" in capsys.readouterr().out.lower()
+
+
+def test_execute_select_browser_crash_returns_failed_not_raise():
+    page = _ExecPage("https://ats.example.com/form")
+    page._locators = {"#country": _CrashLoc()}
+    flow = _offsite()
+    st = _SS(page, "#country", {}, False)
+    assert _exec(flow, "select", st, value="United States") == "failed"
+    assert flow._browser_crashed is True
+
+
+def test_execute_fill_non_crash_exception_still_swallowed():
+    # regression guard: a plain error in the fill branch must NOT be treated as
+    # a crash — it stays swallowed (returns None), _browser_crashed stays False.
+    class _BoomLoc(_ExecLoc):
+        async def count(self):
+            raise RuntimeError("some transient DOM detachment")
+
+    page = _ExecPage("https://ats.example.com/form")
+    page._locators = {"#name": _BoomLoc()}
+    flow = _offsite()
+    st = _SS(page, "#name", {}, False)
+    assert _exec(flow, "fill", st, value="Jordan") is None
+    assert flow._browser_crashed is False
+
+
+def test_get_page_snapshot_reraises_browser_crash_but_swallows_others():
+    class _P:
+        url = "https://ats.example.com/form"
+
+        def __init__(self, exc):
+            self._exc = exc
+
+        async def evaluate(self, *_a):
+            raise self._exc
+
+    flow = _offsite()
+    # crash -> propagates (the step loop turns it into "failed" + a rebuild)
+    with pytest.raises(Exception):
+        _run(flow._get_page_snapshot(_P(_TCE("Target crashed"))))
+    # non-crash -> swallowed, empty snapshot as before
+    snap = _run(flow._get_page_snapshot(_P(RuntimeError("json eval blew up"))))
+    assert snap["fields"] == [] and snap["buttons"] == []

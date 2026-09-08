@@ -68,6 +68,7 @@ from linkedin_apply import (
     OffsiteApplyFlow,
     _coerce_numeric_answer,
     _get_profile_value,
+    _is_browser_crash,
 )
 from scripts.create_db import BLOCKED_ENTITIES_SEED, ensure_db_ready, ensure_schema_current
 
@@ -1186,6 +1187,82 @@ async def login_linkedin_playwright(page) -> None:
 
 # ── Main session ───────────────────────────────────────────────────────────────
 
+async def _page_is_alive(page) -> bool:
+    """True if *page* still responds — a crashed renderer raises on any call
+    even though ``page.is_closed()`` stays False (T36)."""
+    try:
+        if page.is_closed():
+            return False
+        await page.evaluate("1")
+        return True
+    except Exception:
+        return False
+
+
+async def _recover_browser_if_crashed(browser, context, page, *, need_login,
+                                      suspect=False):
+    """T36: return a live ``(context, page)`` pair after a possible tab crash.
+
+    ``run_session`` shares ONE browser / context / page across every job. A
+    Chromium renderer crash on a memory-heavy ATS SPA leaves that page (and,
+    rarely, the context) unusable, so without this every subsequent job in the
+    session also fails. Rebuild only what actually died:
+
+      * shared page healthy → return it unchanged. The liveness probe runs even
+        when ``suspect`` (a crash was caught this job) — the crash may have been
+        in a child tab while the shared page is fine, and rebuilding then would
+        needlessly drop a healthy page. ``suspect`` only skips the retry-wait.
+      * page dead, context alive → open a fresh tab on the same context
+        (keeps cookies / the LinkedIn login).
+      * context dead → rebuild the context, re-login if the session needs it.
+    """
+    # Probe the shared page. One retry (with a short wait) when NOT suspect, so a
+    # transient in-flight navigation isn't mistaken for a crash; when suspect,
+    # a single probe — we already know something crashed, just check if it was
+    # this page.
+    for _attempt in range(1 if suspect else 2):
+        if await _page_is_alive(page):
+            return context, page
+        if not suspect:
+            await asyncio.sleep(0.5)
+
+    # Fresh tab on the same context — the common case, cookies preserved.
+    try:
+        new_page = await context.new_page()
+        if await _page_is_alive(new_page):
+            for _pg in list(context.pages):
+                if _pg is not new_page:
+                    try:
+                        await _pg.close()
+                    except Exception:
+                        pass
+            print("  [recover] Browser tab crashed — opened a fresh tab, session continues.")
+            return context, new_page
+        # New tab isn't usable either → context is likely gone. Close the
+        # orphan before falling through to the full rebuild.
+        try:
+            await new_page.close()
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    # Context itself is gone — rebuild it (loses cookies; re-login if needed).
+    print("  [recover] Browser context lost — rebuilding it.")
+    try:
+        await context.close()
+    except Exception:
+        pass
+    new_context = await browser.new_context(permissions=[])
+    new_page = await new_context.new_page()
+    if need_login:
+        try:
+            await login_linkedin_playwright(new_page)
+        except Exception as exc:
+            print(f"  [recover] Re-login after context rebuild failed ({exc}).")
+    return new_context, new_page
+
+
 async def run_session(
     jobs,
     total,
@@ -1366,7 +1443,7 @@ async def run_session(
                 # ── Build callbacks ────────────────────────────────────────────
                 outcome: dict[str, str] = {"status": "pending"}
 
-                def _make_ready_to_submit(outcome_ref, job_title_ref):
+                def _make_ready_to_submit(outcome_ref, job_title_ref, page_ref):
                     async def ready_to_submit(summary: str) -> str:
                         if auto_mode:
                             print(f"\n  Auto-submitting: {job_title_ref}")
@@ -1390,24 +1467,23 @@ async def run_session(
                                 outcome_ref["status"] = "skipped"
                                 return "skipped"
                             if choice == "f":
-                                await _llm_fill_focused(page, profile)
+                                await _llm_fill_focused(page_ref, profile)
                                 continue
                             outcome_ref["status"] = "applied"
                             return "applied"
                     return ready_to_submit
 
-                async def _fill_focused_cb():
-                    await _llm_fill_focused(page, profile)
+                async def _fill_focused_cb(_page=page):
+                    await _llm_fill_focused(_page, profile)
 
                 callbacks = {
-                    "ready_to_submit":  _make_ready_to_submit(outcome, title or "Unknown"),
+                    "ready_to_submit":  _make_ready_to_submit(outcome, title or "Unknown", page),
                     "fill_focused":     _fill_focused_cb,
                     "save_account":     save_account_to_file,
                     "get_credentials":  _get_login_credentials,
                 }
 
                 # ── Choose apply flow ──────────────────────────────────────────
-                pages_before = set(context.pages)
                 print("  Applying via Playwright…")
 
                 if (application_type or "") == "OffsiteApply":
@@ -1437,19 +1513,29 @@ async def run_session(
                     )
                     flow._verbose_company = company_name or "unknown"
 
+                # T36: set when a Chromium tab/renderer crash is seen for this job
+                # — either caught inside the flow (flow._browser_crashed) or
+                # bubbled to the generic catch below. Triggers a page rebuild
+                # after the job so the crash doesn't poison the rest of the run.
+                browser_crashed = False
+
                 try:
                     status = await asyncio.wait_for(flow.run(url), timeout=600)
                 except asyncio.TimeoutError:
                     print(f"\n  [!] Timed out after 600s")
                     status = "failed"
                 except Exception as exc:
-                    print(f"\n  [!] Error during apply: {exc}")
+                    if _is_browser_crash(exc):
+                        print(f"\n  [!] Browser tab crashed mid-apply — will retry ({exc})")
+                        browser_crashed = True
+                    else:
+                        print(f"\n  [!] Error during apply: {exc}")
                     status = "failed"
+                browser_crashed |= getattr(flow, "_browser_crashed", False)
 
                 # Easy Apply job switched to external apply — retry with OffsiteApplyFlow
                 if status == "external_apply" and not isinstance(flow, OffsiteApplyFlow):
                     print("  [~] Job switched from Easy Apply to external — retrying with OffsiteApplyFlow…")
-                    pages_before = set(context.pages)
                     flow = OffsiteApplyFlow(
                         page=page,
                         context=context,
@@ -1470,8 +1556,13 @@ async def run_session(
                         print(f"\n  [!] Timed out after 600s")
                         status = "failed"
                     except Exception as exc:
-                        print(f"\n  [!] Error during offsite apply: {exc}")
+                        if _is_browser_crash(exc):
+                            print(f"\n  [!] Browser tab crashed mid-apply — will retry ({exc})")
+                            browser_crashed = True
+                        else:
+                            print(f"\n  [!] Error during offsite apply: {exc}")
                         status = "failed"
+                    browser_crashed |= getattr(flow, "_browser_crashed", False)
 
                 # Collect unanswered fields for profile improvement
                 for f in getattr(flow, "unanswered_fields", []):
@@ -1621,9 +1712,23 @@ async def run_session(
                         print(f"\n  [!] Error rate too high ({error_count} errors vs {_progress} handled) — stopping session early.")
                         break
 
+                # T36: a Chromium tab/renderer crash this job leaves the shared
+                # page (and sometimes the context) unusable — rebuild before the
+                # next job so the crash isn't inherited. Also probes the page
+                # even without a caught crash, in case one was swallowed deeper.
+                try:
+                    context, page = await _recover_browser_if_crashed(
+                        browser, context, page,
+                        need_login=not _all_offsite,
+                        suspect=browser_crashed,
+                    )
+                except Exception as _rec_exc:
+                    print(f"  [recover] Browser unrecoverable ({_rec_exc}) — ending session.")
+                    break
+
                 # Close any new tabs opened during apply
                 for pg in list(context.pages):
-                    if pg not in pages_before and not pg.is_closed():
+                    if pg is not page and not pg.is_closed():
                         try:
                             await pg.close()
                         except Exception:
