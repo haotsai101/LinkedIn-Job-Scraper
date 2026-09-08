@@ -4,11 +4,68 @@ from selenium.webdriver.common.by import By
 import time
 import requests
 import pandas as pd
+import tenacity
 
 from scripts.helpers import strip_val, get_value_by_path
 
 
 BROWSER = 'edge'
+
+
+class VoyagerAuthError(Exception):
+    """Raised on an HTTP 401 from the Voyager API — the session cookies are stale.
+
+    Not retryable: refreshing the session is PR 2's job (Selenium -> Playwright
+    cookie handling). For now this propagates with a clear message so the caller
+    knows a re-login is required rather than a transient network blip.
+    """
+
+
+class VoyagerRetryableError(Exception):
+    """Raised on an HTTP 429 or 5xx from the Voyager API — a transient server-side
+    condition. Retried with exponential backoff by ``_voyager_get``; after the
+    final attempt it propagates so the caller can decide what to do."""
+
+
+# Retry policy for the raw network call to LinkedIn's Voyager API:
+#   - ConnectionError / Timeout  -> transient, retry
+#   - HTTP 429 / 5xx             -> transient, retry (surfaced as VoyagerRetryableError)
+#   - HTTP 401                   -> auth problem, do NOT retry (VoyagerAuthError)
+#   - any other non-2xx          -> returned as-is, caller handles it
+# ~2s base, doubling, capped at 60s; 4 attempts total; the final failure re-raises.
+_voyager_retry = tenacity.retry(
+    retry=tenacity.retry_if_exception_type(
+        (
+            requests.exceptions.ConnectionError,
+            requests.exceptions.Timeout,
+            VoyagerRetryableError,
+        )
+    ),
+    wait=tenacity.wait_exponential(multiplier=2, max=60),
+    stop=tenacity.stop_after_attempt(4),
+    reraise=True,
+)
+
+
+@_voyager_retry
+def _voyager_get(session, url, headers=None, timeout=30):
+    """GET ``url`` on ``session`` with tenacity retry/backoff.
+
+    Returns the ``requests.Response`` for a 2xx or any non-retryable non-2xx
+    (e.g. 400/403/404) so the existing caller-side status checks still apply.
+    Raises ``VoyagerAuthError`` on 401 (no retry) and ``VoyagerRetryableError``
+    on 429/5xx (retried, then re-raised on the last attempt).
+    """
+    resp = session.get(url, headers=headers, timeout=timeout)
+    if resp.status_code == 401:
+        raise VoyagerAuthError(
+            f'HTTP 401 from Voyager ({url}) — session cookies are stale, re-login required'
+        )
+    if resp.status_code == 429 or resp.status_code >= 500:
+        raise VoyagerRetryableError(
+            f'HTTP {resp.status_code} from Voyager ({url}) — transient, retrying'
+        )
+    return resp
 
 def create_session(email, password):
     if BROWSER == 'chrome':
@@ -94,7 +151,7 @@ class JobSearchRetriever:
         if 'Path' in headers:
             headers.pop('Path')
 
-        results = self.sessions[self.session_index].get(link, headers=headers)
+        results = _voyager_get(self.sessions[self.session_index], link, headers=headers)
         self.session_index = (self.session_index + 1) % len(self.sessions)
 
         if results.status_code != 200:
@@ -147,23 +204,35 @@ class JobDetailRetriever:
         job_details = {}
         for job_id in job_ids:
             error = False
+            # VoyagerAuthError (401) is intentionally NOT caught here — a stale
+            # session is not a per-job problem, so it propagates with a clear
+            # message (session refresh is PR 2's concern).
             try:
-                details = self.sessions[self.session_index].get(self.job_details_link.format(job_id), headers=self.headers[self.session_index])#, proxies=self.proxies[self.session_index], timeout=5)
-            except requests.exceptions.Timeout:
-                print('Timeout for job {}'.format(job_id))
-                error = True
-            if details.status_code != 200:
+                details = _voyager_get(
+                    self.sessions[self.session_index],
+                    self.job_details_link.format(job_id),
+                    headers=self.headers[self.session_index],
+                )
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout,
+                    VoyagerRetryableError) as exc:
+                # tenacity already retried 4x with backoff and it still failed.
+                print(f'Network error for job {job_id} after retries: {exc}')
                 job_details[job_id] = -1
-                print('Status code {} for job {} with account {}\nText: {}'.format(details.status_code, job_id, self.emails[self.session_index], details.text))
                 error = True
+            else:
+                if details.status_code != 200:
+                    job_details[job_id] = -1
+                    print('Status code {} for job {} with account {}\nText: {}'.format(
+                        details.status_code, job_id, self.emails[self.session_index], details.text))
+                    error = True
+                else:
+                    self.error_count = 0
+                    job_details[job_id] = details.json()
+                    print('Job {} done'.format(job_id))
             if error:
                 self.error_count += 1
                 if self.error_count > 10:
                     raise Exception('Too many errors')
-            else:
-                self.error_count = 0
-                job_details[job_id] = details.json()
-                print('Job {} done'.format(job_id))
             self.session_index = (self.session_index + 1) % len(self.sessions)
             time.sleep(.3)
         return job_details

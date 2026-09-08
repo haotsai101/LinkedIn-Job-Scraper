@@ -8,9 +8,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 # Dagster (recommended — runs all pipelines via UI at http://localhost:3000)
 DAGSTER_HOME=./.dagster_home dagster dev
 
-# Standalone scripts
-python search_retriever.py          # Discover new job IDs
-python details_retriever.py         # Enrich scraped=0 jobs with full attributes
+# Standalone scripts (thin wrappers over scripts/retrieval.py — same loop the Dagster ops run)
+python search_retriever.py                 # Discover new job IDs (stop at 100 new)
+python search_retriever.py --target 250    # ...or a different new-job target (0 = no cap)
+python search_retriever.py --max-rounds 5  # cap rounds (1 round = 1 page per search config)
+python details_retriever.py                # Enrich all scraped=0 jobs with full attributes
+python details_retriever.py --max-updates 50 --sleep 15  # batch size / inter-batch pause
 
 # Job application agent
 python apply_jobs.py                              # Semi-auto: confirm before each submit

@@ -1,37 +1,52 @@
-from scripts.create_db import ensure_db_ready
-from scripts.database_scripts import insert_data
-from scripts.fetch import JobDetailRetriever
+"""Phase 2 — Enrichment. Thin wrapper over ``scripts.retrieval.run_detail_enrichment``.
+
+The batch loop itself lives in ``scripts/retrieval.py`` and is shared with the
+Dagster ``fetch_job_details_op``. This script just parses args, opens the DB and
+calls it once — no ``while True``.
+
+    python details_retriever.py                    # enrich all scraped=0 jobs
+    python details_retriever.py --max-updates 50
+    python details_retriever.py --sleep 15
+"""
+
+import argparse
 import sqlite3
-from scripts.helpers import clean_job_postings
-import time
-import random
 
-SLEEP_TIME = 30
-MAX_UPDATES = 25
-
-conn = sqlite3.connect('linkedin_jobs.db')
-cursor = conn.cursor()
-
-ensure_db_ready(conn, cursor)
+from scripts.create_db import ensure_db_ready
+from scripts.retrieval import DEFAULT_MAX_UPDATES, DEFAULT_SLEEP_TIME, run_detail_enrichment
 
 
-job_detail_retriever = JobDetailRetriever()
+def main():
+    parser = argparse.ArgumentParser(
+        description="Enrich scraped=0 jobs with full attributes."
+    )
+    parser.add_argument(
+        "--max-updates", type=int, default=DEFAULT_MAX_UPDATES,
+        help=f"Jobs to enrich per batch (default: {DEFAULT_MAX_UPDATES}).",
+    )
+    parser.add_argument(
+        "--sleep", type=int, default=DEFAULT_SLEEP_TIME,
+        help=f"Seconds to pause between batches (default: {DEFAULT_SLEEP_TIME}).",
+    )
+    parser.add_argument(
+        "--database", default="linkedin_jobs.db", help="SQLite database path.",
+    )
+    args = parser.parse_args()
 
-while True:
-    query = "SELECT job_id FROM jobs WHERE scraped = 0"
-    cursor.execute(query)
-    result = cursor.fetchall()
-    result = [r[0] for r in result]
+    conn = sqlite3.connect(args.database)
+    cursor = conn.cursor()
+    ensure_db_ready(conn, cursor)
 
-    if not result:
-        print('All jobs scraped. Done.')
-        break
+    result = run_detail_enrichment(
+        conn, cursor, max_updates=args.max_updates, sleep_time=args.sleep
+    )
 
-    details = job_detail_retriever.get_job_details(random.sample(result, min(MAX_UPDATES, len(result))))
-    details = clean_job_postings(details)
-    insert_data(details, conn, cursor)
-    print('UPDATED {} VALUES IN DB — {} remaining'.format(len(details), len(result) - len(details)))
+    conn.close()
+    print(
+        "Done — {updated_count} jobs enriched, {remaining_jobs} still pending "
+        "({status}).".format(**result)
+    )
 
-    print('Sleeping For {} Seconds...'.format(SLEEP_TIME))
-    time.sleep(SLEEP_TIME)
-    print('Resuming...')
+
+if __name__ == "__main__":
+    main()

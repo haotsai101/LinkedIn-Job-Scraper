@@ -23,6 +23,7 @@ dependencies = [
     "playwright>=1.44.0",
     "httpx>=0.27.0",
     "openai>=1.0.0",  # NIM classifier + browser-use (T15) OpenAI-compatible paths (nim_client.py)
+    "tenacity>=8,<10",  # retry/backoff around the Voyager API calls in scripts/fetch.py (T17)
     "claude-agent-sdk>=0.2.140,<0.3",  # Easy Apply classifier + browser agent (subscription auth, no API key) — T14/T14b. Pinned <0.3: relies on ClaudeAgentOptions.output_format + one-shot query() session isolation.
 ]
 

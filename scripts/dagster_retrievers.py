@@ -6,12 +6,8 @@ Converts search_retriever.py and details_retriever.py into schedulable tasks.
 import json
 import sqlite3
 import subprocess
-import random
-from collections import deque
 from pathlib import Path
-import time
 
-import pandas as pd
 from dagster import (
     op,
     job,
@@ -29,9 +25,7 @@ from dagster import (
 )
 
 from scripts.create_db import ensure_db_ready
-from scripts.database_scripts import insert_job_postings, insert_data
-from scripts.fetch import JobSearchRetriever, JobDetailRetriever
-from scripts.helpers import clean_job_postings
+from scripts.retrieval import run_detail_enrichment, run_search
 from scripts.search_config import SEARCH_KEYWORDS
 
 logger = get_dagster_logger()
@@ -50,17 +44,22 @@ logger = get_dagster_logger()
             "SEARCH_KEYWORDS constant in scripts/search_config.py.",
         ),
         "pages_to_fetch": Field(
-            Int, default_value=5, description="Number of result pages to fetch."
+            Int, default_value=5,
+            description="Max rounds to fetch. One round = one result page from "
+            "each search config (remote + Utah).",
         ),
     }
 )
 def search_jobs_op(context) -> dict:
     """
-    Search for LinkedIn jobs and insert new ones into database.
+    Search for LinkedIn jobs and insert new ones into the database.
+
+    Thin wrapper over ``scripts.retrieval.run_search`` (shared with the
+    standalone ``search_retriever.py``).
 
     Config:
         keywords: Search keywords (default: shared SEARCH_KEYWORDS)
-        pages_to_fetch: Number of pages to search (default: 5)
+        pages_to_fetch: Max rounds to fetch (default: 5)
     """
     keywords = context.op_config.get("keywords", SEARCH_KEYWORDS)
     pages_to_fetch = context.op_config.get("pages_to_fetch", 5)
@@ -68,58 +67,21 @@ def search_jobs_op(context) -> dict:
     conn = sqlite3.connect("linkedin_jobs.db")
     cursor = conn.cursor()
     ensure_db_ready(conn, cursor)
-    
+
     logger.info(f"🔍 Starting job search for keywords: {keywords}")
-    
-    job_searcher = JobSearchRetriever(keywords=keywords)
-    total_new = 0
-    total_new_non_sponsored = 0
-    
-    for page in range(1, pages_to_fetch + 1):
-        logger.info(f"📄 Fetching page {page}...")
-        
-        try:
-            all_results = job_searcher.get_jobs(page)
-            
-            # Check which jobs are already in DB
-            query = "SELECT job_id FROM jobs WHERE job_id IN ({})".format(
-                ','.join(['?'] * len(all_results))
-            )
-            cursor.execute(query, list(all_results.keys()))
-            result = cursor.fetchall()
-            result = [r[0] for r in result]
-            
-            # Insert only new jobs
-            new_results = {
-                job_id: job_info 
-                for job_id, job_info in all_results.items() 
-                if job_id not in result
-            }
-            insert_job_postings(new_results, conn, cursor)
-            
-            total_non_sponsored = len([x for x in all_results.values() if x['sponsored'] is False])
-            new_non_sponsored = len([x for x in new_results.values() if x['sponsored'] is False])
-            
-            logger.info(
-                f"✅ Page {page}: {len(new_results)}/{len(all_results)} NEW | "
-                f"{new_non_sponsored}/{total_non_sponsored} NEW NON-PROMOTED"
-            )
-            
-            total_new += len(new_results)
-            total_new_non_sponsored += new_non_sponsored
-            
-        except Exception as e:
-            logger.warning(f"⚠️ Error on page {page}: {e}")
-            continue
-    
+
+    # target=None: the op fetches a fixed number of rounds rather than chasing a
+    # new-job count (that's the standalone script's mode).
+    result = run_search(
+        conn,
+        cursor,
+        keywords=keywords,
+        target=None,
+        max_rounds=pages_to_fetch,
+        log=logger.info,
+    )
+
     conn.close()
-    
-    result = {
-        "total_new_jobs": total_new,
-        "total_new_non_sponsored": total_new_non_sponsored,
-        "pages_fetched": pages_to_fetch,
-    }
-    
     logger.info(f"✅ Job search complete: {result}")
     return result
 
@@ -141,10 +103,13 @@ def search_jobs_op(context) -> dict:
 def fetch_job_details_op(context) -> dict:
     """
     Fetch detailed information for jobs without details yet.
-    
+
+    Thin wrapper over ``scripts.retrieval.run_detail_enrichment`` (shared with
+    the standalone ``details_retriever.py``).
+
     Config:
-        max_updates: Max jobs to update per run (default: 25)
-        sleep_time: Sleep time between runs in seconds (default: 30)
+        max_updates: Max jobs to update per batch (default: 25)
+        sleep_time: Sleep time between batches in seconds (default: 30)
     """
     max_updates = context.op_config.get("max_updates", 25)
     sleep_time = context.op_config.get("sleep_time", 30)
@@ -152,63 +117,32 @@ def fetch_job_details_op(context) -> dict:
     conn = sqlite3.connect("linkedin_jobs.db")
     cursor = conn.cursor()
     ensure_db_ready(conn, cursor)
-    
-    logger.info(f"📋 Fetching details for up to {max_updates} jobs...")
-    
-    # Get jobs without details
-    query = "SELECT job_id FROM jobs WHERE scraped = 0"
-    cursor.execute(query)
-    result = cursor.fetchall()
-    result = [r[0] for r in result]
-    
-    if not result:
-        logger.info("✅ All jobs have been scraped!")
+
+    logger.info(f"📋 Enriching scraped=0 jobs, {max_updates} at a time...")
+
+    try:
+        result = run_detail_enrichment(
+            conn,
+            cursor,
+            max_updates=max_updates,
+            sleep_time=sleep_time,
+            log=logger.info,
+        )
+    except Exception as e:
+        logger.error(f"❌ Error fetching details: {e}")
+        cursor.execute("SELECT COUNT(*) FROM jobs WHERE scraped = 0")
+        remaining = cursor.fetchone()[0]
         conn.close()
         return {
             "updated_count": 0,
-            "remaining_jobs": 0,
-            "status": "complete"
+            "remaining_jobs": remaining,
+            "status": "error",
+            "error": str(e),
         }
-    
-    logger.info(f"Found {len(result)} jobs needing details")
-    job_detail_retriever = JobDetailRetriever()
-
-    # Fetch details for random sample
-    total_size = len(result)
-    while total_size > 0:
-      sample_size = min(max_updates, total_size)
-      
-      try:
-          details = job_detail_retriever.get_job_details(random.sample(result, sample_size))
-          details = clean_job_postings(details)
-          insert_data(details, conn, cursor)
-          
-          logger.info(f"✅ Updated {len(details)} jobs with details")
-          
-          # Remaining jobs
-          cursor.execute("SELECT COUNT(*) FROM jobs WHERE scraped = 0")
-          remaining = cursor.fetchone()[0]
-          
-          result_dict = {
-              "updated_count": len(details),
-              "remaining_jobs": remaining,
-              "status": "in_progress" if remaining > 0 else "complete"
-          }
-          
-      except Exception as e:
-          logger.error(f"❌ Error fetching details: {e}")
-          result_dict = {
-              "updated_count": 0,
-              "remaining_jobs": len(result),
-              "status": "error",
-              "error": str(e)
-          }
-      total_size -= sample_size
-      logger.info(f"⏸️ Sleeping for {sleep_time} seconds before next run...")
-      time.sleep(sleep_time)
 
     conn.close()
-    return result_dict
+    logger.info(f"✅ Detail enrichment complete: {result}")
+    return result
 
 
 # ============================================================================

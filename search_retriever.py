@@ -1,63 +1,53 @@
-from scripts.create_db import ensure_db_ready
-from scripts.database_scripts import insert_job_postings
-from scripts.fetch import JobSearchRetriever
-from scripts.search_config import SEARCH_KEYWORDS
+"""Phase 1 — Discovery. Thin wrapper over ``scripts.retrieval.run_search``.
+
+The retrieval loop itself lives in ``scripts/retrieval.py`` and is shared with
+the Dagster ``search_jobs_op``. This script just parses args, opens the DB and
+calls it once — no ``while True``.
+
+    python search_retriever.py                 # stop at 100 new jobs (default)
+    python search_retriever.py --target 250
+    python search_retriever.py --target 0      # no cap (bounded by --max-rounds
+                                               # or query exhaustion)
+    python search_retriever.py --max-rounds 5  # at most 5 rounds
+"""
+
+import argparse
 import sqlite3
-import time
-from collections import deque
-import pandas as pd
+
+from scripts.create_db import ensure_db_ready
+from scripts.retrieval import DEFAULT_TARGET, run_search
 
 
-sleep_times = deque(maxlen=5)
-first = True
-sleep_factor = 3
+def main():
+    parser = argparse.ArgumentParser(description="Discover new LinkedIn job IDs.")
+    parser.add_argument(
+        "--target", type=int, default=DEFAULT_TARGET,
+        help=f"Stop after this many new jobs are inserted (default: {DEFAULT_TARGET}; "
+             "0 = no cap).",
+    )
+    parser.add_argument(
+        "--max-rounds", type=int, default=None,
+        help="Hard cap on rounds (one page per search config each). Default: none — "
+             "run until --target is hit or the query is exhausted.",
+    )
+    parser.add_argument(
+        "--database", default="linkedin_jobs.db", help="SQLite database path.",
+    )
+    args = parser.parse_args()
 
-conn = sqlite3.connect('linkedin_jobs.db')
-cursor = conn.cursor()
+    conn = sqlite3.connect(args.database)
+    cursor = conn.cursor()
+    ensure_db_ready(conn, cursor)
 
-ensure_db_ready(conn, cursor)
+    target = args.target if args.target and args.target > 0 else None
+    result = run_search(conn, cursor, target=target, max_rounds=args.max_rounds)
+
+    conn.close()
+    print(
+        "Done — {total_new_jobs} new jobs ({total_new_non_sponsored} non-promoted) "
+        "over {pages_fetched} rounds.".format(**result)
+    )
 
 
-KEYWORDS = SEARCH_KEYWORDS  # single source of truth: scripts/search_config.py
-TARGET = 100  # stop after this many new jobs are inserted; set to None to run forever
-
-# Remote (workplaceType:2) and Utah (geoId:102095887) — run two passes alternating
-SEARCH_CONFIGS = [
-    ("remote", dict(filters="sortBy:List(DD),workplaceType:List(2)")),
-    ("utah",   dict(filters="sortBy:List(DD)", geo_id="102095887")),
-]
-searchers = [(label, JobSearchRetriever(keywords=KEYWORDS, count=25, **kwargs)) for label, kwargs in SEARCH_CONFIGS]
-pages = {label: 1 for label, _ in SEARCH_CONFIGS}
-
-total_new = 0
-
-while True:
-    for label, job_searcher in searchers:
-        if TARGET and total_new >= TARGET:
-            break
-        page = pages[label]
-        all_results = job_searcher.get_jobs(page)
-
-        query = "SELECT job_id FROM jobs WHERE job_id IN ({})".format(','.join(['?'] * len(all_results)))
-        cursor.execute(query, list(all_results.keys()))
-        result = [r[0] for r in cursor.fetchall()]
-        new_results = {job_id: job_info for job_id, job_info in all_results.items() if job_id not in result}
-        insert_job_postings(new_results, conn, cursor)
-        total_non_sponsored = len([x for x in all_results.values() if x['sponsored'] is False])
-        new_non_sponsored = len([x for x in new_results.values() if x['sponsored'] is False])
-        total_new += len(new_results)
-        print('[{}] {}/{} NEW | {}/{} NON-PROMOTED | page {} | total new: {}'.format(
-            label, len(new_results), len(all_results), new_non_sponsored, total_non_sponsored, page, total_new))
-        if not first:
-            seconds_per_job = sleep_factor / max(len(new_results), 1)
-            sleep_factor = min(seconds_per_job * total_non_sponsored * .75, 60)
-        first = False
-        pages[label] += 1
-
-        print('Sleeping For {} Seconds...'.format(min(60, sleep_factor)))
-        time.sleep(min(60, sleep_factor))
-        print('Resuming...')
-
-    if TARGET and total_new >= TARGET:
-        print('Reached target of {} new jobs. Done.'.format(TARGET))
-        break
+if __name__ == "__main__":
+    main()
