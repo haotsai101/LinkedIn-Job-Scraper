@@ -44,6 +44,53 @@ def _css_id(el_id: str) -> str:
     return re.sub(r'([\[\]().#+*?^$|{},~>\\])', r'\\\1', el_id)
 
 
+# A *bare* CSS identifier as it occurs in this codebase: ASCII letters, digits,
+# "_" and "-", not starting with a digit / "-<digit>" / "--". (Real CSS also
+# permits non-ASCII and backslash escapes; we never emit those here.)
+_BARE_CSS_IDENT_RE = re.compile(r'^-?[A-Za-z_][A-Za-z0-9_-]*$')
+# Presence of any of these means the selector is more than one bare token:
+# descendant (whitespace) + the child / adjacent / sibling / list combinators.
+_SELECTOR_COMBINATOR_RE = re.compile(r'[\s>+~,]')
+
+
+def _safe_selector(sel: str) -> str:
+    """Normalise a bare ``#id`` / ``tag#id`` selector to the ``[id="…"]``
+    attribute form whenever the id is not a valid *bare* CSS identifier.
+
+    Why: React 18's ``useId()`` emits colon-wrapped ids like
+    ``react-select-:Rehufl7rrrrlcq:-input``. ``#react-select-:R…:-input`` is not
+    a valid CSS selector — Playwright's CSS engine raises
+    ``SyntaxError: '…' is not a valid selector`` — so every react-select field on
+    such a form becomes unfillable (observed live: Lumenalta job, all 3 fields,
+    T44). ``[id="react-select-:R…:-input"]`` quotes the id, making the colons
+    (and dots, brackets, parens) literal and safe. This generalisation also
+    subsumes the older ``#<leading-digit>`` / ``input#<leading-digit>`` case
+    (``#1foo`` -> ``[id="1foo"]``).
+
+    Scope / limitation (deliberate): only a *bare* id token is rewritten. A
+    selector that contains a combinator (whitespace, ``>``, ``+``, ``~``, ``,``)
+    is passed through untouched. A trailing pseudo-class / attribute part fused
+    to the same token (``#id:hover``, ``#id[data-x]``) would be folded into the
+    quoted id rather than split off — but the LLM apply loop only ever emits
+    bare ``#id`` / ``tag#id`` fill/select selectors, so this is acceptable;
+    splitting id-from-trailer for every CSS case is error-prone and out of
+    scope (T44).
+    """
+    if not sel or _SELECTOR_COMBINATOR_RE.search(sel):
+        return sel
+    if sel.startswith("#"):
+        tag, ident = "", sel[1:]
+    else:
+        m = re.match(r'^([A-Za-z][A-Za-z0-9-]*)#(.+)$', sel)
+        if not m:
+            return sel
+        tag, ident = m.group(1), m.group(2)
+    if not ident or "#" in ident or _BARE_CSS_IDENT_RE.match(ident):
+        return sel
+    escaped = ident.replace("\\", "\\\\").replace('"', '\\"')
+    return f'{tag}[id="{escaped}"]'
+
+
 async def _human_type(el, value: str):
     """Type text character-by-character with random delays to mimic human input.
 
@@ -4298,14 +4345,11 @@ class OffsiteApplyFlow:
                                 print(f"  [LLM] Upload failed: {exc}")
 
             elif action_type == "fill" and selector and value:
-                def _safe_selector(sel: str) -> str:
-                    """Convert #<id-starting-with-digit> to [id="..."] (valid CSS)."""
-                    if sel.startswith("#") and len(sel) > 1 and sel[1].isdigit():
-                        return f'[id="{sel[1:]}"]'
-                    if sel.startswith("input#") and sel[6:7].isdigit():
-                        return f'input[id="{sel[6:]}"]'
-                    return sel
                 try:
+                    # Module-level _safe_selector: rewrites bare #id / tag#id to
+                    # the [id="…"] attribute form when the id is not a valid bare
+                    # CSS identifier (React 18 useId colon ids, leading digits) —
+                    # see its docstring for the deliberate compound-selector limit.
                     safe_sel = _safe_selector(selector)
                     el = page.locator(safe_sel).first
                     if await el.count() == 0 and text:
