@@ -91,6 +91,43 @@ def _safe_selector(sel: str) -> str:
     return f'{tag}[id="{escaped}"]'
 
 
+# ── Browser tab / renderer crash detection (T36) ──────────────────────────────
+# Chromium tab/renderer crashes happen on memory-heavy ATS SPAs (large React
+# forms). Playwright then raises ``TargetClosedError`` (a subclass of
+# ``playwright.async_api.Error``) or a plain ``Error`` whose message contains
+# "Target crashed" from whatever operation was in flight (``Locator.count``, a
+# fill, a click). It is a *transient* fault — the job should be retried (-2), not
+# dead-ended (-3) — but it must be caught deliberately so it does not escape as a
+# generic unhandled error and, crucially, so the shared browser page can be
+# rebuilt before the next job (see ``apply_jobs._recover_browser_if_crashed``).
+try:  # pragma: no cover - import shape varies by playwright version
+    from playwright._impl._errors import TargetClosedError as _TargetClosedError
+except Exception:  # pragma: no cover
+    _TargetClosedError = None
+
+_CRASH_MARKERS = (
+    "target crashed",
+    "target page, context or browser has been closed",
+    "target closed",
+    "browser has been closed",
+    "page has been closed",
+    "crashed",
+)
+
+
+def _is_browser_crash(exc: BaseException) -> bool:
+    """True when *exc* is a Chromium tab/renderer crash or a closed-target error.
+
+    Matched both by type (``TargetClosedError``) and by message substring so it
+    fires whichever form the caller happens to see. Deliberately narrow: a
+    Playwright ``TimeoutError`` or a selector ``SyntaxError`` is NOT a crash.
+    """
+    if _TargetClosedError is not None and isinstance(exc, _TargetClosedError):
+        return True
+    msg = str(getattr(exc, "message", "") or exc).lower()
+    return any(m in msg for m in _CRASH_MARKERS)
+
+
 async def _human_type(el, value: str):
     """Type text character-by-character with random delays to mimic human input.
 
@@ -2637,6 +2674,10 @@ class OffsiteApplyFlow:
         # Reset at the top of each _llm_guided_apply run; declared here so the
         # auth seams are safe to call standalone (tests, _fill_external_form).
         self._auth_attempted = False
+        # T36: latched True when a Chromium tab/renderer crash is caught mid-apply.
+        # run_session reads it to rebuild the shared browser page before the next
+        # job (a swallowed crash otherwise poisons every subsequent job).
+        self._browser_crashed = False
 
     _EXPIRED_PHRASES = [
         "No longer accepting applications",
@@ -3122,7 +3163,12 @@ class OffsiteApplyFlow:
             visible_text = snapshot_data.get("visibleText", "")
             fields = snapshot_data.get("fields", [])
             buttons = snapshot_data.get("buttons", [])
-        except Exception:
+        except Exception as exc:
+            # T36: a renderer crash here would otherwise look like a blank SPA and
+            # the step loop would return "expired" (-1). Let it propagate so the
+            # crash is handled as a retryable failure and the page is rebuilt.
+            if _is_browser_crash(exc):
+                raise
             visible_text = ""
             fields = []
             buttons = []
@@ -4831,6 +4877,8 @@ class OffsiteApplyFlow:
                                     except Exception:
                                         pass
                 except Exception as exc:
+                    if _is_browser_crash(exc):
+                        raise  # T36: handled by the method-level crash catch
                     exc_str = str(exc)
                     print(f"  [LLM] Fill failed: {exc_str[:200]}")
                     if "captcha" in exc_str.lower() or "hcaptcha" in exc_str.lower():
@@ -5080,6 +5128,8 @@ class OffsiteApplyFlow:
                                     pass
                         await asyncio.sleep(0.5)
                 except Exception as exc:
+                    if _is_browser_crash(exc):
+                        raise  # T36: handled by the method-level crash catch
                     print(f"  [LLM] Select failed: {exc}")
 
             elif action_type == "click":
@@ -5143,7 +5193,9 @@ class OffsiteApplyFlow:
                                     # Continue step loop so LLM sees the validation errors
                                     break
                                 return await self._handle_submit(page, el)
-                        except Exception:
+                        except Exception as _click_exc:
+                            if _is_browser_crash(_click_exc):
+                                raise  # T36: handled by the method-level crash catch
                             continue
                     else:
                         print(f"  [LLM] Submit button not found: {selector!r} / {text!r}")
@@ -5182,7 +5234,9 @@ class OffsiteApplyFlow:
                                     await asyncio.sleep(2)
                                 clicked = True
                                 break
-                        except Exception:
+                        except Exception as _click_exc:
+                            if _is_browser_crash(_click_exc):
+                                raise  # T36: handled by the method-level crash catch
                             continue
                     if not clicked:
                         print(f"  [LLM] Click target not found: {selector!r} / {text!r}")
@@ -5193,6 +5247,19 @@ class OffsiteApplyFlow:
                     # makes a navigation dead end look like a mid-form stall and
                     # earns a pointless -2 retry every --reset-failed run.
                     state.click_hit_target = clicked and not _clicked_anchor
+        except Exception as exc:
+            # T36: a Chromium tab/renderer crash mid-action ("Target crashed" /
+            # TargetClosedError from a .count()/.fill()/.click()). The per-branch
+            # handlers above re-raise it to here. End the job deliberately as a
+            # retryable failure — NOT a stall (don't route through
+            # _terminal_state_for_stall) — and flag the flow so run_session
+            # rebuilds the shared page before the next job.
+            if _is_browser_crash(exc):
+                self._browser_crashed = True
+                print(f"  [Offsite] Browser tab crashed mid-apply ({exc}) — "
+                      f"marking failed for retry")
+                return "failed"
+            raise
         finally:
             # Terminal returns above unwind straight out; only the fall-through
             # path needs the new-tab / normalised-selector rebinds synced back.
