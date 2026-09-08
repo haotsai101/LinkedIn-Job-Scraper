@@ -574,13 +574,43 @@ def test_genuine_location_labels_still_return_the_location(label):
     assert _gpv(PROFILE, label, "text") == "Salt Lake City, Utah", label
 
 
-@pytest.mark.parametrize("label", ["City, State", "City/State"])
-def test_city_state_labels_resolve_to_a_location_value(label):
-    # Pre-existing quirk (unchanged by T41): these contain the word "state", so
-    # the earlier state-of-residence branch answers first with profile["state"].
-    # \bcity\b matches them too, but the state branch wins on ordering. Either
-    # way the value typed is a real location component, never a years figure.
-    assert _gpv(PROFILE, label, "text") == "Utah", label
+# ── T43: a combined City/State field resolves to the full location line ────────
+# Before T43 a label naming both "city" and "state" hit the state-of-residence
+# branch first and returned profile["state"] ("Utah") — the T41 reviewer flagged
+# it and locked the quirk with a characterization test. T43 adds a combined
+# check ahead of the zip / street-address / state branches: when the normalized
+# label names both \bcity\b and \bstate\b (or a "city, state" / "city/state"
+# phrase), return the whole profile["location"] string.
+@pytest.mark.parametrize("label", [
+    "City, State",
+    "City/State",
+    "City / State",
+    "City and State",
+    "City, State, Zip",
+    "City, State (Country)",
+])
+def test_city_state_labels_resolve_to_the_full_location(label):
+    assert _gpv(PROFILE, label, "text") == "Salt Lake City, Utah", label
+
+
+def test_city_state_combo_falls_through_when_profile_has_no_location():
+    # No location string -> the combined branch must NOT fire and return "".
+    # It falls through; "City, State" then hits the state-of-residence branch.
+    p = dict(PROFILE, location="")
+    got = _gpv(p, "City, State", "text")
+    assert got != "", "combined branch returned an empty string instead of falling through"
+    assert got == "Utah"
+
+
+def test_bare_city_and_bare_state_labels_are_unaffected_by_t43():
+    # Regression guards: the combined check must not swallow single-component
+    # labels. "City" -> city/location branch; "State" and "What state do you
+    # live in?" -> state-of-residence branch.
+    assert _gpv(PROFILE, "City", "text") == "Salt Lake City, Utah"
+    assert _gpv(PROFILE, "State", "text") == "Utah"
+    assert _gpv(PROFILE, "What state do you live in?", "text") == "Utah"
+    assert _gpv(PROFILE, "City where you're based", "text") == "Salt Lake City, Utah"
+    assert _gpv(PROFILE, "Zip", "text") == "84101"
 
 
 # ── work authorization / visa / citizenship ───────────────────────────────────
