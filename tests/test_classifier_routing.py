@@ -522,6 +522,16 @@ def test_match_spam_domain_matches_posting_domain_and_url():
     assert apply_jobs._match_spam_domain("", "") is None
 
 
+def test_match_spam_domain_torentify_is_pre_filtered():
+    # T46: torentify.com is an aggregator whose "Apply Now" bounces through
+    # jooble.org -> talent.com (or a Cloudflare wall) — spam-skipped at 0 LLM cost.
+    assert apply_jobs._match_spam_domain(
+        "torentify.com", "https://www.torentify.com/jobs/abc"
+    ) == "torentify.com"
+    assert apply_jobs._match_spam_domain("www.torentify.com", None) == "www.torentify.com"
+    assert "torentify.com" in apply_jobs._OFFSITE_SPAM
+
+
 def test_greenhouse_is_not_pre_filtered():
     joined = " ".join(apply_jobs._OFFSITE_SPAM)
     assert "greenhouse" not in joined
