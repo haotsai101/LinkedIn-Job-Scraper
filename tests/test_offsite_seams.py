@@ -520,12 +520,17 @@ def _exec(flow, action_type, state, *, text="", value=""):
 
 # ── _StepState ───────────────────────────────────────────────────────────
 
-def test_stepstate_holds_the_four_mutable_slots():
+def test_stepstate_holds_the_five_mutable_slots():
     ff = {"x": "1"}
     p = _ExecPage()
     st = _SS(p, "#sel", ff, False)
     assert st.page is p and st.selector == "#sel"
     assert st.forced_filled is ff and st.submit_clicked is False
+    # T45: 5th slot — set by _execute_action's click branch, read by the loop
+    # to decide whether a click counts as engaging the form. Constructor stays
+    # 4-arg; the slot defaults False.
+    assert st.click_hit_target is False
+    assert "click_hit_target" in _SS.__slots__
 
 
 # ── dispatch routing ─────────────────────────────────────────────────────
@@ -558,6 +563,7 @@ def test_execute_click_opening_new_tab_rebinds_state_page():
     assert out is None
     assert st.page is new_tab            # orchestrator must see the new tab
     assert st.submit_clicked is False
+    assert st.click_hit_target is False  # T45: a nav <a> is not form engagement
 
 
 def test_execute_click_no_new_tab_keeps_state_page():
@@ -570,6 +576,7 @@ def test_execute_click_no_new_tab_keeps_state_page():
     assert _exec(flow, "click", st, text="Show more") is None
     assert st.page is landing
     assert btn.clicks  # it was clicked
+    assert st.click_hit_target is True   # T45: a resolved non-nav control engages the form
 
 
 # ── submit-click: submit_clicked latch + _handle_submit propagation ──────
@@ -612,6 +619,9 @@ def test_execute_click_disabled_submit_latches_but_continues(monkeypatch):
     out = _exec(flow, "click", st, text="Submit application")
     assert out is None               # loop continues so the LLM sees validation errors
     assert st.submit_clicked is True
+    # T45: a forced click on a real (aria-disabled) submit button IS engagement —
+    # is_submit_btn was not flipped off, so form inputs were present.
+    assert st.click_hit_target is True
 
 
 # ── select: #<digit>-id selector normalisation into state.selector ───────
@@ -632,6 +642,67 @@ def test_execute_select_plain_selector_unchanged():
     st = _SS(page, "#country", {}, False)
     _exec(flow, "select", st, value="United States")
     assert st.selector == "#country"
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# click_hit_target — does a `click` count as engaging the form?  (T45)
+# ══════════════════════════════════════════════════════════════════════════
+#
+# _llm_guided_apply reads _StepState.click_hit_target to decide whether a
+# `click` sets _form_engaged, which in turn picks -2 "failed" vs -3 "blocked"
+# at every give-up site. A click engages the form only when it resolved a real
+# target that is NOT a plain nav <a>. Anchor-ness is read from the RESOLVED
+# locator's tag, not the LLM's proposed selector: _execute_action falls back to
+# a:has-text()/[aria-label*=] locators, so a non-`a` primary selector can still
+# land on a nav link (PR #54 review point 3).
+
+def test_click_not_found_leaves_click_hit_target_false():
+    page = _ExecPage("https://co.example.com/careers")  # default_loc count 0
+    flow = _offsite()
+    flow.context = _ExecCtxNoTab()
+    st = _SS(page, "#nope", {}, False)
+    assert _exec(flow, "click", st, text="Nowhere") is None
+    assert st.click_hit_target is False
+
+
+def test_click_resolved_anchor_navlink_leaves_click_hit_target_false():
+    page = _ExecPage("https://co.example.com/")
+    nav = _ExecLoc(count=1, visible=True, text="Working with us", tag="a")
+    page._locators = {'a:has-text("Working with us")': nav}
+    flow = _offsite()
+    flow.context = _ExecCtxNoTab()
+    st = _SS(page, 'a:has-text("Working with us")', {}, False)
+    assert _exec(flow, "click", st, text="Working with us") is None
+    assert nav.clicks               # the link was clicked
+    assert st.click_hit_target is False
+
+
+def test_click_ahastext_fallback_to_navlink_reads_resolved_tag_not_selector():
+    # proposed selector is a non-`a` id that never resolves; the a:has-text()
+    # fallback lands on a real nav <a>. Old code scored anchor-ness off the
+    # proposed `#…` selector -> click_hit_target True -> a nav dead end looked
+    # form-engaged. Must be False.
+    page = _ExecPage("https://co.example.com/")
+    nav = _ExecLoc(count=1, visible=True, text="Open roles", tag="a")
+    page._locators = {'a:has-text("Open roles")': nav}
+    flow = _offsite()
+    flow.context = _ExecCtxNoTab()
+    st = _SS(page, "#apply-cta", {}, False)
+    assert _exec(flow, "click", st, text="Open roles") is None
+    assert nav.clicks
+    assert st.click_hit_target is False
+
+
+def test_click_ahastext_fallback_to_button_sets_click_hit_target():
+    page = _ExecPage("https://co.example.com/")
+    btn = _ExecLoc(count=1, visible=True, text="Show the form", tag="button")
+    page._locators = {'button:has-text("Show the form")': btn}
+    flow = _offsite()
+    flow.context = _ExecCtxNoTab()
+    st = _SS(page, "#missing", {}, False)
+    assert _exec(flow, "click", st, text="Show the form") is None
+    assert btn.clicks
+    assert st.click_hit_target is True
 
 
 # ══════════════════════════════════════════════════════════════════════════
