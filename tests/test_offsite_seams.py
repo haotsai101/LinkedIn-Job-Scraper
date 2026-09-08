@@ -634,6 +634,99 @@ def test_execute_select_plain_selector_unchanged():
     assert st.selector == "#country"
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# _safe_selector — bare #id / tag#id -> [id="…"] attribute-form rewrite  (T44)
+# ══════════════════════════════════════════════════════════════════════════
+#
+# React 18 useId() emits colon-wrapped ids (react-select-:Rxxx:-input). A bare
+# "#…:…" selector is invalid CSS and Playwright's engine raises SyntaxError, so
+# every react-select field on the form is unfillable. _safe_selector rewrites
+# any bare #id whose id is not a valid bare CSS identifier to the quoted
+# attribute form; compound selectors (a combinator present) pass through.
+
+_safe = linkedin_apply._safe_selector
+
+
+def test_safe_selector_react_useid_colon_id_rewritten():
+    # the exact live failure (Lumenalta job 8, T44)
+    assert _safe("#react-select-:Rehufl7rrrrlcq:-input") == \
+        '[id="react-select-:Rehufl7rrrrlcq:-input"]'
+
+
+def test_safe_selector_leading_digit_id_same_as_before():
+    # the pre-existing #<digit> case must produce an identical result
+    assert _safe("#1foo") == '[id="1foo"]'
+
+
+def test_safe_selector_tag_qualified_colon_id_keeps_tag():
+    assert _safe("input#:r5:") == 'input[id=":r5:"]'
+
+
+def test_safe_selector_plain_id_untouched():
+    assert _safe("#normal-id") == "#normal-id"
+    assert _safe("input#country") == "input#country"
+
+
+def test_safe_selector_compound_selector_passes_through():
+    # documented limitation: anything with a combinator is left alone
+    assert _safe("#normal-id > span") == "#normal-id > span"
+    assert _safe("#a .b") == "#a .b"
+
+
+def test_safe_selector_dot_in_id_rewritten():
+    assert _safe("#id-with.dot") == '[id="id-with.dot"]'
+
+
+def test_safe_selector_escapes_quote_and_backslash_in_id():
+    assert _safe('#id-with"quote') == '[id="id-with\\"quote"]'
+    assert _safe('#id\\slash') == '[id="id\\\\slash"]'
+    # both in one id — regresses if the two .replace() calls are reordered
+    # (backslash must be doubled *before* the quote is escaped)
+    assert _safe(r'#a\b"c') == r'[id="a\\b\"c"]'
+
+
+def test_safe_selector_non_id_selector_untouched():
+    assert _safe('[name="x"]') == '[name="x"]'
+    assert _safe("div.card") == "div.card"
+    assert _safe("") == ""
+
+
+def test_execute_fill_colon_id_selector_targets_the_right_locator():
+    # end-to-end through _execute_action's fill branch: the colon id must reach
+    # page.locator() already normalised to [id="…"] — never raw (SyntaxError).
+    # A react-select combobox (as on the live Lumenalta form) so the fill branch
+    # takes the React-Select path and commits the value into forced_filled.
+    field = _ExecLoc(count=1, visible=True, tag="input",
+                     attrs={"id": "react-select-:R1abc:-input", "role": "combobox"},
+                     input_value="")
+    page = _ExecPage("https://ats.example.com/form")
+    page._locators = {'[id="react-select-:R1abc:-input"]': field}
+    ff = {}
+    flow = _offsite()
+    st = _SS(page, "#react-select-:R1abc:-input", ff, False)
+    # no SyntaxError, controlled return
+    assert _exec(flow, "fill", st, value="United States") is None
+    # the normalised [id="…"] locator resolved to our field and got filled —
+    # a raw "#…:…:-input" would have raised SyntaxError in page.locator()
+    assert field.filled == ["United States"]
+    # normalised form written back to history (consistent with `select` branch)
+    assert st.selector == '[id="react-select-:R1abc:-input"]'
+
+
+def test_execute_select_colon_id_selector_targets_the_right_locator():
+    # the `select` twin of the fill test — the LLM can emit a `select` action
+    # against the same react-select combobox ids (T44 reviewer follow-up).
+    field = _ExecLoc(count=1, visible=True, tag="input",
+                     attrs={"id": "react-select-:R1abc:-input"})
+    page = _ExecPage("https://ats.example.com/form")
+    page._locators = {'[id="react-select-:R1abc:-input"]': field}
+    flow = _offsite()
+    st = _SS(page, "#react-select-:R1abc:-input", {}, False)
+    # no SyntaxError at page.locator(); normalised form recorded for history
+    assert _exec(flow, "select", st, value="Yes") is None
+    assert st.selector == '[id="react-select-:R1abc:-input"]'
+
+
 # ── fill: CAPTCHA-exception guard returns "skipped" ─────────────────────
 
 def test_execute_fill_captcha_exception_returns_skipped():
