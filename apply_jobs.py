@@ -117,6 +117,7 @@ _OFFSITE_SPAM = (
     "jobright.ai", "sundayy.com", "scale.jobs", "dice.com",
     "mercor.com", "remotehunter.com", "haystack.cv", "talentally.com",
     "micro1.ai", "tenex.ai", "bestjobtool.com", "fetchjobs.co",
+    "torentify.com",  # aggregator; Apply Now -> jooble.org -> talent.com / bot wall (T46)
     "alignerr.com", "app.dataannotation.tech",
     "theladders.com", "hiresome.ai",
     # Assessment / crossover platforms — not real direct-hire jobs
