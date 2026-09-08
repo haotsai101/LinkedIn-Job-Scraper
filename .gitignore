@@ -14,6 +14,10 @@ linkedin-job-scraper/
 # Prevent accidental upload of login info
 /logins.csv
 
+# LinkedIn Playwright session state (live cookies — T17). One per search account:
+# storage_state_<sha1(email)[:12]>.json, written next to linkedin_jobs.db.
+storage_state*.json
+
 # LLM credentials and user profile (sensitive)
 /.env
 /user_profile.json

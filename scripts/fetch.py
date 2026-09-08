@@ -1,23 +1,21 @@
-import random
-from selenium import webdriver
-from selenium.webdriver.common.by import By
 import time
-import requests
+
 import pandas as pd
+import requests
 import tenacity
 
-from scripts.helpers import strip_val, get_value_by_path
-
-
-BROWSER = 'edge'
+from scripts import linkedin_auth
+from scripts.helpers import get_value_by_path, strip_val
 
 
 class VoyagerAuthError(Exception):
     """Raised on an HTTP 401 from the Voyager API — the session cookies are stale.
 
-    Not retryable: refreshing the session is PR 2's job (Selenium -> Playwright
-    cookie handling). For now this propagates with a clear message so the caller
-    knows a re-login is required rather than a transient network blip.
+    Not retryable at the ``_voyager_get`` layer (tenacity can't re-login — it only
+    has the request). The multi-account retrievers catch it once via
+    ``_ReauthMixin._get``: refresh that account's ``storage_state`` with a real
+    Playwright login, rebuild its ``requests.Session`` + headers, retry once. A
+    second consecutive 401 propagates.
     """
 
 
@@ -67,37 +65,6 @@ def _voyager_get(session, url, headers=None, timeout=30):
         )
     return resp
 
-def create_session(email, password):
-    if BROWSER == 'chrome':
-        driver = webdriver.Chrome()
-    elif BROWSER == 'edge':
-        driver = webdriver.Edge()
-
-    driver.get('https://www.linkedin.com/checkpoint/rm/sign-in-another-account')
-    time.sleep(1)
-    driver.find_element(By.ID, 'username').send_keys(email)
-    driver.find_element(By.ID, 'password').send_keys(password)
-    driver.find_element(By.CSS_SELECTOR, 'button.btn__primary--large[type="submit"]').click()
-    # Wait up to 30s for all auth redirect paths to clear
-    _auth_paths = ('/checkpoint', '/login', '/challenge', '/security')
-    print(f'[create_session] Waiting for login to complete for {email!r}...')
-    deadline = time.time() + 30
-    while time.time() < deadline:
-        if not any(p in driver.current_url for p in _auth_paths):
-            break
-        time.sleep(1)
-    if any(p in driver.current_url for p in _auth_paths):
-        driver.quit()
-        raise RuntimeError(f'Login failed or timed out for {email!r} — still on auth page: {driver.current_url}')
-    driver.get('https://www.linkedin.com/jobs/search/?')
-    time.sleep(1)
-    cookies = driver.get_cookies()
-    driver.quit()
-    session = requests.Session()
-    for cookie in cookies:
-        session.cookies.set(cookie['name'], cookie['value'])
-    return session
-
 def get_logins(method):
     logins = pd.read_csv('logins.csv')
     logins = logins[logins['method'] == method]
@@ -105,7 +72,49 @@ def get_logins(method):
     passwords = logins['passwords'].tolist()
     return emails, passwords
 
-class JobSearchRetriever:
+
+class _ReauthMixin:
+    """Shared multi-account session handling + one-shot 401 recovery.
+
+    Both retrievers hold ``self.sessions`` (one authenticated ``requests.Session``
+    per ``logins.csv`` account) and ``self.headers`` (the matching per-session
+    Voyager header dict). ``_init_accounts`` builds them from ``storage_state``
+    files — **no browser launch when a valid state file exists** (T17). ``_get``
+    wraps a Voyager call so a single ``VoyagerAuthError`` triggers a real
+    re-login for that one account and one retry; a second 401 propagates.
+
+    Subclasses must implement ``_make_headers(idx)``.
+    """
+
+    def _init_accounts(self, method):
+        self.emails, self.passwords = get_logins(method)
+        self.state_paths = [linkedin_auth.state_path_for(e) for e in self.emails]
+        self.sessions = [
+            linkedin_auth.get_session(e, p, sp)
+            for e, p, sp in zip(self.emails, self.passwords, self.state_paths, strict=True)
+        ]
+
+    def _make_headers(self, idx):  # pragma: no cover - overridden
+        raise NotImplementedError
+
+    def _reauth(self, idx):
+        """Refresh account ``idx``'s session in place via a real Playwright login."""
+        print(f'[fetch] 401 for {self.emails[idx]!r} — refreshing LinkedIn session')
+        linkedin_auth.login_and_save_state(
+            self.emails[idx], self.passwords[idx], self.state_paths[idx]
+        )
+        self.sessions[idx] = linkedin_auth.session_from_storage_state(self.state_paths[idx])
+        self.headers[idx] = self._make_headers(idx)
+
+    def _get(self, idx, url, headers=None):
+        """``_voyager_get`` for account ``idx`` with one re-auth + retry on 401."""
+        try:
+            return _voyager_get(self.sessions[idx], url, headers=headers or self.headers[idx])
+        except VoyagerAuthError:
+            self._reauth(idx)
+            return _voyager_get(self.sessions[idx], url, headers=self.headers[idx])
+
+class JobSearchRetriever(_ReauthMixin):
     def __init__(self, keywords="data", count: int = 100, filters: str = "sortBy:List(DD)", geo_id: str = ""):
         """Create a search retriever.
 
@@ -119,10 +128,13 @@ class JobSearchRetriever:
         query = f"keywords:{keywords}{geo_part},origin:JOB_SEARCH_PAGE_OTHER_ENTRY,selectedFilters:({filters}),spellCorrectionEnabled:true"
         # template with a {start} placeholder; get_jobs will replace start based on page
         self.job_search_link_template = f'https://www.linkedin.com/voyager/api/voyagerJobsDashJobCards?decorationId=com.linkedin.voyager.dash.deco.jobs.search.JobSearchCardsCollection-187&count={self.count}&q=jobSearch&query=({query})&start={{start}}'
-        emails, passwords = get_logins('search')
-        self.sessions = [create_session(email, password) for email, password in zip(emails, passwords)]
+        self._init_accounts('search')
         self.session_index = 0
-        self.headers = [{
+        self.headers = [self._make_headers(i) for i in range(len(self.sessions))]
+
+    def _make_headers(self, idx):
+        session = self.sessions[idx]
+        return {
             'Authority': 'www.linkedin.com',
             'Method': 'GET',
             # Note: 'Path' header is intentionally left out or will be overridden per-request to avoid stale start offsets
@@ -131,12 +143,12 @@ class JobSearchRetriever:
             'Accept-Encoding': 'gzip, deflate, br',
             'Accept-Language': 'en-US,en;q=0.9',
             'Cookie': "; ".join([f"{key}={value}" for key, value in session.cookies.items()]),
-            'Csrf-Token': session.cookies.get('JSESSIONID').strip('"'),
+            'Csrf-Token': linkedin_auth.csrf_token(session),
             # 'TE': 'Trailers',
-            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36',
+            'User-Agent': linkedin_auth.USER_AGENT,
             # 'X-Li-Track': '{"clientVersion":"1.12.7990","mpVersion":"1.12.7990","osName":"web","timezoneOffset":-7,"timezone":"America/Los_Angeles","deviceFormFactor":"DESKTOP","mpName":"voyager-web","displayDensity":1,"displayWidth":1920,"displayHeight":1080}'
-            'X-Li-Track': '{"clientVersion":"1.13.5589","mpVersion":"1.13.5589","osName":"web","timezoneOffset":-7,"timezone":"America/Los_Angeles","deviceFormFactor":"DESKTOP","mpName":"voyager-web","displayDensity":1,"displayWidth":360,"displayHeight":800}'
-        } for session in self.sessions]
+            'X-Li-Track': linkedin_auth.X_LI_TRACK,
+        }
 
     def get_jobs(self, page: int = 0):
         """Fetch job cards for the given page (0-based). Page 0 == start=0.
@@ -151,7 +163,7 @@ class JobSearchRetriever:
         if 'Path' in headers:
             headers.pop('Path')
 
-        results = _voyager_get(self.sessions[self.session_index], link, headers=headers)
+        results = self._get(self.session_index, link, headers=headers)
         self.session_index = (self.session_index + 1) % len(self.sessions)
 
         if results.status_code != 200:
@@ -171,17 +183,20 @@ class JobSearchRetriever:
 
         return job_ids
 
-class JobDetailRetriever:
+class JobDetailRetriever(_ReauthMixin):
     def __init__(self):
         self.error_count = 0
         self.job_details_link = "https://www.linkedin.com/voyager/api/jobs/jobPostings/{}?decorationId=com.linkedin.voyager.deco.jobs.web.shared.WebFullJobPosting-65"
-        emails, passwords = get_logins('details')
-        self.emails = emails
-        self.sessions = [create_session(email, password) for email, password in zip(emails, passwords)]
+        self._init_accounts('details')
         self.session_index = 0
         self.variable_paths = pd.read_csv('json_paths/data_variables.csv')
+        self.headers = [self._make_headers(i) for i in range(len(self.sessions))]
 
-        self.headers = [{
+        # self.proxies = [{'http': f'http://{proxy}', 'https': f'http://{proxy}'} for proxy in []]
+
+    def _make_headers(self, idx):
+        session = self.sessions[idx]
+        return {
             'Authority': 'www.linkedin.com',
             'Method': 'GET',
             'Path': '/voyager/api/search/hits?decorationId=com.linkedin.voyager.deco.jserp.WebJobSearchHitWithSalary-25&count=25&filters=List(sortBy-%3EDD,resultType-%3EJOBS)&origin=JOB_SEARCH_PAGE_JOB_FILTER&q=jserpFilters&queryContext=List(primaryHitType-%3EJOBS,spellCorrectionEnabled-%3Etrue)&start=0&topNRequestedFlavors=List(HIDDEN_GEM,IN_NETWORK,SCHOOL_RECRUIT,COMPANY_RECRUIT,SALARY,JOB_SEEKER_QUALIFIED,PRE_SCREENING_QUESTIONS,SKILL_ASSESSMENTS,ACTIVELY_HIRING_COMPANY,TOP_APPLICANT)',
@@ -190,28 +205,27 @@ class JobDetailRetriever:
             'Accept-Encoding': 'gzip, deflate, br',
             'Accept-Language': 'en-US,en;q=0.9',
             'Cookie': "; ".join([f"{key}={value}" for key, value in session.cookies.items()]),
-            'Csrf-Token': session.cookies.get('JSESSIONID').strip('"'),
+            'Csrf-Token': linkedin_auth.csrf_token(session),
             # 'TE': 'Trailers',
-            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36',
+            'User-Agent': linkedin_auth.USER_AGENT,
             # 'X-Li-Track': '{"clientVersion":"1.12.7990","mpVersion":"1.12.7990","osName":"web","timezoneOffset":-7,"timezone":"America/Los_Angeles","deviceFormFactor":"DESKTOP","mpName":"voyager-web","displayDensity":1,"displayWidth":1920,"displayHeight":1080}'
-            'X-Li-Track': '{"clientVersion":"1.13.5589","mpVersion":"1.13.5589","osName":"web","timezoneOffset":-7,"timezone":"America/Los_Angeles","deviceFormFactor":"DESKTOP","mpName":"voyager-web","displayDensity":1,"displayWidth":360,"displayHeight":800}'
-        } for session in self.sessions]
-
-        # self.proxies = [{'http': f'http://{proxy}', 'https': f'http://{proxy}'} for proxy in []]
+            'X-Li-Track': linkedin_auth.X_LI_TRACK,
+        }
 
 
     def get_job_details(self, job_ids):
         job_details = {}
         for job_id in job_ids:
             error = False
-            # VoyagerAuthError (401) is intentionally NOT caught here — a stale
-            # session is not a per-job problem, so it propagates with a clear
-            # message (session refresh is PR 2's concern).
+            # A single 401 is recovered inside ``_get`` (re-login + one retry for
+            # that account). A *second* consecutive 401 raises VoyagerAuthError,
+            # which is intentionally NOT caught here — a session that won't
+            # re-authenticate is not a per-job problem, so it propagates with a
+            # clear message.
             try:
-                details = _voyager_get(
-                    self.sessions[self.session_index],
+                details = self._get(
+                    self.session_index,
                     self.job_details_link.format(job_id),
-                    headers=self.headers[self.session_index],
                 )
             except (requests.exceptions.ConnectionError, requests.exceptions.Timeout,
                     VoyagerRetryableError) as exc:

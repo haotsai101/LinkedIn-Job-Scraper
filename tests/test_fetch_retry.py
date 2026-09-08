@@ -9,6 +9,7 @@ import pytest
 import requests
 
 import scripts.fetch as fetch
+import scripts.linkedin_auth as linkedin_auth
 from scripts.fetch import VoyagerAuthError, VoyagerRetryableError
 
 
@@ -100,6 +101,8 @@ def _detail_retriever(session):
     r.error_count = 0
     r.job_details_link = "https://voyager/{}"
     r.emails = ["acct@example.com"]
+    r.passwords = ["pw"]
+    r.state_paths = ["/tmp/does-not-exist-storage_state.json"]
     r.sessions = [session]
     r.session_index = 0
     r.headers = [{}]
@@ -115,11 +118,32 @@ def test_get_job_details_maps_persistent_5xx_to_sentinel():
     assert sess.calls == 4     # retried before giving up
 
 
-def test_get_job_details_propagates_401():
-    sess = FakeSession([FakeResp(401, text="unauthorized")])
+def test_get_job_details_reauths_once_on_401_then_succeeds(monkeypatch):
+    # First Voyager call 401s -> _reauth refreshes the session -> retry succeeds.
+    sess = FakeSession([FakeResp(401, text="stale"), FakeResp(200, json_data={"ok": 1})])
     r = _detail_retriever(sess)
+
+    calls = {"login": 0}
+    monkeypatch.setattr(linkedin_auth, "login_and_save_state",
+                        lambda *a, **k: calls.__setitem__("login", calls["login"] + 1))
+    monkeypatch.setattr(linkedin_auth, "session_from_storage_state", lambda _p: sess)
+    monkeypatch.setattr(fetch.JobDetailRetriever, "_make_headers", lambda self, idx: {})
+
+    out = r.get_job_details([42])
+    assert out == {42: {"ok": 1}}
+    assert calls["login"] == 1
+    assert sess.calls == 2
+
+
+def test_get_job_details_propagates_401_after_second_consecutive_401(monkeypatch):
+    sess = FakeSession([FakeResp(401, text="stale"), FakeResp(401, text="still stale")])
+    r = _detail_retriever(sess)
+    monkeypatch.setattr(linkedin_auth, "login_and_save_state", lambda *a, **k: None)
+    monkeypatch.setattr(linkedin_auth, "session_from_storage_state", lambda _p: sess)
+    monkeypatch.setattr(fetch.JobDetailRetriever, "_make_headers", lambda self, idx: {})
     with pytest.raises(VoyagerAuthError):
         r.get_job_details([42])
+    assert sess.calls == 2
 
 
 def test_get_job_details_happy_path():
