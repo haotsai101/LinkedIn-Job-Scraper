@@ -407,13 +407,24 @@ New `tests/test_session_blocked_domains.py` (15 cases): operator row blocks end-
 
 ## T17 — Scraper cleanup
 
-**Phase:** 5 · **Risk:** medium · **Deps:** T12
+**Phase:** 5 · **Risk:** medium · **Deps:** T12 · **Status:** 🔨 in progress — split into 2 PRs.
 
-- Replace the `while True: time.sleep()` bodies of `search_retriever.py` / `details_retriever.py` with thin wrappers over the existing Dagster ops; add `tenacity` retry/backoff around the Voyager calls in `scripts/fetch.py`.
+**PR 1 (loop cleanup + tenacity) — done.** Extracted the core retrieval loop of each
+standalone script into `scripts/retrieval.py` (`run_search` / `run_detail_enrichment`),
+the single source of truth now called by BOTH the standalone scripts AND the Dagster
+ops (`search_jobs_op` / `fetch_job_details_op`). The scripts are thin `argparse` wrappers
+(`--target` / `--max-rounds`; `--max-updates` / `--sleep`) with no `while True`. Added
+`tenacity` (`pyproject.toml`) retry/backoff (`wait_exponential` 2s→60s, 4 attempts) around
+the Voyager `requests` calls in `scripts/fetch.py` via `_voyager_get`: retries
+ConnectionError / Timeout / HTTP 429 / HTTP 5xx; a 401 raises `VoyagerAuthError`
+immediately (no retry — session refresh is PR 2). Tests: `tests/test_retrieval.py`,
+`tests/test_fetch_retry.py`.
+
+**PR 2 (Selenium → Playwright cookies + drop selenium) — pending.**
 - Move cookie extraction from Selenium to Playwright with a persisted `storage_state.json`, refreshed only on 401.
 - Drop `selenium` from deps if nothing else uses it.
 
-**Acceptance:** no `while True` in the standalone scripts; `tenacity` wraps the network calls; a discovery run works without launching Selenium when a valid `storage_state.json` exists.
+**Acceptance:** no `while True` in the standalone scripts ✅ (PR 1); `tenacity` wraps the network calls ✅ (PR 1); a discovery run works without launching Selenium when a valid `storage_state.json` exists (PR 2).
 
 ---
 
