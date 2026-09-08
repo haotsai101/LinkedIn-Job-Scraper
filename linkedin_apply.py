@@ -752,18 +752,16 @@ def _get_profile_value(profile: dict, label: str, kind: str = "text") -> str | N
     # the whole location line, not just the city or the state. Checked BEFORE the
     # zip, street-address and state-of-residence branches, each of which would
     # otherwise win on ordering: "City, State, Zip" hits the zip branch, and a
-    # plain "City, State" hits the state-of-residence branch. Falls through when
-    # the profile has no location string, so the individual branches / the LLM
-    # still get a shot rather than the field being filled with "". The "relocat"
-    # guard mirrors the city/location branch below. \bcity\b + \bstate\b already
-    # covers "City / State", "City and State", "City, State, Zip" and
-    # "City, State (Country)" (',', '/', whitespace and '(' are word boundaries);
-    # the phrase tuple is a belt-and-suspenders fallback.
-    if (
-        (re.search(r'\bcity\b', l) and re.search(r'\bstate\b', l))
-        or any(k in l for k in ("city, state", "city/state", "city / state", "city and state"))
-    ) and "relocat" not in l and p.get("location"):
-        return p.get("location")
+    # plain "City, State" hits the state-of-residence branch. \bcity\b + \bstate\b
+    # covers every combined phrasing on its own ("City / State", "City and State",
+    # "City, State, Zip", "City, State (Country)" — ',', '/', whitespace and '('
+    # are all word boundaries). Falls through (to the individual branches / the
+    # LLM) when the profile has no usable location string, so the field is never
+    # filled with "" / whitespace. The "relocat" guard mirrors the city/location
+    # branch below.
+    _location = (p.get("location") or "").strip()
+    if re.search(r'\bcity\b', l) and re.search(r'\bstate\b', l) and "relocat" not in l and _location:
+        return _location
     if any(k in l for k in ("zip", "postal")):
         return p.get("zip_code")
     if any(k in l for k in ("address line 1", "street address", "address 1", "street")):
