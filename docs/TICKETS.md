@@ -425,7 +425,11 @@ immediately (no retry — session refresh is PR 2). Tests: `tests/test_retrieval
   fails with `LinkedInLoginError` on a 2-FA/CAPTCHA/checkpoint stall instead of hanging), writes a
   Playwright `storage_state` JSON (chmod 0600).
 - `session_from_storage_state(path)` — builds an authenticated `requests.Session` from that JSON
-  with **no browser launch**; cookies loaded with domain/path, `Csrf-Token` derived from `JSESSIONID`.
+  with **no browser launch**; cookies loaded with domain/path. Nothing set on `session.headers`
+  (that would reorder the on-the-wire Voyager header keys); the retrievers build the full
+  per-request dict, sourcing `Csrf-Token` from `linkedin_auth.csrf_token()` and the `Cookie`
+  header from `linkedin_auth.cookie_header()` (dedupes multi-domain cookie crumbs). Wire parity
+  vs. the old Selenium path is locked by `test_voyager_request_header_order_and_cookie_string_match_master`.
 - `get_session(email, password, path)` — loads the state file if present (no browser), else logs in once.
 - Per-account state files: `storage_state_<sha1(email)[:12]>.json` next to `linkedin_jobs.db`
   (override dir via `$LINKEDIN_STATE_DIR`). `.gitignore`: `storage_state*.json`.

@@ -24,9 +24,11 @@ hanging. The two are deliberately kept separate; this module is scraper-scoped.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
+import tempfile
 from pathlib import Path
 
 import requests
@@ -69,7 +71,7 @@ def state_path_for(email: str, base_dir: str | os.PathLike | None = None) -> Pat
     default, or under ``$LINKEDIN_STATE_DIR`` / ``base_dir`` if set. The email is
     lower-cased and stripped before hashing so ``A@x.com`` and ``a@x.com`` share
     one file. The filename carries no PII (hash only); the file contents are live
-    cookies and are gitignored (``storage_state*.json``).
+    cookies and are gitignored (``storage_state*``).
     """
     base = Path(base_dir or os.environ.get("LINKEDIN_STATE_DIR") or ".")
     digest = hashlib.sha1(email.strip().lower().encode()).hexdigest()[:12]
@@ -84,6 +86,7 @@ def _playwright_login(email: str, password: str, *, headless: bool) -> dict:
     without touching the file-writing / validation logic.
     """
     try:
+        from playwright.sync_api import Error as PWError
         from playwright.sync_api import TimeoutError as PWTimeoutError
         from playwright.sync_api import sync_playwright
     except ImportError as exc:  # pragma: no cover - playwright is a hard dep in prod
@@ -92,35 +95,46 @@ def _playwright_login(email: str, password: str, *, headless: bool) -> dict:
             "`playwright install chromium`"
         ) from exc
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=headless)
-        try:
-            context = browser.new_context(user_agent=USER_AGENT)
-            page = context.new_page()
-            page.set_default_navigation_timeout(_NAV_TIMEOUT_MS)
-            page.set_default_timeout(_NAV_TIMEOUT_MS)
-
-            page.goto(_LOGIN_URL, wait_until="domcontentloaded")
-            page.fill("#username", email)
-            page.fill("#password", password)
-            page.click('button.btn__primary--large[type="submit"]')
-
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=headless)
             try:
-                page.wait_for_url(
-                    lambda url: "linkedin.com" in url
-                    and not any(frag in url for frag in _AUTH_PATHS),
-                    timeout=_NAV_TIMEOUT_MS,
-                )
-            except PWTimeoutError as exc:
-                raise LinkedInLoginError(
-                    f"login for {email!r} did not complete within "
-                    f"{_NAV_TIMEOUT_MS // 1000}s — still on {page.url!r} "
-                    f"(2-FA / CAPTCHA / checkpoint?)"
-                ) from exc
+                context = browser.new_context(user_agent=USER_AGENT)
+                page = context.new_page()
+                page.set_default_navigation_timeout(_NAV_TIMEOUT_MS)
+                page.set_default_timeout(_NAV_TIMEOUT_MS)
 
-            state = context.storage_state()
-        finally:
-            browser.close()
+                page.goto(_LOGIN_URL, wait_until="domcontentloaded")
+                page.fill("#username", email)
+                page.fill("#password", password)
+                page.click('button.btn__primary--large[type="submit"]')
+
+                try:
+                    page.wait_for_url(
+                        lambda url: "linkedin.com" in url
+                        and not any(frag in url for frag in _AUTH_PATHS),
+                        timeout=_NAV_TIMEOUT_MS,
+                    )
+                except PWTimeoutError as exc:
+                    raise LinkedInLoginError(
+                        f"login for {email!r} did not complete within "
+                        f"{_NAV_TIMEOUT_MS // 1000}s — still on {page.url!r} "
+                        f"(2-FA / CAPTCHA / checkpoint?)"
+                    ) from exc
+
+                state = context.storage_state()
+            finally:
+                browser.close()
+    except LinkedInLoginError:
+        raise
+    except PWError as exc:
+        # Most common on a fresh box: the Chromium binary isn't installed, so
+        # p.chromium.launch() raises a bare playwright Error. Don't let that
+        # traceback escape a Dagster op / _reauth — surface the fix.
+        raise LinkedInLoginError(
+            f"Playwright could not run the LinkedIn login for {email!r}: {exc} "
+            "(if the browser binary is missing, run `playwright install chromium`)"
+        ) from exc
 
     return state
 
@@ -153,12 +167,18 @@ def login_and_save_state(
 
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    # 0600 — this file is a live session credential.
-    path.write_text(json.dumps(state))
+    # This file is a live session credential: create it 0600 from the start
+    # (mkstemp does that) and swap it in atomically, so a reader never sees a
+    # half-written or briefly world-readable file.
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f"{path.name}.", suffix=".tmp")
     try:
-        path.chmod(0o600)
-    except OSError:  # pragma: no cover - non-POSIX / weird fs
-        pass
+        with os.fdopen(fd, "w") as fh:
+            fh.write(json.dumps(state))
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
 
 
 def csrf_token(session: requests.Session) -> str:
@@ -172,18 +192,23 @@ def csrf_token(session: requests.Session) -> str:
     raise LinkedInLoginError("session has no JSESSIONID cookie — state file is stale")
 
 
-def _voyager_headers(session: requests.Session) -> dict:
-    """The static Voyager header block, with ``Csrf-Token`` derived from the
-    session's ``JSESSIONID``. Kept in parity with the per-request header dicts
-    the retrievers build (scripts/fetch.py) — no extra headers vs. the old
-    Selenium path. Cookies ride on the session jar."""
-    return {
-        "Accept": "application/vnd.linkedin.normalized+json+2.1",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Csrf-Token": csrf_token(session),
-        "User-Agent": USER_AGENT,
-        "X-Li-Track": X_LI_TRACK,
-    }
+def cookie_header(session: requests.Session) -> str:
+    """``Cookie:`` header value for a Voyager request — one crumb per name.
+
+    A real Playwright ``storage_state`` carries several cookies (``JSESSIONID``,
+    ``bcookie``, ``lidc``, ``lang`` …) on *both* ``.linkedin.com`` and
+    ``.www.linkedin.com``. Iterating the jar yields every crumb, which would
+    repeat names in the header (``JSESSIONID=x; …; JSESSIONID=x``). Every
+    LinkedIn cookie domain matches the Voyager host ``www.linkedin.com``, so we
+    collapse to a single crumb per name. The jar iterates grouped by domain, so
+    ``.www.linkedin.com`` (the more specific host match) is seen last and wins —
+    matching what a browser would send, and de-duped like the old Selenium
+    ``session.cookies.set(name, value)`` loop.
+    """
+    crumbs: dict[str, str] = {}
+    for cookie in session.cookies:
+        crumbs[cookie.name] = cookie.value
+    return "; ".join(f"{name}={value}" for name, value in crumbs.items())
 
 
 def session_from_storage_state(path: str | os.PathLike) -> requests.Session:
@@ -191,9 +216,11 @@ def session_from_storage_state(path: str | os.PathLike) -> requests.Session:
     ``storage_state`` JSON. **No browser launch.**
 
     Cookies are loaded with their domain / path so ``requests`` sends them to
-    ``www.linkedin.com``; the Voyager headers (incl. ``Csrf-Token``) are set on
-    the session. Raises :class:`LinkedInLoginError` if the file is missing a
-    usable ``JSESSIONID`` (the caller re-authenticates).
+    ``www.linkedin.com``. Nothing is put on ``session.headers`` — the retrievers
+    build a complete per-request header dict (``scripts/fetch.py:_make_headers``)
+    and populating session defaults here would reorder the on-the-wire header
+    keys (a known anti-bot fingerprint). Raises :class:`LinkedInLoginError` early
+    if the file has no usable ``JSESSIONID`` (the caller re-authenticates).
     """
     path = Path(path)
     data = json.loads(path.read_text())
@@ -209,7 +236,7 @@ def session_from_storage_state(path: str | os.PathLike) -> requests.Session:
                 secure=c.get("secure", False),
             )
         )
-    session.headers.update(_voyager_headers(session))  # raises if no JSESSIONID
+    csrf_token(session)  # fail fast if the state file has no JSESSIONID
     return session
 
 
