@@ -748,6 +748,22 @@ def _get_profile_value(profile: dict, label: str, kind: str = "text") -> str | N
         return p.get("portfolio_url")
     if "website" in l and "personal" not in l:
         return p.get("website_url") or p.get("portfolio_url") or p.get("linkedin_url")
+    # T43: a combined "City, State" / "City/State" / "City and State" field wants
+    # the whole location line, not just the city or the state. Checked BEFORE the
+    # zip, street-address and state-of-residence branches, each of which would
+    # otherwise win on ordering: "City, State, Zip" hits the zip branch, and a
+    # plain "City, State" hits the state-of-residence branch. Falls through when
+    # the profile has no location string, so the individual branches / the LLM
+    # still get a shot rather than the field being filled with "". The "relocat"
+    # guard mirrors the city/location branch below. \bcity\b + \bstate\b already
+    # covers "City / State", "City and State", "City, State, Zip" and
+    # "City, State (Country)" (',', '/', whitespace and '(' are word boundaries);
+    # the phrase tuple is a belt-and-suspenders fallback.
+    if (
+        (re.search(r'\bcity\b', l) and re.search(r'\bstate\b', l))
+        or any(k in l for k in ("city, state", "city/state", "city / state", "city and state"))
+    ) and "relocat" not in l and p.get("location"):
+        return p.get("location")
     if any(k in l for k in ("zip", "postal")):
         return p.get("zip_code")
     if any(k in l for k in ("address line 1", "street address", "address 1", "street")):
