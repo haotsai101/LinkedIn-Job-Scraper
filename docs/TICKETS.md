@@ -407,7 +407,7 @@ New `tests/test_session_blocked_domains.py` (15 cases): operator row blocks end-
 
 ## T17 — Scraper cleanup
 
-**Phase:** 5 · **Risk:** medium · **Deps:** T12 · **Status:** 🔨 in progress — split into 2 PRs.
+**Phase:** 5 · **Risk:** medium · **Deps:** T12 · **Status:** ✅ fixed (both PRs) — pending QA (real scrape run).
 
 **PR 1 (loop cleanup + tenacity) — done.** Extracted the core retrieval loop of each
 standalone script into `scripts/retrieval.py` (`run_search` / `run_detail_enrichment`),
@@ -420,11 +420,27 @@ ConnectionError / Timeout / HTTP 429 / HTTP 5xx; a 401 raises `VoyagerAuthError`
 immediately (no retry — session refresh is PR 2). Tests: `tests/test_retrieval.py`,
 `tests/test_fetch_retry.py`.
 
-**PR 2 (Selenium → Playwright cookies + drop selenium) — pending.**
-- Move cookie extraction from Selenium to Playwright with a persisted `storage_state.json`, refreshed only on 401.
-- Drop `selenium` from deps if nothing else uses it.
+**PR 2 (Selenium → Playwright cookies + drop selenium) — done.** New `scripts/linkedin_auth.py`:
+- `login_and_save_state(email, password, path)` — headless Playwright login (30s nav timeout,
+  fails with `LinkedInLoginError` on a 2-FA/CAPTCHA/checkpoint stall instead of hanging), writes a
+  Playwright `storage_state` JSON (chmod 0600).
+- `session_from_storage_state(path)` — builds an authenticated `requests.Session` from that JSON
+  with **no browser launch**; cookies loaded with domain/path. Nothing set on `session.headers`
+  (that would reorder the on-the-wire Voyager header keys); the retrievers build the full
+  per-request dict, sourcing `Csrf-Token` from `linkedin_auth.csrf_token()` and the `Cookie`
+  header from `linkedin_auth.cookie_header()` (dedupes multi-domain cookie crumbs). Wire parity
+  vs. the old Selenium path is locked by `test_voyager_request_header_order_and_cookie_string_match_master`.
+- `get_session(email, password, path)` — loads the state file if present (no browser), else logs in once.
+- Per-account state files: `storage_state_<sha1(email)[:12]>.json` next to `linkedin_jobs.db`
+  (override dir via `$LINKEDIN_STATE_DIR`). `.gitignore`: `storage_state*.json`.
+- `scripts/fetch.py`: `create_session` (Selenium) removed; `_ReauthMixin` on both retrievers owns
+  401 recovery — one `VoyagerAuthError` → re-login that account + rebuild session/headers + retry once;
+  a 2nd consecutive 401 propagates. `selenium` dropped from `pyproject.toml` (nothing else imports it).
+- First real scrape run needs `playwright install chromium` once (noted in `CLAUDE.md` / README).
+- Tests: `tests/test_linkedin_auth.py` (cache-hit = no browser, cold login writes file, cookie/header
+  mapping, multi-domain `JSESSIONID`), `tests/test_fetch_retry.py` (401 re-auth + retry, 2nd 401 propagates).
 
-**Acceptance:** no `while True` in the standalone scripts ✅ (PR 1); `tenacity` wraps the network calls ✅ (PR 1); a discovery run works without launching Selenium when a valid `storage_state.json` exists (PR 2).
+**Acceptance:** no `while True` in the standalone scripts ✅ (PR 1); `tenacity` wraps the network calls ✅ (PR 1); a discovery run works without launching a browser when a valid `storage_state` file exists ✅ (PR 2 — `test_get_session_uses_cache_and_never_launches_browser`).
 
 ---
 

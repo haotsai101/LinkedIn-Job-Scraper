@@ -5,6 +5,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Commands
 
 ```bash
+# One-time setup: the scraper login and the apply agent both drive Chromium
+playwright install chromium
+
 # Dagster (recommended — runs all pipelines via UI at http://localhost:3000)
 DAGSTER_HOME=./.dagster_home dagster dev
 
@@ -79,7 +82,7 @@ When tickets are created (e.g. by the log-bug-detector agent after a run), follo
 
 ### Two-phase scraping pipeline
 
-**Phase 1 — Discovery** (`search_retriever.py`, `scripts/fetch.py:JobSearchRetriever`): Queries LinkedIn's internal Voyager API via authenticated `requests.Session` (cookies extracted by Selenium). Inserts new job IDs into the `jobs` table with minimal attributes and `scraped=0`.
+**Phase 1 — Discovery** (`search_retriever.py`, `scripts/fetch.py:JobSearchRetriever`): Queries LinkedIn's internal Voyager API via authenticated `requests.Session`. Session cookies come from `scripts/linkedin_auth.py`: a one-time headless Playwright login writes a per-account `storage_state_<hash>.json` next to `linkedin_jobs.db`; subsequent runs load that file with **no browser launch** (a 401 from Voyager triggers a single re-login + retry for that account). First run needs the Chromium binary — `playwright install chromium` once. Inserts new job IDs into the `jobs` table with minimal attributes and `scraped=0`.
 
 **Phase 2 — Enrichment** (`details_retriever.py`, `scripts/fetch.py:JobDetailRetriever`): Fetches full job attributes for every `scraped=0` row and sets `scraped=1`. This is rate-limit-sensitive and is designed to run with multiple accounts/proxies.
 
