@@ -5135,10 +5135,27 @@ class OffsiteApplyFlow:
                         print(f"  [LLM] Submit button not found: {selector!r} / {text!r}")
                 else:
                     clicked = False
+                    _clicked_anchor = False
                     for loc_str in loc_strs:
                         try:
                             el = page.locator(loc_str).first
                             if await el.count() > 0:
+                                # T45: decide nav-link-ness from the element that
+                                # actually resolved, not the LLM's proposed
+                                # `selector`. loc_strs falls back to
+                                # a:has-text()/[aria-label*=] locators, so a
+                                # non-`a` primary selector + `text` can still land
+                                # on a real <a> nav link and must not count as
+                                # form engagement. Read the live tag; on failure
+                                # fall back to the resolved locator string.
+                                try:
+                                    _tag = (await el.evaluate("e => e.tagName") or "").lower()
+                                except Exception:
+                                    _tag = ""
+                                _clicked_anchor = (
+                                    _tag == "a" if _tag
+                                    else loc_str.lstrip().startswith("a")
+                                )
                                 # Watch for new tab
                                 try:
                                     async with self.context.expect_page(timeout=3000) as npi:
@@ -5161,7 +5178,7 @@ class OffsiteApplyFlow:
                     # careers SPA) that only navigates; treating it as engagement
                     # makes a navigation dead end look like a mid-form stall and
                     # earns a pointless -2 retry every --reset-failed run.
-                    state.click_hit_target = clicked and not _is_anchor_only
+                    state.click_hit_target = clicked and not _clicked_anchor
         finally:
             # Terminal returns above unwind straight out; only the fall-through
             # path needs the new-tab / normalised-selector rebinds synced back.

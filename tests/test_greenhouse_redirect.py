@@ -69,8 +69,9 @@ class _QueryStub:
 
 
 class _FakeLocator:
-    def __init__(self, count=0, *, visible=True, text=""):
+    def __init__(self, count=0, *, visible=True, text="", tag="button"):
         self._count, self._visible, self._text = count, visible, text
+        self._tag = tag
 
     @property
     def first(self):
@@ -88,21 +89,36 @@ class _FakeLocator:
     async def inner_text(self):
         return self._text
 
-    async def click(self):
+    async def evaluate(self, js, *_a):
+        # _execute_action's click branch reads the resolved element's tag name
+        # (T45) to tell a nav <a> from a real control.
+        if "tagName" in js:
+            return self._tag
+        return ""
+
+    async def click(self, **_kw):
         return None
 
 
 class _FakePage:
-    def __init__(self, url, *, redirects=None):
+    def __init__(self, url, *, redirects=None, click_targets=None):
         self.url = url
         self._redirects = redirects or {}
         self.goto_calls: list[str] = []
+        # {selector-substring: tag} — a locator that RESOLVES (count 1) so the
+        # T45 click_hit_target branch is actually exercised. Every current
+        # _FakePage test resolves nothing (count 0), so `clicked` never goes
+        # True there.
+        self._click_targets = click_targets or {}
 
     async def goto(self, url, **_kw):
         self.goto_calls.append(url)
         self.url = self._redirects.get(url, url)
 
-    def locator(self, _selector):
+    def locator(self, selector):
+        for key, tag in self._click_targets.items():
+            if key in selector:
+                return _FakeLocator(1, tag=tag)
         return _FakeLocator(0)
 
     async def evaluate(self, _js):
@@ -344,6 +360,61 @@ def test_navlink_only_deadend_step_limit_returns_blocked(monkeypatch):
         return {"action": "click", "selector": f'a:has-text("Nav {box["i"]}")',
                 "text": f"Nav {box['i']}", "reason": "still hunting"}
     monkeypatch.setattr(linkedin_apply.OffsiteApplyFlow, "_decide_action", _decide)
+    flow = _offsite(application_url="https://www.medosync.com/careers")
+    out = asyncio.run(flow._llm_guided_apply(page))
+    assert out == "blocked"
+
+
+# ── T45 / PR #54 — click_hit_target end-to-end (resolving locator) ─────────
+#
+# The cases above all drive _FakePage.locator() -> count 0, so `clicked` never
+# goes True and the resolved-<a>-vs-resolved-<button> distinction is untested.
+# These use click_targets={} so the locator RESOLVES.
+
+def test_resolved_navlink_click_does_not_engage_form_stays_blocked(monkeypatch):
+    """The loop clicks a nav <a> that now RESOLVES (count 1) on a non-ATS host,
+    then trips the repeated-action guard. A resolved <a> is not form engagement
+    -> still blocked (-3). Regresses to "failed" if anchor-ness is misread."""
+    _install_common(monkeypatch, snapshot_fields=[])
+    monkeypatch.setattr(
+        linkedin_apply.OffsiteApplyFlow, "_decide_action",
+        _always({"action": "click", "selector": 'a:has-text("Working with us")',
+                 "text": "Working with us", "reason": "hunting for the apply form"}))
+    page = _FakePage("https://www.medosync.com/",
+                     click_targets={'a:has-text("Working with us")': "a"})
+    flow = _offsite(application_url="https://www.medosync.com/careers/backend-developer")
+    out = asyncio.run(flow._llm_guided_apply(page))
+    assert out == "blocked"
+
+
+def test_resolved_nonanchor_click_engages_form_repeated_action_is_failed(monkeypatch):
+    """The loop clicks a resolved <button> (a real control) on a non-ATS host,
+    then trips the repeated-action guard. That click engaged the form ->
+    "failed" (-2, retryable), not "blocked"."""
+    _install_common(monkeypatch, snapshot_fields=[])
+    monkeypatch.setattr(
+        linkedin_apply.OffsiteApplyFlow, "_decide_action",
+        _always({"action": "click", "selector": "#reveal-form",
+                 "text": "Show more details", "reason": "reveal the form"}))
+    page = _FakePage("https://www.medosync.com/careers/backend-developer",
+                     click_targets={"#reveal-form": "button"})
+    flow = _offsite(application_url="https://www.medosync.com/careers/backend-developer")
+    out = asyncio.run(flow._llm_guided_apply(page))
+    assert out == "failed"
+
+
+def test_ahastext_fallback_navlink_does_not_engage_form_stays_blocked(monkeypatch):
+    """Non-`a` primary selector that never resolves; the a:has-text("<text>")
+    fallback lands on a real nav <a>. Anchor-ness comes from the RESOLVED
+    locator (PR #54 review point 3) -> not engagement -> blocked (-3).
+    Old code (anchor-ness from the `#…` proposed selector) -> "failed"."""
+    _install_common(monkeypatch, snapshot_fields=[])
+    monkeypatch.setattr(
+        linkedin_apply.OffsiteApplyFlow, "_decide_action",
+        _always({"action": "click", "selector": "#nonexistent-apply-btn",
+                 "text": "Open roles", "reason": "trying to open the form"}))
+    page = _FakePage("https://www.medosync.com/",
+                     click_targets={'a:has-text("Open roles")': "a"})
     flow = _offsite(application_url="https://www.medosync.com/careers")
     out = asyncio.run(flow._llm_guided_apply(page))
     assert out == "blocked"
