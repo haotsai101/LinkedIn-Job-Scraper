@@ -172,3 +172,84 @@ def test_run_detail_enrichment_no_sleep_after_final_batch(db):
         log=lambda *_: None,
     )
     assert naps == []  # single batch cleared everything -> never slept
+
+
+# ── search adaptive-backoff formula ──────────────────────────────────────────
+#
+# The riskiest part of the T17 extraction: the per-page sleep in run_search is
+# NOT a fixed value, it carries state (`sleep_factor`, the `first` flag) across
+# iterations. These pin the exact formula against known inputs.
+#
+#   iteration 1 (first=True): no formula, nap = min(60, _SEARCH_BASE_SLEEP=3)
+#   iteration N>1:            per_job = sleep_factor / max(len(new), 1)
+#                             sleep_factor = min(per_job * non_sponsored * 0.75, 60)
+#                             nap = min(60, sleep_factor)
+
+def _batch(n_total, n_sponsored, first_id):
+    """A get_jobs() return value: n_total cards, n_sponsored of them promoted."""
+    return {
+        first_id + i: {"sponsored": i < n_sponsored, "title": "x"}
+        for i in range(n_total)
+    }
+
+
+def _install_scripted_searcher(monkeypatch, batches):
+    queue = list(batches)
+
+    class _Scripted:
+        def __init__(self, *, keywords, count, **kwargs):
+            pass
+
+        def get_jobs(self, page):
+            return queue.pop(0) if queue else {}
+
+    monkeypatch.setattr(retrieval, "JobSearchRetriever", _Scripted)
+
+
+def test_run_search_adaptive_backoff_formula(db, monkeypatch):
+    # one search config -> one get_jobs() per round, so the nap sequence is
+    # exactly [round1, round2].
+    _install_scripted_searcher(monkeypatch, [
+        _batch(4, 0, 500_000),    # round 1: 4 new, 4 non-promoted
+        _batch(10, 2, 600_000),   # round 2: 10 new, 8 non-promoted
+    ])
+    naps = []
+
+    retrieval.run_search(
+        db, db.cursor(),
+        target=None, max_rounds=2,
+        search_configs=[("solo", {})],
+        sleep_fn=lambda s: naps.append(s),
+        log=lambda *_: None,
+    )
+
+    # round 1: first iteration -> base sleep, untouched by the formula
+    assert naps[0] == retrieval._SEARCH_BASE_SLEEP == 3
+    # round 2: seconds_per_job = 3 / 10 = 0.3 ; 0.3 * 8 * 0.75 = 1.8
+    assert naps[1] == pytest.approx(1.8)
+
+
+def test_run_search_backoff_is_capped_at_60(db, monkeypatch):
+    # 99 of the round-2 ids already exist -> only 1 is "new" (tiny divisor) but
+    # total_non_sponsored is 100 -> raw factor 3/1 * 100 * 0.75 = 225, clamped.
+    db.executemany(
+        "INSERT INTO jobs (job_id, scraped) VALUES (?, 0)",
+        [(700_000 + i,) for i in range(99)],
+    )
+    db.commit()
+    _install_scripted_searcher(monkeypatch, [
+        _batch(3, 0, 500_000),          # round 1
+        _batch(100, 0, 700_000),        # round 2: ids 700_000..700_099
+    ])
+    naps = []
+
+    retrieval.run_search(
+        db, db.cursor(),
+        target=None, max_rounds=2,
+        search_configs=[("solo", {})],
+        sleep_fn=lambda s: naps.append(s),
+        log=lambda *_: None,
+    )
+
+    assert naps[1] == 60
+    assert all(n <= 60 for n in naps)

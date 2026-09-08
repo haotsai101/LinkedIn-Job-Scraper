@@ -16,6 +16,7 @@ from dagster import (
     DefaultScheduleStatus,
     DefaultSensorStatus,
     sensor,
+    RetryPolicy,
     RunRequest,
     SkipReason,
     get_dagster_logger,
@@ -27,6 +28,15 @@ from dagster import (
 from scripts.create_db import ensure_db_ready
 from scripts.retrieval import run_detail_enrichment, run_search
 from scripts.search_config import SEARCH_KEYWORDS
+
+# A Voyager outage that outlasts tenacity's ~4 attempts (~28s) should not kill
+# the whole 12h discovery cycle. Per-page / per-batch commits preserve earlier
+# progress, so a retried op resumes from where it left off (search re-fetches
+# pages that yielded rows already in the DB; details re-queries scraped=0).
+# Dagster's RetryPolicy has no exception filter, so a stale-session 401
+# (VoyagerAuthError) also gets these 2 retries before the run fails — still a
+# visible failure, just ~2min slower. Actual re-login is PR 2's job.
+_VOYAGER_RETRY_POLICY = RetryPolicy(max_retries=2, delay=60)
 
 logger = get_dagster_logger()
 
@@ -48,7 +58,8 @@ logger = get_dagster_logger()
             description="Max rounds to fetch. One round = one result page from "
             "each search config (remote + Utah).",
         ),
-    }
+    },
+    retry_policy=_VOYAGER_RETRY_POLICY,
 )
 def search_jobs_op(context) -> dict:
     """
@@ -98,7 +109,8 @@ def search_jobs_op(context) -> dict:
             default_value=30,
             description="Sleep time between batches in seconds.",
         ),
-    }
+    },
+    retry_policy=_VOYAGER_RETRY_POLICY,
 )
 def fetch_job_details_op(context) -> dict:
     """
@@ -129,16 +141,17 @@ def fetch_job_details_op(context) -> dict:
             log=logger.info,
         )
     except Exception as e:
-        logger.error(f"❌ Error fetching details: {e}")
-        cursor.execute("SELECT COUNT(*) FROM jobs WHERE scraped = 0")
-        remaining = cursor.fetchone()[0]
+        # A real failure: stale session (VoyagerAuthError), a Voyager outage
+        # that outlasted tenacity's retries (VoyagerRetryableError), or a DB
+        # error. Let it propagate — the Dagster run is marked FAILED, the
+        # retry_policy re-runs the op, and per-batch commits mean the re-run
+        # resumes from the still-pending scraped=0 rows. Consistent with
+        # search_jobs_op, which never swallowed either. (The old code returned
+        # an {"status": "error"} dict here, which left the run GREEN — the bug
+        # this review flagged for the 401 case, but true for any failure.)
+        logger.error(f"❌ Detail enrichment failed: {e}")
         conn.close()
-        return {
-            "updated_count": 0,
-            "remaining_jobs": remaining,
-            "status": "error",
-            "error": str(e),
-        }
+        raise
 
     conn.close()
     logger.info(f"✅ Detail enrichment complete: {result}")
