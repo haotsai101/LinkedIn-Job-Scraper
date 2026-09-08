@@ -107,11 +107,12 @@ except Exception:  # pragma: no cover
 
 _CRASH_MARKERS = (
     "target crashed",
+    "page crashed",
+    "renderer process crashed",
     "target page, context or browser has been closed",
     "target closed",
     "browser has been closed",
     "page has been closed",
-    "crashed",
 )
 
 

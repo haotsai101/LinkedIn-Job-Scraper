@@ -1208,19 +1208,22 @@ async def _recover_browser_if_crashed(browser, context, page, *, need_login,
     rarely, the context) unusable, so without this every subsequent job in the
     session also fails. Rebuild only what actually died:
 
-      * page healthy  → return it unchanged (cheap liveness probe, unless
-        ``suspect`` — a crash was already caught — in which case skip straight
-        to the repair).
+      * shared page healthy → return it unchanged. The liveness probe runs even
+        when ``suspect`` (a crash was caught this job) — the crash may have been
+        in a child tab while the shared page is fine, and rebuilding then would
+        needlessly drop a healthy page. ``suspect`` only skips the retry-wait.
       * page dead, context alive → open a fresh tab on the same context
         (keeps cookies / the LinkedIn login).
       * context dead → rebuild the context, re-login if the session needs it.
     """
-    if not suspect:
-        # Probe with one retry so a transient in-flight navigation isn't
-        # mistaken for a crash.
-        for _attempt in range(2):
-            if await _page_is_alive(page):
-                return context, page
+    # Probe the shared page. One retry (with a short wait) when NOT suspect, so a
+    # transient in-flight navigation isn't mistaken for a crash; when suspect,
+    # a single probe — we already know something crashed, just check if it was
+    # this page.
+    for _attempt in range(1 if suspect else 2):
+        if await _page_is_alive(page):
+            return context, page
+        if not suspect:
             await asyncio.sleep(0.5)
 
     # Fresh tab on the same context — the common case, cookies preserved.
@@ -1235,6 +1238,12 @@ async def _recover_browser_if_crashed(browser, context, page, *, need_login,
                         pass
             print("  [recover] Browser tab crashed — opened a fresh tab, session continues.")
             return context, new_page
+        # New tab isn't usable either → context is likely gone. Close the
+        # orphan before falling through to the full rebuild.
+        try:
+            await new_page.close()
+        except Exception:
+            pass
     except Exception:
         pass
 
