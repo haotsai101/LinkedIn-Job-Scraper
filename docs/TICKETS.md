@@ -14,7 +14,7 @@ Baseline captured 2026-08-28. `docs/baseline/db_state.baseline.txt` holds the DB
 | 4 — Phase 3 | ~~T15 browser-use spike~~ | **DROPPED** 2026-09-03 (owner: "skip all NIM-specific tasks, keep going with Agent SDK"). browser-use needs a working free NIM model; the whole tier is unreliable. `verify_submission` unification (T15's non-NIM half) folds into T33. |
 | 4/5 | **T33** — OffsiteApply flow reliability | ✅ **CLOSED** — merged (PR #25). Unified `verify_submission` (Rippling `/jobs?page=0` false-negative), blocked-domain jobs → `-3` not auto-fail. First pass at T31/T32; the rest split to their own PR (see `## T31 / T32`). |
 | 5 — Phase 4 | **T16b** — decompose `_llm_guided_apply` on the Agent SDK (primary OffsiteApply path) + retire `ScriptApplyEngine` | ✅ **CLOSED** 2026-09-05 — PR 1 (#30) + PR 2 (#31) merged, QA passed (live run: 3 real applications inc. multi-step Rippling, 2 correct `-3` blocks, 0 errors). `ScriptApplyEngine` gone; OffsiteApply is a single decomposed step-loop engine. |
-| 6 — Phase 5 | T17 — scraper cleanup | needs T12 ✓ |
+| 6 — Phase 5 | T17 — scraper cleanup | ✅ **CLOSED** 2026-09-09 — PR 1 (#61, loop consolidation + tenacity) + PR 2 (#62, Selenium→Playwright `storage_state`, `selenium` dropped). QA: cold headless login → 25 real jobs; warm path enriches 25 with no browser. |
 | Follow-ups | T19 ✅ + T24 ✅ (PR pending) · T22 ✅ (PR pending) · T21 **CLOSED** (#33) · T20 ✅ (PR pending) · T30 **CLOSED — superseded by T38** (NIM classifier now opt-in; Agent SDK is the default) | P2–P3 |
 
 **Direction change (2026-09-03):** T14b live-QA runs confirmed the Agent SDK classifier is 100% reliable where NIM's model isn't (T30), but NIM stays for OffsiteApply classification with the circuit breaker as the safety net. The browser-use spike (T15) is dropped — the free NIM tier can't host an agentic browser model reliably. Remaining apply-agent work goes straight to hardening + decomposing `_llm_guided_apply` on the Agent SDK.
@@ -407,7 +407,15 @@ New `tests/test_session_blocked_domains.py` (15 cases): operator row blocks end-
 
 ## T17 — Scraper cleanup
 
-**Phase:** 5 · **Risk:** medium · **Deps:** T12 · **Status:** ✅ fixed (both PRs) — pending QA (real scrape run).
+**Phase:** 5 · **Risk:** medium · **Deps:** T12 · **Status:** ✅ **CLOSED** — PR 1 (#61, `ac525ad`) + PR 2 (#62, `e49dfa4`), QA passed 2026-09-08/09.
+
+**QA (2026-09-08/09):**
+- **Cold `storage_state` scrape** (`python search_retriever.py --target 15`, no cached state file): headless Playwright login authenticated with no LinkedIn checkpoint; the Voyager API accepted the assembled headers/cookies → **25 real jobs discovered, page 1** (`[remote] 25/25 NEW … Reached target of 15 new jobs. Done.`). `storage_state_<hash>.json` written at `chmod 0600` (`-rw-------`), confirmed gitignored, `git status` clean.
+- **Warm path** (`python details_retriever.py --max-updates 25`, cached state present): **25 jobs enriched, 0 remaining**, **zero browser-launch signals** in the log — `session_from_storage_state` loaded cookies straight into the `requests.Session`, no Playwright.
+- The pre-T17 live-scrape crash (Selenium `driver.get` → 120s ChromeDriver `ReadTimeout`) is gone — `selenium` is no longer a dependency and nothing imports it.
+- 418 unit tests; the wire-parity regression test (`test_voyager_request_header_order_and_cookie_string_match_master`) verified by the reviewer to fail on the pre-fix commit.
+
+Acceptance met: no `while True` in the standalone scripts (the bounded loops live in `scripts/retrieval.py` with explicit `max_rounds` / target / exhaustion / `scraped=0`-empty exits); `tenacity` wraps the Voyager calls; a discovery run works with no browser when a valid `storage_state` exists.
 
 **PR 1 (loop cleanup + tenacity) — done.** Extracted the core retrieval loop of each
 standalone script into `scripts/retrieval.py` (`run_search` / `run_detail_enrichment`),
