@@ -55,7 +55,10 @@ from email.mime.text import MIMEText
 from pathlib import Path
 from urllib.parse import urlparse
 
-from openai import OpenAI
+try:  # `openai` is opt-in since T38 (NIM classifier route). Only the legacy
+    from openai import OpenAI  # `--setup` interview uses it — see nim_client.py.
+except ImportError:  # pragma: no cover
+    OpenAI = None  # type: ignore[assignment,misc]
 from playwright.async_api import async_playwright
 
 import config
@@ -1846,10 +1849,11 @@ def main():
     profile = load_profile()
     if profile is None or args.setup:
         # The profile-structuring interview is the only path that still uses the
-        # legacy OpenAI-compatible LLM_* endpoint; build the client lazily here
-        # so a missing LLM_API / LLM_URL never blocks --stats / --auto runs.
+        # legacy OpenAI-compatible LLM_* endpoint; the client is built lazily so
+        # a missing `openai` package (opt-in since T38) or LLM_API never blocks
+        # --stats / --auto runs.
         setup_client = None
-        if api_key and base_url:
+        if OpenAI is not None and api_key and base_url:
             try:
                 setup_client = OpenAI(api_key=api_key, base_url=base_url)
             except Exception as _oc_exc:
