@@ -140,6 +140,28 @@ def test_split_skill_string_strips_a_leading_conjunction():
     assert la._split_skill_string("Python, SQL") == ["Python", "SQL"]
 
 
+def test_years_of_skill_tier1_match_uses_the_tightened_boundary_class():
+    # PR #65 review: _resolve_years_of_skill's Tier-1 regex is the same anchored
+    # whole-token match as _anchored_in_bg and must share the "-"/"_" boundary
+    # chars — otherwise a listed 2-char skill ("Go") matches a hyphen fragment in
+    # the label ("a go-to methodology") and returns full tenure instead of "1".
+    prof = {
+        "current_title": "Software Engineer",
+        "headline": "",
+        "summary": "Backend engineer.",
+        "years_experience": 8,
+        "skills": "Go, Python",
+    }
+    hyphen_q = "years of experience with a go-to methodology"
+    assert la._resolve_years_of_skill(hyphen_q, "text", prof) == "1"
+    assert _gpv(prof, hyphen_q, "text") == "1"
+    # positive control: a real "years of Go experience" question for the same
+    # profile still Tier-1 matches the listed skill -> full tenure.
+    real_q = "how many years of go experience do you have?"
+    assert la._resolve_years_of_skill(real_q, "text", prof) == "8"
+    assert _gpv(prof, real_q, "text") == "8"
+
+
 def test_leading_and_in_skills_no_longer_hides_a_single_char_skill():
     # "...and R" used to land in skill_entries as "and r" != "r", so the exact
     # single-char skill check missed and "years of experience with R" was floored.

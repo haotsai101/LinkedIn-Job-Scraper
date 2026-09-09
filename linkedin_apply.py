@@ -904,9 +904,12 @@ def _resolve_years_of_skill(lbl: str, kind: str, p: dict) -> str:
         for _part in re.split(r"[/,]", str(_sk).lower())
         if len(_part.strip()) >= 2
     ]
-    # Tier 1: the question names a skill the applicant explicitly lists.
+    # Tier 1: the question names a skill the applicant explicitly lists. Same
+    # anchored whole-token match as _anchored_in_bg, incl. the "-"/"_" boundary
+    # chars (T48) so a 2-char skill token ("go", "ai", "r") can't match a hyphen
+    # fragment in the label ("...with a go-to approach" must not match skill "Go").
     for _part in _skill_parts:
-        if re.search(r"(?<![a-z0-9+#.])" + re.escape(_part) + r"(?![a-z0-9+#.])", lbl):
+        if re.search(r"(?<![a-z0-9+#.\-_])" + re.escape(_part) + r"(?![a-z0-9+#.\-_])", lbl):
             return str(_tot_years)
     # Tier 2: adjacency — a substantive word from the question (>=4 chars, not
     # application-form boilerplate) appears in the applicant's own background.
