@@ -10,8 +10,10 @@ import json
 import os
 import random
 import re
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import NamedTuple
 from urllib.parse import urlparse, parse_qs
 # Optional heavy dep: only needed when actually running an apply session. Guarded so
 # the module (and its pure helpers like _get_profile_value) can be imported in
@@ -659,6 +661,17 @@ _QUALIFIER_CONNECTIVES = {
 }
 
 
+def _split_skill_string(raw: str) -> list[str]:
+    """Split a string-form ``skills`` list on ``,`` / ``;`` and strip a leading
+    conjunction from each entry: ``"Python, Go, and R"`` -> ``["Python", "Go",
+    "R"]`` (T48 — an un-stripped ``"and R"`` never matched the exact single-char
+    skill check in :func:`_years_label_names_a_foreign_role_or_skill`, so
+    ``"years of experience with R"`` was mis-floored). Entries may be blank;
+    callers already filter those out.
+    """
+    return [s.strip().removeprefix("and ").strip() for s in re.split(r"[,;]", raw)]
+
+
 def _years_label_names_a_foreign_role_or_skill(l: str, profile: dict) -> bool:
     """True when a "years of experience" label pins the experience to a role,
     skill, or domain the applicant has **not** worked in ("...as a Lead",
@@ -703,14 +716,17 @@ def _years_label_names_a_foreign_role_or_skill(l: str, profile: dict) -> bool:
     # below ("...experience with R" for someone whose skills list has "R").
     _skills_raw = profile.get("skills") or []
     if isinstance(_skills_raw, str):
-        _skills_raw = re.split(r"[,;]", _skills_raw)
+        _skills_raw = _split_skill_string(_skills_raw)
     skill_entries = {str(s).strip().lower() for s in _skills_raw if str(s).strip()}
 
     def _anchored_in_bg(token: str) -> bool:
         # Whole-token match against the profile text, not a substring: "go"
-        # matches "Go" / "and Go," but not "golang" or "category".
+        # matches "Go" / "and Go," but not "golang" or "category". The boundary
+        # class includes "-" and "_" (T48) so a 2-char token can't match a
+        # hyphen fragment ("go" in "go-to", "co" in "co-founder", "ai" in
+        # "ai-driven") — common résumé-prose conjunctive prefixes.
         return bool(re.search(
-            r'(?<![a-z0-9+#.])' + re.escape(token) + r'(?![a-z0-9+#.])', bg))
+            r'(?<![a-z0-9+#.\-_])' + re.escape(token) + r'(?![a-z0-9+#.\-_])', bg))
 
     for span in spans:
         # Whole-span match first: a multi-token acronym pair ("ai/ml", "ai ml",
@@ -745,8 +761,648 @@ def _years_label_names_a_foreign_role_or_skill(l: str, profile: dict) -> bool:
     return False
 
 
+# ── _get_profile_value: ordered (matcher, resolver) rule table (T47) ───────────
+#
+# Historically a ~80-branch sequential `if` cascade over the normalized label +
+# `kind`. Every rule added in T40/T41/T42/T43 had to reason about *global* branch
+# ordering to keep an earlier branch from stealing a label. T47 makes that
+# ordering a single explicit list: `_PROFILE_VALUE_RULES` is iterated once, and
+# the first rule whose `.matches(lbl, kind, p)` is True returns its
+# `.resolve(lbl, kind, p)` — exactly reproducing "first matching `if` wins".
+#
+# Fall-through semantics: in the original cascade, *every* branch whose `if`
+# condition was true executed a `return`. There is no "matched the label but fell
+# through to a later branch" case that is not already encoded in the `if`
+# condition itself. So a data-conditional branch such as the T43 combined
+# City/State rule (`... and _location`) or the T40 bare-years rule (`... and not
+# _years_label_names_a_foreign_role_or_skill(...)`) simply folds that condition
+# into `.matches`: a data-less / foreign-qualifier profile fails the matcher and
+# iteration continues to the next rule — identical to the old `if` being False.
+
+_SELECTISH_KINDS = ("select", "select-one", "select-multiple", "radio", "checkbox")
+_CHOICE_KINDS = ("select", "select-one", "radio")
+
+# Residency-exclusion question building blocks (combinatorial verb × region).
+_RESIDE_VERBS = ("reside in", "based in", "located in", "live in")
+_EXCL_REGIONS = ("mexico", "latin", "south america", "central america")
+
+# Multi-word location phrases matched as plain substrings. The bare word "city"
+# is matched on a \bcity\b boundary instead (T41 — a substring test also fires
+# inside "capacity").
+_LOC_PHRASES = ("location", "where are you", "your location", "current location",
+                "what is your current location", "city, state", "city/state")
+
+# AI / ML stack keywords: a text/number field naming one of these resolves to the
+# "1" floor — unless it is a "years of <foreign AI skill>" question, which drops
+# to the tiered years rule to be floored consistently there (T40).
+_AI_SKILL_KEYWORDS = (
+    "generative ai", "gen ai", "llm", "large language model",
+    "multimodal", "agentic", "rag", "retrieval augmented",
+    "vector database", "embedding", "fine tun",
+    "artificial intelligence", " ai ", "machine learning", "deep learning",
+    "neural network", "natural language", "nlp", "computer vision",
+    "data science", "data scientist", "model training", "model development",
+    "model deployment", "ai/ml", "ai agent", "ai engineer", "prompt engineer",
+    "transformer", "diffusion model", "reinforcement learning",
+)
+
+# Social / platform URL fields we hold no value for — return "" so the LLM
+# fallback cannot fabricate a handle.
+_UNKNOWN_SOCIAL = (
+    "twitter", "x.com", "x handle", "x profile",
+    "facebook", "instagram", "tiktok", "youtube",
+    "medium.com", "substack", "blog url", "blog link",
+    "stackoverflow", "stack overflow",
+    "behance", "dribbble", "devpost", "kaggle",
+    "other url", "other link", "other social", "other profile",
+    "personal url", "social media url", "social profile",
+)
+
+
+class _ProfileRule(NamedTuple):
+    """One entry in the ordered ``_PROFILE_VALUE_RULES`` table.
+
+    ``matches(label, kind, profile) -> bool`` — the (former) ``if`` condition.
+    ``resolve(label, kind, profile) -> str | None`` — the (former) ``return``
+    expression; ``None`` is a valid resolved value and still stops iteration
+    (e.g. an unknown-social field resolves to ``""``, a cover-letter field to
+    ``None``).
+    """
+
+    name: str
+    matches: Callable[[str, str, dict], bool]
+    resolve: Callable[[str, str, dict], "str | None"]
+
+
+def _is_years_query(lbl: str) -> bool:
+    """Label asks about a span of time ("years of", "how many months", …).
+
+    Formerly the ``_is_years_q`` local; gates the LinkedIn/GitHub URL rules and
+    the AI-skills rule so a "years of experience with LinkedIn's API" style
+    question is not answered with a profile URL.
+    """
+    return any(k in lbl for k in
+               ("years of", "how many years", "how many months", "years experience"))
+
+
+def _is_bare_years_experience(lbl: str) -> bool:
+    """Label is an *overall* "years of experience" question — optionally with a
+    filler adjective ("years of professional experience") but with no concrete
+    role/skill/domain qualifier. Formerly the ``_bare_years_exp`` local.
+    """
+    return (
+        any(k in lbl for k in ("years of experience", "years experience", "total experience"))
+        or any(f"years of {f} experience" in lbl for f in _BARE_EXPERIENCE_FILLERS)
+        or any(f"years {f} experience" in lbl for f in _BARE_EXPERIENCE_FILLERS)
+    )
+
+
+def _full_name_parts(p: dict) -> list[str]:
+    return (p.get("full_name") or "").split()
+
+
+def _resolve_resume(lbl: str, kind: str, p: dict) -> "str | None":
+    raw = p.get("resume_path", "")
+    if raw:
+        return os.path.abspath(raw) if not os.path.isabs(raw) else raw
+    return None
+
+
+def _resolve_first_name(lbl: str, kind: str, p: dict) -> "str | None":
+    parts = _full_name_parts(p)
+    return parts[0] if parts else None
+
+
+def _resolve_last_name(lbl: str, kind: str, p: dict) -> "str | None":
+    parts = _full_name_parts(p)
+    return parts[-1] if len(parts) > 1 else (parts[0] if parts else None)
+
+
+def _resolve_years_of_skill(lbl: str, kind: str, p: dict) -> str:
+    """Tiered answer for an unmapped "years of <specific skill>" question (T32).
+
+    "0" reads as "no experience at all" and gets the applicant auto-filtered, so
+    it is never returned here. Tiered so we neither undersell nor fabricate:
+      * a skill the applicant explicitly lists -> their full tenure, capped at
+        the overall years_experience figure (never inflated);
+      * a skill adjacent to their background (a content word from the question
+        also appears in their title / headline / summary / skill list) -> 2;
+      * anything genuinely unrecognised (COBOL, "management" for an IC) -> "1".
+    """
+    try:
+        _tot_years = int(float(str(p.get("years_experience", "")).strip() or 0))
+    except (TypeError, ValueError):
+        _tot_years = 0
+    if _tot_years <= 0:
+        return "1"
+    _skills = p.get("skills") or []
+    if isinstance(_skills, str):
+        _skills = _split_skill_string(_skills)
+    _skill_parts = [
+        _part.strip()
+        for _sk in _skills
+        for _part in re.split(r"[/,]", str(_sk).lower())
+        if len(_part.strip()) >= 2
+    ]
+    # Tier 1: the question names a skill the applicant explicitly lists. Same
+    # anchored whole-token match as _anchored_in_bg, incl. the "-"/"_" boundary
+    # chars (T48) so a 2-char skill token ("go", "ai", "r") can't match a hyphen
+    # fragment in the label ("...with a go-to approach" must not match skill "Go").
+    for _part in _skill_parts:
+        if re.search(r"(?<![a-z0-9+#.\-_])" + re.escape(_part) + r"(?![a-z0-9+#.\-_])", lbl):
+            return str(_tot_years)
+    # Tier 2: adjacency — a substantive word from the question (>=4 chars, not
+    # application-form boilerplate) appears in the applicant's own background.
+    _bg = " ".join(str(p.get(_k) or "") for _k in
+                   ("current_title", "headline", "summary")).lower()
+    _bg += " " + " ".join(_skill_parts)
+    _STOP = {"years", "year", "months", "month", "experience", "many",
+             "with", "have", "your", "using", "working", "work", "professional",
+             "hands", "practical", "level", "developing", "development",
+             "about", "please", "tell", "describe", "paragraph"}
+    _adjacent = any(
+        len(_w) >= 4 and _w not in _STOP and _w in _bg
+        for _w in re.findall(r"[a-z]+", lbl)
+    )
+    return str(min(_tot_years, 2)) if _adjacent else "1"
+
+
+def _resolve_opt_stem(lbl: str, kind: str, p: dict) -> str:
+    auth = (p.get("work_authorization") or "").upper()
+    return "Yes" if any(x in auth for x in ("OPT", "STEM")) else "No"
+
+
+def _resolve_sponsor(lbl: str, kind: str, p: dict) -> str:
+    if p.get("need_sponsorship", "").lower() in ("yes", "true", "1"):
+        return "Yes"
+    auth = (p.get("work_authorization") or "").upper()
+    return "Yes" if any(x in auth for x in ("OPT", "H1B", "H-1B", "F1", "TN")) else "No"
+
+
+def _resolve_salary(lbl: str, kind: str, p: dict) -> str:
+    raw_sal = str(p.get("preferred_salary", ""))
+    # If stored as a range (e.g. "100000 - 120000"), return the upper bound for
+    # fields that require a single numeric value.
+    if "-" in raw_sal or "–" in raw_sal:
+        parts = re.split(r'[-–]', raw_sal)
+        nums = [re.sub(r'[^\d.]', '', x) for x in parts]
+        nums = [x for x in nums if x]
+        if nums:
+            return nums[-1]  # upper bound
+    return raw_sal
+
+
+def _resolve_specific_degree(lbl: str, kind: str, p: dict) -> str:
+    edu = p.get("education", {}) if isinstance(p.get("education"), dict) else {}
+    user_rank = _degree_rank(edu.get("degree") or "")
+    if any(t in lbl for t in ("doctor", "ph.d", "phd")):
+        required_rank = 4
+    elif "master" in lbl:
+        required_rank = 3
+    elif "bachelor" in lbl:
+        required_rank = 2
+    else:
+        required_rank = 1  # associate
+    return "Yes" if user_rank >= required_rank else "No"
+
+
+def _resolve_highest_education(lbl: str, kind: str, p: dict) -> str:
+    edu = p.get("education", {})
+    # "Have you completed the following level of education: X?" is a Yes/No radio.
+    if kind in ("radio",):
+        return "Yes" if (isinstance(edu, dict) and edu.get("degree")) else "No"
+    deg = (edu.get("degree") or "") if isinstance(edu, dict) else ""
+    _deg_map = {"m.s.": "Master's Degree", "ms": "Master's Degree", "m.s": "Master's Degree",
+                "b.s.": "Bachelor's Degree", "bs": "Bachelor's Degree", "b.s": "Bachelor's Degree",
+                "ph.d": "Doctorate", "phd": "Doctorate", "mba": "Master's Degree"}
+    return _deg_map.get(deg.lower().strip("."), deg) or "Master's Degree"
+
+
+def _resolve_grad_year(lbl: str, kind: str, p: dict) -> "str | None":
+    edu = p.get("education", {}) if isinstance(p.get("education"), dict) else {}
+    yr = str(edu.get("year", "")).strip()
+    return yr if yr else None
+
+
+def _resolve_degree(lbl: str, kind: str, p: dict) -> "str | None":
+    edu = p.get("education", {})
+    if kind == "radio":
+        return "Yes" if (isinstance(edu, dict) and edu.get("degree")) else "No"
+    return edu.get("degree") if isinstance(edu, dict) else None
+
+
+def _resolve_preferred_name(lbl: str, kind: str, p: dict) -> str:
+    if p.get("preferred_name"):
+        return p["preferred_name"]
+    parts = _full_name_parts(p)
+    return parts[0] if parts else ""
+
+
+# ── Rule-table building blocks ────────────────────────────────────────────────
+# Most rules are "label contains one of these substrings [and the field kind is
+# one of these] -> a constant / a profile value". These factories keep the table
+# terse; the handful of rules with real branching use an explicit lambda or a
+# named ``_resolve_*`` helper above.
+
+_MISSING = object()
+
+
+def _kw(*words: str) -> Callable[[str, str, dict], bool]:
+    """Matcher: any of ``words`` is a substring of the normalized label."""
+    return lambda lbl, kind, p: any(w in lbl for w in words)
+
+
+def _kw_kind(kinds: tuple, *words: str) -> Callable[[str, str, dict], bool]:
+    """Matcher: ``_kw(*words)`` AND the field ``kind`` is one of ``kinds``."""
+    return lambda lbl, kind, p: kind in kinds and any(w in lbl for w in words)
+
+
+def _const(value: "str | None") -> Callable[[str, str, dict], "str | None"]:
+    """Resolver: always return ``value``."""
+    return lambda lbl, kind, p: value
+
+
+def _pv(key: str, default: object = _MISSING) -> Callable[[str, str, dict], "str | None"]:
+    """Resolver: ``profile.get(key)`` (with ``default`` when supplied)."""
+    if default is _MISSING:
+        return lambda lbl, kind, p: p.get(key)
+    return lambda lbl, kind, p: p.get(key, default)
+
+
+def _edu_field(key: str) -> Callable[[str, str, dict], "str | None"]:
+    """Resolver: ``profile["education"][key]`` when education is a dict, else None."""
+    return lambda lbl, kind, p: (
+        p.get("education", {}).get(key) if isinstance(p.get("education"), dict) else None)
+
+
+def _resolve_website(lbl: str, kind: str, p: dict) -> "str | None":
+    return p.get("website_url") or p.get("portfolio_url") or p.get("linkedin_url")
+
+
+def _resolve_headline(lbl: str, kind: str, p: dict) -> "str | None":
+    return p.get("headline") or p.get("current_title")
+
+
+def _resolve_summary(lbl: str, kind: str, p: dict) -> "str | None":
+    return p.get("summary") or p.get("cover_letter_text")
+
+
+def _resolve_current_company(lbl: str, kind: str, p: dict) -> str:
+    return p.get("current_company") or p.get("employer") or "N/A"
+
+
+def _resolve_job_type(lbl: str, kind: str, p: dict) -> str:
+    return p.get("current_title") or "Software Engineer"
+
+
+def _resolve_mailing_address(lbl: str, kind: str, p: dict) -> "str | None":
+    return p.get("street_address") or p.get("location")
+
+
+def _resolve_city_location(lbl: str, kind: str, p: dict) -> "str | None":
+    return p.get("location") or p.get("city")
+
+
+def _resolve_agree(lbl: str, kind: str, p: dict) -> str:
+    return "Yes" if kind in ("select", "select-one") else "on"
+
+
+# The ordered rule table. ORDER IS THE CONTRACT — it reproduces the original
+# top-to-bottom `if` cascade exactly. A comment flags every entry whose *position*
+# (not just its matcher) is load-bearing.
+_PROFILE_VALUE_RULES: list[_ProfileRule] = [
+    # Cover-letter fields never yield a resume path or any value — unconditional,
+    # and MUST precede the resume rule ("cv"/"resume" tokens) and the later
+    # cover-letter-text rule (now unreachable, kept for parity).
+    _ProfileRule("cover_letter_guard",
+                 _kw("cover letter", "cover_letter", "covering letter"),
+                 _const(None)),
+    _ProfileRule("resume",
+                 lambda lbl, kind, p: kind == "file" or (
+                     kind not in _SELECTISH_KINDS
+                     and any(w in lbl for w in ("resume", "résumé", "cv", "upload your resume",
+                                                "upload your résumé", "attach resume",
+                                                "attach résumé", "attach cv"))),
+                 _resolve_resume),
+    # "first name" MUST precede "name" (substring) and "preferred name"
+    # ("preferred first name" contains "first name" -> resolves to given name).
+    _ProfileRule("first_name", _kw("first name", "given name"), _resolve_first_name),
+    _ProfileRule("last_name", _kw("last name", "family name", "surname"), _resolve_last_name),
+    _ProfileRule("email", _kw("email"), _pv("email")),
+    # "phone country code" MUST precede "phone" and the generic "country" rule.
+    _ProfileRule("phone_country_code",
+                 _kw("phone country code", "country code", "country dial"),
+                 _pv("country", "United States")),
+    _ProfileRule("phone", _kw("phone", "mobile"), _pv("phone")),
+    # LinkedIn/GitHub URL — excluded when the label is a "years of ..." question.
+    _ProfileRule("linkedin_url",
+                 lambda lbl, kind, p: "linkedin" in lbl and not _is_years_query(lbl),
+                 _pv("linkedin_url")),
+    _ProfileRule("github_url",
+                 lambda lbl, kind, p: "github" in lbl and not _is_years_query(lbl),
+                 _pv("github_url")),
+    _ProfileRule("portfolio_url",
+                 _kw("portfolio", "personal website", "personal site"),
+                 _pv("portfolio_url")),
+    _ProfileRule("website_url",
+                 lambda lbl, kind, p: "website" in lbl and "personal" not in lbl,
+                 _resolve_website),
+    # T43: a combined "City, State" field wants the whole location line. MUST
+    # precede the zip / street-address / state-of-residence rules (each would win
+    # on ordering). The `_location` test is folded into the matcher so a profile
+    # with no location string falls through instead of filling the field with "".
+    _ProfileRule("city_state_combined",
+                 lambda lbl, kind, p: (bool(re.search(r'\bcity\b', lbl))
+                                       and bool(re.search(r'\bstate\b', lbl))
+                                       and "relocat" not in lbl
+                                       and bool((p.get("location") or "").strip())),
+                 lambda lbl, kind, p: (p.get("location") or "").strip()),
+    _ProfileRule("zip", _kw("zip", "postal"), _pv("zip_code")),
+    _ProfileRule("street_address",
+                 _kw("address line 1", "street address", "address 1", "street"),
+                 _pv("street_address")),
+    _ProfileRule("address_line_2",
+                 _kw("address line 2", "address 2", "apt", "suite"),
+                 _const("")),
+    # State of residence. MUST precede the identity/country rules; the broad
+    # `"state" in lbl` arm excludes work-authorization phrasings.
+    _ProfileRule("state_of_residence",
+                 lambda lbl, kind, p: any(w in lbl for w in (
+                     "which state", "your state", "state of residence", "state you live",
+                     "province", "state/province"))
+                 or (("state" in lbl or "province" in lbl) and "united states" not in lbl
+                     and "authorized" not in lbl and "visa" not in lbl),
+                 _pv("state")),
+    # Identity fields — MUST precede generic country/location to avoid cross-match.
+    _ProfileRule("disability", _kw("disability", "disabled"), _pv("disability_status", "No")),
+    _ProfileRule("gender", _kw("gender"), _pv("gender", "decline")),
+    _ProfileRule("race", _kw("race", "ethnicity", "ethnic"), _pv("race", "decline")),
+    _ProfileRule("veteran",
+                 _kw("veteran", "military status", "protected veteran"),
+                 _pv("veteran_status", "No")),
+    # Right-to-work country picker — MUST fire before the generic "country" rule.
+    _ProfileRule("right_to_work_country",
+                 _kw("right to work", "verify right to work", "work from one of the following",
+                     "currently based in and can verify"),
+                 _pv("country", "United States")),
+    _ProfileRule("us_based",
+                 _kw("us based", "u.s. based", "united states based", "currently based in the us",
+                     "currently based in the united states", "currently residing in the us",
+                     "located in the us", "located in the united states"),
+                 _const("Yes")),
+    _ProfileRule("excluded_region_residency",
+                 lambda lbl, kind, p: kind in _CHOICE_KINDS
+                 and any(f"{v} {r}" in lbl for v in _RESIDE_VERBS for r in _EXCL_REGIONS),
+                 _const("No")),
+    _ProfileRule("relocation_yes_no",
+                 _kw_kind(_CHOICE_KINDS, "open to relocat", "willing to relocat", "able to relocat",
+                          "relocation assistance", "relocate to"),
+                 _const("No")),
+    _ProfileRule("rest_of_world", _kw("rest of world"), _const("")),
+    _ProfileRule("country",
+                 lambda lbl, kind, p: "country" in lbl and "relocat" not in lbl,
+                 _pv("country", "United States")),
+    # T41: \bcity\b boundary (not a bare substring, which also fires in
+    # "capacity"). MUST run before the years-of-experience rules.
+    _ProfileRule("city_location",
+                 lambda lbl, kind, p: (bool(re.search(r'\bcity\b', lbl))
+                                       or any(w in lbl for w in _LOC_PHRASES))
+                 and "relocat" not in lbl,
+                 _resolve_city_location),
+    _ProfileRule("mailing_address",
+                 lambda lbl, kind, p: any(w in lbl for w in (
+                     "mailing address", "home address", "postal address", "billing address",
+                     "current address", "your address")) or lbl.strip() == "address",
+                 _resolve_mailing_address),
+    _ProfileRule("middle_name", _kw("middle name", "middle initial"), _const("")),
+    _ProfileRule("current_company",
+                 lambda lbl, kind, p: any(w in lbl for w in (
+                     "current company", "current employer", "current organization", "employer name",
+                     "company name", "organization name", "most recent employer", "most recent company"))
+                 or lbl in ("org", "company", "organization", "employer"),
+                 _resolve_current_company),
+    _ProfileRule("current_title",
+                 _kw("current title", "job title", "current role", "current position"),
+                 _pv("current_title")),
+    _ProfileRule("headline",
+                 _kw("headline", "professional headline", "profile headline"),
+                 _resolve_headline),
+    _ProfileRule("summary",
+                 _kw("summary", "professional summary", "about me", "bio"),
+                 _resolve_summary),
+    # T40: a *bare* overall "years of experience" question -> full tenure. A
+    # phrasing that pins experience to a role/skill/domain the applicant has NOT
+    # worked in ("...as a Lead", "...with COBOL") fails this matcher and drops to
+    # the tiered rule below, which floors it.
+    _ProfileRule("bare_years_experience",
+                 lambda lbl, kind, p: _is_bare_years_experience(lbl)
+                 and not _years_label_names_a_foreign_role_or_skill(lbl, p),
+                 lambda lbl, kind, p: str(p.get("years_experience", ""))),
+    # AI/ML stack keyword -> "1" floor. A "years of experience with <foreign AI
+    # skill>" question is excluded here so it is floored in the tiered rule (T40).
+    _ProfileRule("ai_skill_floor",
+                 lambda lbl, kind, p: kind in ("text", "number")
+                 and any(w in lbl for w in _AI_SKILL_KEYWORDS)
+                 and not (_is_years_query(lbl)
+                          and _years_label_names_a_foreign_role_or_skill(lbl, p)),
+                 _const("1")),
+    # T32 tiered "years of <specific skill>". MUST run after bare_years_experience
+    # and ai_skill_floor; "relevant"/"total" are excluded (the total_experience
+    # rule below owns those).
+    _ProfileRule("years_of_skill_tiered",
+                 lambda lbl, kind, p: (kind in ("text", "number")
+                                       and any(w in lbl for w in (
+                                           "how many years", "how many months", "years of",
+                                           "years with", "yrs of experience", "yrs experience"))
+                                       and not any(w in lbl for w in ("relevant", "total"))),
+                 _resolve_years_of_skill),
+    _ProfileRule("opt_stem",
+                 _kw_kind(_CHOICE_KINDS, "opt or stem", "opt/stem", "stem opt", "currently on opt"),
+                 _resolve_opt_stem),
+    _ProfileRule("sponsorship",
+                 _kw("sponsor", "sponsorship", "visa support", "work visa"),
+                 _resolve_sponsor),
+    _ProfileRule("authorized_to_work",
+                 _kw("authorized to work", "legally authorized", "legal right to work", "eligible to work"),
+                 _const("Yes")),
+    _ProfileRule("ai_coding_tools",
+                 _kw_kind(_CHOICE_KINDS, "ai coding", "ai code", "coding agent", "coding assistant",
+                          "copilot", "cursor", "claude code"),
+                 _const("Yes")),
+    _ProfileRule("w2_employment",
+                 _kw_kind(_CHOICE_KINDS, "willing to work on w2", "work on w2", "w2 employment",
+                          "w2 contractor", "w2 basis"),
+                 _const("Yes")),
+    _ProfileRule("work_auth_expiry",
+                 _kw("work authorization expire", "authorization expir", "visa expir"),
+                 _pv("work_authorization_expiry", "N/A")),
+    _ProfileRule("salary",
+                 _kw("salary", "compensation", "expected pay", "desired pay"),
+                 _resolve_salary),
+    # Specific-degree completion — MUST precede the generic education rules
+    # (which would answer "Yes" for any degree the user holds).
+    _ProfileRule("specific_degree_completion",
+                 lambda lbl, kind, p: kind in _CHOICE_KINDS and bool(re.search(
+                     r'have you completed.{0,60}(doctor|ph\.?d|phd|master|bachelor|associate)', lbl)),
+                 _resolve_specific_degree),
+    _ProfileRule("highest_education",
+                 _kw("highest level of education", "highest education", "education level",
+                     "level of education"),
+                 _resolve_highest_education),
+    # "In which year did you complete your degree?" -> graduation year. MUST
+    # precede the bare "degree" rule.
+    _ProfileRule("graduation_year",
+                 lambda lbl, kind, p: "year" in lbl and any(w in lbl for w in (
+                     "degree", "master", "bachelor", "graduate", "graduated", "complet")),
+                 _resolve_grad_year),
+    _ProfileRule("degree", _kw("degree"), _resolve_degree),
+    _ProfileRule("school",
+                 _kw("school", "university", "college", "institution"),
+                 _edu_field("school")),
+    _ProfileRule("field_of_study",
+                 _kw("field of study", "major", "area of study"),
+                 _edu_field("field")),
+    _ProfileRule("how_did_you_hear",
+                 _kw("where did you hear", "how did you hear", "how did you find out",
+                     "how did you learn about", "source of hire"),
+                 _const("LinkedIn")),
+    _ProfileRule("travel",
+                 lambda lbl, kind, p: kind in _CHOICE_KINDS
+                 and (any(w in lbl for w in ("willing to travel", "% travel", "travel requirement",
+                                             "open to travel"))
+                      or ("comfortable with" in lbl and "travel" in lbl)),
+                 _pv("willing_to_travel", "No")),
+    # Notice period / start timeline — MUST precede the generic "start date" rule.
+    _ProfileRule("notice_period_timeline",
+                 _kw_kind(_CHOICE_KINDS, "how quickly", "how soon", "when can you start",
+                          "notice period", "earliest start", "available to start"),
+                 _pv("notice_period", "Immediately")),
+    _ProfileRule("commute_proximity",
+                 _kw_kind(_CHOICE_KINDS, "commutable", "in-office attendance", "commuting distance",
+                          "in commutable"),
+                 _const("No")),
+    _ProfileRule("start_date",
+                 _kw("earliest available", "start date", "when can you start", "available to start",
+                     "date available", "earliest start"),
+                 _const("Immediately")),
+    _ProfileRule("relative_works_here",
+                 lambda lbl, kind, p: any(w in lbl for w in ("relative", "friend", "family member"))
+                 and any(w in lbl for w in ("work for", "employed", "works at", "work at", "employee")),
+                 _const("No")),
+    _ProfileRule("secondary_employment",
+                 _kw("secondary employment", "other employment", "work for another", "work elsewhere"),
+                 _const("No")),
+    _ProfileRule("applied_here_before",
+                 _kw("applied here before", "applied to us before", "applied with us",
+                     "previously applied", "filed an application", "application with"),
+                 _const("No")),
+    _ProfileRule("worked_here_before",
+                 _kw("worked here before", "worked for us", "worked for this company",
+                     "previously worked", "prior employment here", "former employee",
+                     "previously employed by", "prior employment at"),
+                 _const("No")),
+    _ProfileRule("under_18_proof",
+                 _kw("under 18", "proof of eligibility", "proof of age", "work permit"),
+                 _const("N/A")),
+    _ProfileRule("agree_consent",
+                 _kw_kind(("select", "select-one", "checkbox"), "agree to", "i agree", "acknowledge",
+                          "i understand", "consent to", "terms of service", "privacy policy",
+                          "terms and conditions"),
+                 _resolve_agree),
+    _ProfileRule("comfortable_remote_commute_shift",
+                 _kw("comfortable working", "comfortable with remote", "comfortable in a remote",
+                     "ok for the remote", "remote engagement", "comfortable commuting",
+                     "commuting to this job", "commute to this", "willing to commute",
+                     "comfortable for", "shift hours", "est shift", "pst shift", "cst shift",
+                     "mst shift", "work in our timezone", "work us hours", "work in us time"),
+                 _const("Yes")),
+    _ProfileRule("student_visa", _kw("student visa", "f-1 visa", "f1 visa"), _const("No")),
+    _ProfileRule("background_check", _kw("background check"), _const("Yes")),
+    _ProfileRule("drug_test", _kw("drug test"), _const("Yes")),
+    _ProfileRule("contract_work",
+                 _kw("contract work", "work a contract", "work contract", "contract position",
+                     "contract role", "contract only", "corp-to-corp", "c2c", "1099"),
+                 _const("No")),
+    _ProfileRule("notice_period_days",
+                 _kw("notice period", "notice days", "days notice"),
+                 _const("14")),
+    # "total" / "relevant" experience wants the full figure — but only as a
+    # *bare* overall question ("total experience as a Lead" is still floored, T40).
+    _ProfileRule("total_experience",
+                 lambda lbl, kind, p: any(w in lbl for w in (
+                     "total years", "total experience", "years of relevant", "relevant experience",
+                     "total it experience"))
+                 and not _years_label_names_a_foreign_role_or_skill(lbl, p),
+                 lambda lbl, kind, p: str(p.get("years_experience", "4"))),
+    _ProfileRule("ic_role_comfort",
+                 _kw("individual contributor", "hands-on-keyboard", "hands on keyboard", "ic role",
+                     "hands-on engineer"),
+                 _const("Yes")),
+    _ProfileRule("evaluation_frameworks",
+                 _kw("evaluation framework", "llm-as-a-judge", "llm as a judge", "ai-as-a-judge",
+                     "ai as a judge"),
+                 _const("Yes")),
+    _ProfileRule("deployed_to_production_count",
+                 _kw_kind(("text", "number"), "deployed to production"),
+                 _const("3")),
+    _ProfileRule("ml_stack_yes_no",
+                 _kw_kind(_CHOICE_KINDS, "building rag pipeline", "rag pipeline", "ml model",
+                          "creating custom embedding", "designing and implementing ml"),
+                 _const("Yes")),
+    _ProfileRule("non_tech_domain",
+                 _kw_kind(_CHOICE_KINDS, "insurance domain", "p&c insurance", "property & casualty",
+                          "property and casualty", "healthcare domain", "financial domain",
+                          "legal domain", "manufacturing domain", "retail domain"),
+                 _const("No")),
+    # Broad experience/skill "yes" rules — regex first (an interrupting product
+    # name breaks the contiguous "do you have experience" substring).
+    _ProfileRule("do_you_have_experience_regex",
+                 lambda lbl, kind, p: kind in _CHOICE_KINDS
+                 and bool(re.search(r'do you have .{0,50}(experience|expertise)', lbl)),
+                 _const("Yes")),
+    _ProfileRule("broad_experience_keywords",
+                 _kw_kind(_CHOICE_KINDS, "hands-on experience", "have you built",
+                          "professional experience with", "experience building", "experience using",
+                          "experience developing", "experience implementing", "do you have experience",
+                          "have you worked with", "have you used", "have you worked in",
+                          "have you architected", "have you deployed", "have you designed",
+                          "have you shipped", "have you developed", "have you led",
+                          "early-stage startup", "high-ownership"),
+                 _const("Yes")),
+    # Unreachable (cover_letter_guard already returned None) — kept for parity.
+    _ProfileRule("cover_letter_text",
+                 _kw_kind(("text", "textarea"), "cover letter", "cover_letter", "covering letter"),
+                 _const(None)),
+    _ProfileRule("job_type_preference",
+                 _kw("looking for", "job type preference", "what kind of job", "type of employment"),
+                 _resolve_job_type),
+    _ProfileRule("language",
+                 _kw_kind(("text", "select", "select-one"), "language"),
+                 _pv("preferred_language", "English")),
+    _ProfileRule("preferred_name",
+                 _kw("preferred name", "preferred first name", "nickname"),
+                 _resolve_preferred_name),
+    _ProfileRule("name_pronunciation",
+                 _kw("pronunciation", "phonetic", "how to pronounce"),
+                 _const("")),
+    # "name" is a broad substring — MUST be near the end (after first/last/
+    # preferred/middle name, company name, etc.).
+    _ProfileRule("full_name", _kw("name", "full name"), _pv("full_name")),
+    _ProfileRule("unknown_social_url", _kw(*_UNKNOWN_SOCIAL), _const("")),
+    # Any remaining url-typed field -> blank (MUST be last).
+    _ProfileRule("url_kind_fallback",
+                 lambda lbl, kind, p: kind == "url",
+                 _const("")),
+]
+
+
 def _get_profile_value(profile: dict, label: str, kind: str = "text") -> str | None:
-    """Map a form field label to a profile value. Returns None if no confident match."""
+    """Map a form field label to a profile value. Returns None if no confident match.
+
+    T47: a slim driver over the ordered ``_PROFILE_VALUE_RULES`` table. The
+    normalization preamble below is unchanged; the former ~80-branch `if` cascade
+    is now the table, iterated once (first matching rule wins).
+    """
     # Collapse all whitespace (including embedded newlines from DOM textContent),
     # strip asterisk/required markers, then normalize spaces.
     l = label.lower().replace("_", " ")
@@ -756,406 +1412,9 @@ def _get_profile_value(profile: dict, label: str, kind: str = "text") -> str | N
     l = l.replace("*", "").replace("(required)", "").strip()
     p = profile
 
-    # Never return a resume path for cover letter fields
-    if any(k in l for k in ("cover letter", "cover_letter", "covering letter")):
-        return None
-    if kind == "file" or (kind not in ("select", "select-one", "select-multiple", "radio", "checkbox") and any(k in l for k in ("resume", "résumé", "cv", "upload your resume", "upload your résumé", "attach resume", "attach résumé", "attach cv"))):
-        raw = p.get("resume_path", "")
-        if raw:
-            return os.path.abspath(raw) if not os.path.isabs(raw) else raw
-        return None
-
-    if any(k in l for k in ("first name", "given name")):
-        parts = (p.get("full_name") or "").split()
-        return parts[0] if parts else None
-    if any(k in l for k in ("last name", "family name", "surname")):
-        parts = (p.get("full_name") or "").split()
-        return parts[-1] if len(parts) > 1 else (parts[0] if parts else None)
-    if "email" in l:
-        return p.get("email")
-    if any(k in l for k in ("phone country code", "country code", "country dial")):
-        return p.get("country", "United States")
-    if "phone" in l or "mobile" in l:
-        return p.get("phone")
-    _is_years_q = any(k in l for k in ("years of", "how many years", "how many months", "years experience"))
-    if "linkedin" in l and not _is_years_q:
-        return p.get("linkedin_url")
-    if "github" in l and not _is_years_q:
-        return p.get("github_url")
-    if any(k in l for k in ("portfolio", "personal website", "personal site")):
-        return p.get("portfolio_url")
-    if "website" in l and "personal" not in l:
-        return p.get("website_url") or p.get("portfolio_url") or p.get("linkedin_url")
-    # T43: a combined "City, State" / "City/State" / "City and State" field wants
-    # the whole location line, not just the city or the state. Checked BEFORE the
-    # zip, street-address and state-of-residence branches, each of which would
-    # otherwise win on ordering: "City, State, Zip" hits the zip branch, and a
-    # plain "City, State" hits the state-of-residence branch. \bcity\b + \bstate\b
-    # covers every combined phrasing on its own ("City / State", "City and State",
-    # "City, State, Zip", "City, State (Country)" — ',', '/', whitespace and '('
-    # are all word boundaries). Falls through (to the individual branches / the
-    # LLM) when the profile has no usable location string, so the field is never
-    # filled with "" / whitespace. The "relocat" guard mirrors the city/location
-    # branch below.
-    _location = (p.get("location") or "").strip()
-    if re.search(r'\bcity\b', l) and re.search(r'\bstate\b', l) and "relocat" not in l and _location:
-        return _location
-    if any(k in l for k in ("zip", "postal")):
-        return p.get("zip_code")
-    if any(k in l for k in ("address line 1", "street address", "address 1", "street")):
-        return p.get("street_address")
-    if "address line 2" in l or "address 2" in l or "apt" in l or "suite" in l:
-        return ""  # leave blank
-    if any(k in l for k in ("which state", "your state", "state of residence", "state you live", "province", "state/province")) or (("state" in l or "province" in l) and "united states" not in l and "authorized" not in l and "visa" not in l):
-        return p.get("state")
-    # Identity fields checked BEFORE generic country/location to prevent cross-matching
-    if any(k in l for k in ("disability", "disabled")):
-        return p.get("disability_status", "No")
-    if "gender" in l:
-        return p.get("gender", "decline")
-    if any(k in l for k in ("race", "ethnicity", "ethnic")):
-        return p.get("race", "decline")
-    if any(k in l for k in ("veteran", "military status", "protected veteran")):
-        return p.get("veteran_status", "No")
-    # Work eligibility / right-to-work country picker — must fire BEFORE generic "country" rule
-    if any(k in l for k in ("right to work", "verify right to work",
-                             "work from one of the following", "currently based in and can verify")):
-        return p.get("country", "United States")
-    # "Are you currently US based?" / "Are you based in the US?" style questions
-    if any(k in l for k in ("us based", "u.s. based", "united states based",
-                             "currently based in the us", "currently based in the united states",
-                             "currently residing in the us", "located in the us",
-                             "located in the united states")):
-        return "Yes"
-    # Geographic residency exclusion questions — user resides in Utah, USA.
-    # Combinatorial match so every verb/region pairing is covered symmetrically
-    # (e.g. "based in South America", "located in Central America", "located in Latin").
-    _RESIDE_VERBS = ("reside in", "based in", "located in", "live in")
-    _EXCL_REGIONS = ("mexico", "latin", "south america", "central america")
-    if any(f"{v} {r}" in l for v in _RESIDE_VERBS for r in _EXCL_REGIONS) \
-            and kind in ("select", "select-one", "radio"):
-        return "No"
-    # Relocation yes/no questions — user targets remote roles, not willing to relocate
-    if any(k in l for k in ("open to relocat", "willing to relocat", "able to relocat",
-                             "relocation assistance", "relocate to")) and kind in ("select", "select-one", "radio"):
-        return "No"
-    # "REST OF WORLD" conditional follow-up — leave blank (user is US-based)
-    if "rest of world" in l:
-        return ""
-    if "country" in l and "relocat" not in l:
-        return p.get("country", "United States")
-    # T41: "city" is matched on a word boundary, not as a bare substring — a
-    # substring test also fires inside "capacity", so a label like "years of
-    # experience in a professional/leadership capacity" was wrongly diverted
-    # here (this branch runs well before the years-of-experience logic) and
-    # returned profile["location"] (or None when the profile has no location)
-    # instead of a tenure figure. The multi-word phrases below stay as substring
-    # checks. A literal \bcity\b also matches inside "city, state" / "city/state"
-    # (',' and '/' are word boundaries), which is correct — those ARE location
-    # labels — so they need no separate tuple entry.
-    _loc_phrases = ("location", "where are you", "your location", "current location",
-                    "what is your current location", "city, state", "city/state")
-    if (re.search(r'\bcity\b', l) or any(k in l for k in _loc_phrases)) and "relocat" not in l:
-        return p.get("location") or p.get("city")
-    # Only match postal/physical address fields — avoid "addressed", "redress", "address it", etc.
-    if any(k in l for k in ("mailing address", "home address", "postal address", "billing address", "current address", "your address")) or l.strip() == "address":
-        return p.get("street_address") or p.get("location")
-    if any(k in l for k in ("middle name", "middle initial")):
-        return ""  # user has no middle name
-    if any(k in l for k in ("current company", "current employer", "current organization",
-                             "employer name", "company name", "organization name",
-                             "most recent employer", "most recent company")) or l in ("org", "company", "organization", "employer"):
-        return p.get("current_company") or p.get("employer") or "N/A"
-    if any(k in l for k in ("current title", "job title", "current role", "current position")):
-        return p.get("current_title")
-    if any(k in l for k in ("headline", "professional headline", "profile headline")):
-        return p.get("headline") or p.get("current_title")
-    if any(k in l for k in ("summary", "professional summary", "about me", "bio")):
-        return p.get("summary") or p.get("cover_letter_text")
-    # Bare / overall "years of experience" question -> the applicant's full
-    # tenure. Covers filler phrasings that still mean "overall" ("years of
-    # professional / work / total experience"). Only a phrasing that pins the
-    # experience to a role/skill/domain the applicant has NOT worked in
-    # ("...experience as a Lead", "...experience with COBOL") falls through to
-    # the T32 tiered branch below, which floors unfamiliar tenure (T40).
-    _bare_years_exp = (
-        any(k in l for k in ("years of experience", "years experience", "total experience"))
-        or any(f"years of {f} experience" in l for f in _BARE_EXPERIENCE_FILLERS)
-        or any(f"years {f} experience" in l for f in _BARE_EXPERIENCE_FILLERS)
-    )
-    if _bare_years_exp and not _years_label_names_a_foreign_role_or_skill(l, p):
-        return str(p.get("years_experience", ""))
-    if any(k in l for k in (
-        "generative ai", "gen ai", "llm", "large language model",
-        "multimodal", "agentic", "rag", "retrieval augmented",
-        "vector database", "embedding", "fine tun",
-        "artificial intelligence", " ai ", "machine learning", "deep learning",
-        "neural network", "natural language", "nlp", "computer vision",
-        "data science", "data scientist", "model training", "model development",
-        "model deployment", "ai/ml", "ai agent", "ai engineer", "prompt engineer",
-        "transformer", "diffusion model", "reinforcement learning",
-    )) and kind in ("text", "number") \
-            and not (_is_years_q and _years_label_names_a_foreign_role_or_skill(l, p)):
-        # ...but a "years of experience with <foreign AI skill>" question drops
-        # to the tiered branch so it is floored consistently there (T40).
-        return "1"
-    if (any(k in l for k in ("how many years", "how many months", "years of", "years with",
-                             "yrs of experience", "yrs experience"))
-            and not any(k in l for k in ("relevant", "total"))
-            and kind in ("text", "number")):
-        # Unmapped "years of <specific skill>" question (T32). "0" reads as "no
-        # experience at all" and gets the applicant auto-filtered, so it is never
-        # returned here — a truthful zero is only produced when the answer text
-        # positively says so (_coerce_numeric_answer's negative-phrase guard).
-        # Tiered so we neither undersell nor fabricate tenure for a skill the
-        # applicant has never touched:
-        #   * a skill the applicant actually lists  -> their full tenure, still
-        #     capped at the overall years_experience figure (never inflated);
-        #   * a skill *adjacent* to their background (a content word from the
-        #     question also shows up in their title / headline / summary / skill
-        #     list) -> capped at 2 years;
-        #   * anything genuinely unrecognised (COBOL, "management" for an IC, …)
-        #     -> "1", a minimal non-zero floor that still dodges the auto-filter
-        #     without claiming experience that isn't there — matches the AI/ML
-        #     branch above and the no-overall-figure case below.
-        # ("relevant" / "total" experience questions are excluded — they want the
-        # full figure and are handled by the "total years" branch further down.)
-        try:
-            _tot_years = int(float(str(p.get("years_experience", "")).strip() or 0))
-        except (TypeError, ValueError):
-            _tot_years = 0
-        if _tot_years <= 0:
-            return "1"
-        _skills = p.get("skills") or []
-        if isinstance(_skills, str):
-            _skills = re.split(r"[,;]", _skills)
-        _skill_parts = [
-            _part.strip()
-            for _sk in _skills
-            for _part in re.split(r"[/,]", str(_sk).lower())
-            if len(_part.strip()) >= 2
-        ]
-        # Tier 1: the question names a skill the applicant explicitly lists.
-        for _part in _skill_parts:
-            if re.search(r"(?<![a-z0-9+#.])" + re.escape(_part) + r"(?![a-z0-9+#.])", l):
-                return str(_tot_years)
-        # Tier 2: adjacency — a substantive word from the question (>=4 chars,
-        # not application-form boilerplate) appears in the applicant's own
-        # title / headline / summary / skill list.
-        _bg = " ".join(str(p.get(_k) or "") for _k in
-                       ("current_title", "headline", "summary")).lower()
-        _bg += " " + " ".join(_skill_parts)
-        _STOP = {"years", "year", "months", "month", "experience", "many",
-                 "with", "have", "your", "using", "working", "work", "professional",
-                 "hands", "practical", "level", "developing", "development",
-                 "about", "please", "tell", "describe", "paragraph"}
-        _adjacent = any(
-            len(_w) >= 4 and _w not in _STOP and _w in _bg
-            for _w in re.findall(r"[a-z]+", l)
-        )
-        return str(min(_tot_years, 2)) if _adjacent else "1"
-    # "Are you currently on OPT or STEM OPT?" → Yes if profile work_authorization is OPT/STEM
-    if any(k in l for k in ("opt or stem", "opt/stem", "stem opt", "currently on opt")) \
-            and kind in ("select", "select-one", "radio"):
-        auth = (p.get("work_authorization") or "").upper()
-        return "Yes" if any(x in auth for x in ("OPT", "STEM")) else "No"
-    if any(k in l for k in ("sponsor", "sponsorship", "visa support", "work visa")):
-        if p.get("need_sponsorship", "").lower() in ("yes", "true", "1"):
-            return "Yes"
-        auth = (p.get("work_authorization") or "").upper()
-        return "Yes" if any(x in auth for x in ("OPT", "H1B", "H-1B", "F1", "TN")) else "No"
-    if any(k in l for k in ("authorized to work", "legally authorized", "legal right to work", "eligible to work")):
-        return "Yes"
-    # AI coding tools usage — user actively uses Claude Code, Cursor, Copilot etc.
-    if any(k in l for k in ("ai coding", "ai code", "coding agent", "coding assistant", "copilot", "cursor", "claude code")) \
-            and kind in ("select", "select-one", "radio"):
-        return "Yes"
-    # W2 employment — OPT holders can work on W2
-    if any(k in l for k in ("willing to work on w2", "work on w2", "w2 employment", "w2 contractor", "w2 basis")) \
-            and kind in ("select", "select-one", "radio"):
-        return "Yes"
-    if any(k in l for k in ("work authorization expire", "authorization expir", "visa expir")):
-        return p.get("work_authorization_expiry", "N/A")
-    if any(k in l for k in ("salary", "compensation", "expected pay", "desired pay")):
-        raw_sal = str(p.get("preferred_salary", ""))
-        # If stored as a range (e.g. "100000 - 120000"), return the upper bound for
-        # fields that require a single numeric value.
-        if "-" in raw_sal or "–" in raw_sal:
-            parts = re.split(r'[-–]', raw_sal)
-            nums = [re.sub(r'[^\d.]', '', x) for x in parts]
-            nums = [x for x in nums if x]
-            if nums:
-                return nums[-1]  # upper bound
-        return raw_sal
-    # Specific-degree completion questions: "Have you completed [DEGREE]?"
-    # Must run BEFORE the generic education branch, which would otherwise answer
-    # "Yes" for any degree the user holds (e.g. claiming a PhD when they have a B.S.).
-    _deg_label = l  # l is the lowercased label
-    if re.search(r'have you completed.{0,60}(doctor|ph\.?d|phd|master|bachelor|associate)', _deg_label) \
-            and kind in ("select", "select-one", "radio"):
-        edu = p.get("education", {}) if isinstance(p.get("education"), dict) else {}
-        user_rank = _degree_rank(edu.get("degree") or "")
-        if any(t in _deg_label for t in ("doctor", "ph.d", "phd")):
-            required_rank = 4
-        elif "master" in _deg_label:
-            required_rank = 3
-        elif "bachelor" in _deg_label:
-            required_rank = 2
-        else:
-            required_rank = 1  # associate
-        return "Yes" if user_rank >= required_rank else "No"
-    if any(k in l for k in ("highest level of education", "highest education", "education level", "level of education")):
-        edu = p.get("education", {})
-        # "Have you completed the following level of education: X?" is a Yes/No radio, not a degree picker
-        if kind in ("radio",):
-            return "Yes" if (isinstance(edu, dict) and edu.get("degree")) else "No"
-        deg = (edu.get("degree") or "") if isinstance(edu, dict) else ""
-        _deg_map = {"m.s.": "Master's Degree", "ms": "Master's Degree", "m.s": "Master's Degree",
-                    "b.s.": "Bachelor's Degree", "bs": "Bachelor's Degree", "b.s": "Bachelor's Degree",
-                    "ph.d": "Doctorate", "phd": "Doctorate", "mba": "Master's Degree"}
-        return _deg_map.get(deg.lower().strip("."), deg) or "Master's Degree"
-    # "In which year did you complete your master's/bachelor's degree?" → graduation year
-    if "year" in l and any(k in l for k in ("degree", "master", "bachelor", "graduate", "graduated", "complet")):
-        edu = p.get("education", {}) if isinstance(p.get("education"), dict) else {}
-        yr = str(edu.get("year", "")).strip()
-        return yr if yr else None
-    if "degree" in l:
-        edu = p.get("education", {})
-        if kind == "radio":
-            return "Yes" if (isinstance(edu, dict) and edu.get("degree")) else "No"
-        return edu.get("degree") if isinstance(edu, dict) else None
-    if any(k in l for k in ("school", "university", "college", "institution")):
-        edu = p.get("education", {})
-        return edu.get("school") if isinstance(edu, dict) else None
-    if any(k in l for k in ("field of study", "major", "area of study")):
-        edu = p.get("education", {})
-        return edu.get("field") if isinstance(edu, dict) else None
-    if any(k in l for k in ("where did you hear", "how did you hear", "how did you find out", "how did you learn about", "source of hire")):
-        return "LinkedIn"
-    # Travel willingness — "comfortable with" tightened to also require "travel" so it
-    # doesn't swallow unrelated "comfortable with X" questions handled further down.
-    if (any(k in l for k in ("willing to travel", "% travel", "travel requirement", "open to travel"))
-            or ("comfortable with" in l and "travel" in l)) \
-            and kind in ("select", "select-one", "radio"):
-        return p.get("willing_to_travel", "No")
-    # Notice period / start timeline — runs BEFORE the generic "start date -> Immediately"
-    # rule below. Default to "Immediately": it's present in virtually all LinkedIn
-    # dropdowns, whereas a literal "2 weeks" may not match range-based options
-    # (e.g. "2-4 weeks"). A real notice_period from the profile still wins.
-    if any(k in l for k in ("how quickly", "how soon", "when can you start",
-                             "notice period", "earliest start", "available to start")) \
-            and kind in ("select", "select-one", "radio"):
-        return p.get("notice_period", "Immediately")
-    # Geographic commute / in-office proximity — user is in Utah; these appear on non-remote
-    # roles, so answer "No". Only matches distance/eligibility questions, NOT commute-
-    # willingness ("willing to commute") which is handled by the "-> Yes" rule below.
-    if any(k in l for k in ("commutable", "in-office attendance",
-                             "commuting distance", "in commutable")) \
-            and kind in ("select", "select-one", "radio"):
-        return "No"
-    if any(k in l for k in ("earliest available", "start date", "when can you start", "available to start", "date available", "earliest start")):
-        return "Immediately"
-    if any(k in l for k in ("relative", "friend", "family member")) and any(k in l for k in ("work for", "employed", "works at", "work at", "employee")):
-        return "No"
-    if any(k in l for k in ("secondary employment", "other employment", "work for another", "work elsewhere")):
-        return "No"
-    if any(k in l for k in ("applied here before", "applied to us before", "applied with us", "previously applied", "filed an application", "application with")):
-        return "No"
-    if any(k in l for k in ("worked here before", "worked for us", "worked for this company", "previously worked", "prior employment here", "former employee", "previously employed by", "prior employment at")):
-        return "No"
-    if any(k in l for k in ("under 18", "proof of eligibility", "proof of age", "work permit")):
-        return "N/A"
-    if any(k in l for k in ("agree to", "i agree", "acknowledge", "i understand", "consent to", "terms of service", "privacy policy", "terms and conditions")) and kind in ("select", "select-one", "checkbox"):
-        return "Yes" if kind in ("select", "select-one") else "on"
-    if any(k in l for k in ("comfortable working", "comfortable with remote", "comfortable in a remote", "ok for the remote", "remote engagement",
-                             "comfortable commuting", "commuting to this job", "commute to this", "willing to commute",
-                             "comfortable for", "shift hours", "est shift", "pst shift", "cst shift", "mst shift",
-                             "work in our timezone", "work us hours", "work in us time")):
-        return "Yes"
-    if any(k in l for k in ("student visa", "f-1 visa", "f1 visa")):
-        return "No"
-    if any(k in l for k in ("background check",)):
-        return "Yes"
-    if any(k in l for k in ("drug test",)):
-        return "Yes"
-    if any(k in l for k in ("contract work", "work a contract", "work contract", "contract position", "contract role", "contract only", "corp-to-corp", "c2c", "1099")):
-        return "No"
-    if any(k in l for k in ("notice period", "notice days", "days notice")):
-        return "14"
-    # "total" / "relevant" experience wants the full figure — but only when it is
-    # still a *bare* overall question. "total experience as a Lead" is a
-    # role-qualified overclaim and must not resolve here either (T40).
-    if any(k in l for k in ("total years", "total experience", "years of relevant",
-                            "relevant experience", "total it experience")) \
-            and not _years_label_names_a_foreign_role_or_skill(l, p):
-        return str(p.get("years_experience", "4"))
-    # IC / hands-on role comfort questions
-    if any(k in l for k in ("individual contributor", "hands-on-keyboard", "hands on keyboard", "ic role", "hands-on engineer")):
-        return "Yes"
-    # Evaluation frameworks / LLM-as-a-judge experience
-    if any(k in l for k in ("evaluation framework", "llm-as-a-judge", "llm as a judge", "ai-as-a-judge", "ai as a judge")):
-        return "Yes"
-    # "How many [AI/RAG/agent] applications deployed to production" numeric question
-    if "deployed to production" in l and kind in ("text", "number"):
-        return "3"
-    # Yes/No skill questions about ML/AI stack experience
-    if any(k in l for k in ("building rag pipeline", "rag pipeline", "ml model", "creating custom embedding", "designing and implementing ml")) and kind in ("select", "select-one", "radio"):
-        return "Yes"
-    # Non-tech domain experience questions — answer No (P&C insurance, healthcare, etc.)
-    if any(k in l for k in (
-        "insurance domain", "p&c insurance", "property & casualty", "property and casualty",
-        "healthcare domain", "financial domain", "legal domain", "manufacturing domain", "retail domain",
-    )) and kind in ("select", "select-one", "radio"):
-        return "No"
-    # Broad experience/skill select questions — answer Yes.
-    # Regex first: catches "do you have <product> development experience?" where an
-    # interrupting product name (e.g. "twilio development") breaks the contiguous
-    # "do you have experience" substring the keyword list below relies on.
-    if re.search(r'do you have .{0,50}(experience|expertise)', l) \
-            and kind in ("select", "select-one", "radio"):
-        return "Yes"
-    if any(k in l for k in (
-        "hands-on experience", "have you built", "professional experience with",
-        "experience building", "experience using", "experience developing",
-        "experience implementing", "do you have experience",
-        "have you worked with", "have you used", "have you worked in",
-        "have you architected", "have you deployed", "have you designed",
-        "have you shipped", "have you developed", "have you led",
-        "early-stage startup", "high-ownership",
-    )) and kind in ("select", "select-one", "radio"):
-        return "Yes"
-    if any(k in l for k in ("cover letter", "cover_letter", "covering letter")) and kind in ("text", "textarea"):
-        return None  # always skip cover letter text fields
-    if any(k in l for k in ("looking for", "job type preference", "what kind of job", "type of employment")):
-        return p.get("current_title") or "Software Engineer"
-    if "language" in l and kind in ("text", "select", "select-one"):
-        return p.get("preferred_language", "English")
-    if any(k in l for k in ("preferred name", "preferred first name", "nickname")):
-        if p.get("preferred_name"):
-            return p["preferred_name"]
-        parts = (p.get("full_name") or "").split()
-        return parts[0] if parts else ""
-    if any(k in l for k in ("pronunciation", "phonetic", "how to pronounce")):
-        return ""  # leave blank — user has no phonetic guide in profile
-    if any(k in l for k in ("name", "full name")):
-        return p.get("full_name")
-
-    # Social/platform URLs not in profile — return empty so LLM doesn't fabricate a fake URL
-    _UNKNOWN_SOCIAL = (
-        "twitter", "x.com", "x handle", "x profile",
-        "facebook", "instagram", "tiktok", "youtube",
-        "medium.com", "substack", "blog url", "blog link",
-        "stackoverflow", "stack overflow",
-        "behance", "dribbble", "devpost", "kaggle",
-        "other url", "other link", "other social", "other profile",
-        "personal url", "social media url", "social profile",
-    )
-    if any(k in l for k in _UNKNOWN_SOCIAL):
-        return ""
-    # Any field typed as url= that we didn't already match — leave blank
-    if kind == "url":
-        return ""
-
+    for rule in _PROFILE_VALUE_RULES:
+        if rule.matches(l, kind, p):
+            return rule.resolve(l, kind, p)
     return None
 
 
