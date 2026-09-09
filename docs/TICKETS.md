@@ -24,13 +24,13 @@ Baseline captured 2026-08-28. `docs/baseline/db_state.baseline.txt` holds the DB
 | # | Sev | Summary |
 |---|---|---|
 | T30 | P2 | ✅ **CLOSED — superseded by T38** (#38, QA 2026-09-06). New classifier `meta/llama-3.2-11b-vision-instruct` returned non-JSON ~1/3 of NIM-route calls in the real flow, and was 8-12s (not the ~1.5s probe). **Root cause found (T38):** NIM returns an *empty/whitespace* body for job descriptions over ~4–5K chars — reproduced directly (short desc → clean JSON; a real 6.7K-char posting → `JSONDecodeError` every time). Real postings are routinely 6–8K, so the NIM route fails on most real jobs; 3 in a row trips `run_session`'s `_MAX_CLASSIFY_FAIL_STREAK` and aborts the session, and the T27 breaker only catches `TimeoutError`, not parse failures. **Fix (T38):** the Agent SDK is now the default classifier for *all* jobs (reliable, same latency, rides the Claude subscription = free). NIM stays in the tree as an opt-in route behind `CLASSIFIER_ROUTE=nim`. |
-| T31 | P2 | ✅ **CLOSED** (#34 + #37, QA 2026-09-06) — see `## T31 / T32` below. Numeric/scale free-text fields got prose instead of a bare number. Residual T40 fixed (PR pending). |
-| T32 | P2 | ✅ **CLOSED** (#34, QA 2026-09-06) — see `## T31 / T32` below. Unmapped "years of &lt;skill&gt;" fields undersold to `0`. Residual T40 (catch-all branch order) fixed (PR pending). |
+| T31 | P2 | ✅ **CLOSED** (#34 + #37, QA 2026-09-06) — see `## T31 / T32` below. Numeric/scale free-text fields got prose instead of a bare number. Residual T40 closed (#41). |
+| T32 | P2 | ✅ **CLOSED** (#34, QA 2026-09-06) — see `## T31 / T32` below. Unmapped "years of &lt;skill&gt;" fields undersold to `0`. Residual T40 (catch-all branch order) closed (#41). |
 | T36 | P3 | (split out of T32) Playwright tab crash mid-fill → `applied=-2` auto-fail. **Blast radius was worse than the ticket said: `run_session` shares one browser/context/page across all jobs, so one crash failed every job after it in the session.** **✅ CLOSED** (#58, `ea01038`, 2026-09-07 — 386 tests incl. `test_job1_crash_does_not_cascade_into_job2` which drives the real `run_session` loop; reviewer traced every crash-propagation path + confirmed the loop-local `context, page = _recover_browser_if_crashed(...)` rebind reaches job N+1). See `## T36` below. Crash-class exceptions (`TargetClosedError` / "Target crashed") now caught deliberately → `"failed"`/-2 (retryable, logged, not routed through `_terminal_state_for_stall`); the shared browser page/context is rebuilt after a crash so subsequent jobs in the session aren't poisoned. |
 | T37 | P2 | ✅ **CLOSED** (#36, QA 2026-09-06) — see `## T37` below. Live QA of PR #34 found `_ask_llm`'s local numeric detection out of sync with `_coerce_numeric_answer` — long-labelled "Rate … (1-10)" scale fields still got prose. |
 | T38 | P1 | ✅ **CLOSED** (#38, QA 2026-09-06) — see `## T38` below. Supersedes/closes T30. NIM classifier returns an empty body for descriptions over ~4–5K chars → most real OffsiteApply jobs fail to classify → session aborts. Agent SDK is now the default classifier for all jobs; NIM is opt-in (`CLASSIFIER_ROUTE=nim`). |
 | T40 | P3 | ✅ **CLOSED** (#41, QA 2026-09-07) — (found by the T22/T38 QA run 2026-09-06) `_get_profile_value`'s `"years of experience"` catch-all ran *before* the T32 tiered "years of &lt;skill/role&gt;" branch, so `"How many years of experience do you have as a Lead?"` returned full `years_experience` (`4`) — asserted a whole career in a role the applicant has never held. Fix: new `_years_label_names_a_foreign_role_or_skill(l, profile)` guard on the three overall-experience catch-alls. A "years of experience" label is diverted to the tiered (flooring) branch **only** when it names a role/skill/domain FOREIGN to the applicant's profile ("as a Lead", "with COBOL", "in the insurance sector"). Generic phrasing ("as a whole", "in the software industry", "in the US") and the applicant's own role/skills keep the full figure — an under-claimed "1"/"2" trips "minimum N years" knockout filters. Unrelated pre-existing bug found while here → **T41**. |
-| T41 | P3 | ✅ **fixed (PR pending)** — (found while implementing T40) `_get_profile_value`'s location branch did a tuple-membership substring check that matched `"city"` inside `"capacity"`, so `"years of experience in a professional/leadership capacity"` returned `profile["location"]` instead of a years figure. Pre-existing (same on `master`), **not** touched by T40. Fix: the `"city"` key is now matched on a word boundary (`re.search(r"\bcity\b", l)`); the multi-word location phrases stay as substring checks. See `## T41` below. |
+| T41 | P3 | ✅ **CLOSED** (#48, `8d0997d`, 2026-09-07) — (found while implementing T40) `_get_profile_value`'s location branch did a tuple-membership substring check that matched `"city"` inside `"capacity"`, so `"years of experience in a professional/leadership capacity"` returned `profile["location"]` instead of a years figure. Pre-existing (same on `master`), **not** touched by T40. Fix: the `"city"` key is now matched on a word boundary (`re.search(r"\bcity\b", l)`); the multi-word location phrases stay as substring checks. See `## T41` below. |
 | T42 | P3 | (found verifying T40 against the live `user_profile.json`) T40's `_years_label_names_a_foreign_role_or_skill` "does the qualifier appear in the applicant's background?" check has a `len(w) >= 3` guard, so a 2-char skill/domain token (`ai`, `ml`, `go`, `ui`, `ux`, `qa`, `bi`, `r`) is **never** matched against the profile → always classified "foreign" → floored to `"1"`. Live: `"years of experience in AI/ML"` → `"1"` for an applicant with `RAG Architectures` / `LLM Fine-tuning` / `Vector Databases` skills, an M.S. in Data Science, and "AI applications" in the summary. Underclaim (safe direction, and `1` ≠ `0`), narrow (skills literally in the `skills` list as ≥3-char tokens — Python/Kubernetes/AWS/Go — resolve correctly via an earlier exact-match branch), but real for AI/ML-targeted applications. See `## T42` below. **✅ CLOSED** (#45, QA 2026-09-07) — lowered the `bg` word-boundary guard to `len(w) >= 2`, added a whole-span match (`ai/ml` / `ai ml`) and a single-char exact-skill-entry check (step 3b: `"...with R"` for a listed `R`). Live: `"in AI / ML"` → `"1"` → `"4"`; QA run confirmed the "listed skill → full figure" path live (job 15, `Python years = '4'` via `_get_profile_value`). |
 | T43 | P4 | ✅ **CLOSED** (#56, `0831c61`, 2026-09-07 — 9 tests, reviewer independently verified 6/6 fail on `master`) — (found by the T41 PR #48 reviewer) `_get_profile_value`: a field labelled `"City, State"` / `"City/State"` returned `profile["state"]` (`"Utah"`) because the state-of-residence branch (`\bstate\b`) beat the city/location branch on ordering. Pre-existing; T41 locked it with a characterization test. Fix: a combined check ahead of the zip / street-address / state branches — when the normalized label names both `\bcity\b` and `\bstate\b` (or a `"city, state"` / `"city/state"` phrase) and the profile has a `location` string, return the full `location`. Bare `"City"` / `"State"` / `"Zip"` and `"What state do you live in?"` unaffected; falls through when `location` is empty. See `## T43` below. |
 | T47 | P3 | ✅ **CLOSED** (#65, `a2d68ec`, 2026-09-09 — behaviour-preserving: `test_profile_value.py` unchanged, 431 tests; live spot-check confirms as-a-Lead→`1`, Python→`4`, City/State→full location, "in a professional capacity"→`4`) — (tech debt — raised by the T43 #56 reviewer) `_get_profile_value` had grown to ~80 sequential `if` branches where every new rule (T40/T41/T42/T43) had to reason about global ordering to avoid an earlier branch stealing a label. Converted to a module-level ordered `_PROFILE_VALUE_RULES` list of `_ProfileRule(name, matches, resolve)` entries iterated once (first match wins). Normalization preamble unchanged; behaviour-preserving — `tests/test_profile_value.py` stays 100% green with zero assertion changes. See `## T47` below. |
@@ -314,7 +314,7 @@ Split the ~1,500-line `_llm_guided_apply` into testable seams: `page_snapshot` �
 
 ## T19 — Auto-run pending DB migrations on startup
 
-**Phase:** P3 · **Risk:** low · **Deps:** T8, T9 · **Status:** ✅ fixed (PR pending) · Raised by log-bug-detector during Wave 1 QA.
+**Phase:** P3 · **Risk:** low · **Deps:** T8, T9 · **Status:** ✅ **CLOSED** (#40, `4cfe735`, QA 2026-09-06) · Raised by log-bug-detector during Wave 1 QA.
 
 T8's indexes + WAL and T9's schema changes only take effect when the operator manually runs the migration scripts. For an unattended agent that's a footgun. Add a lightweight "run all `scripts/migrations/NNN_*.py` that haven't been applied" step to `apply_jobs.py` startup (and/or a Dagster op), tracked via a `schema_migrations(id TEXT PRIMARY KEY, applied_at INTEGER)` table. Each migration is already idempotent, so worst case is a fast no-op.
 
@@ -333,7 +333,7 @@ T8's indexes + WAL and T9's schema changes only take effect when the operator ma
 
 ## T20 — Pin `ruff` into the interpreter that runs the agent
 
-**Phase:** P3 · **Risk:** trivial · **Deps:** T1 · **Status:** ✅ fixed (PR pending) · Raised by log-bug-detector during Wave 1 QA.
+**Phase:** P3 · **Risk:** trivial · **Deps:** T1 · **Status:** ✅ **CLOSED** (#43, `15807ab`, 2026-09-07) · Raised by log-bug-detector during Wave 1 QA.
 
 `ruff` is in `[project.optional-dependencies].dev` but the `/opt/anaconda3/bin/python` env that actually runs the agent doesn't have it, so `ruff check .` only works in a fresh venv. Either document that lint runs in the venv, add a `make lint` / `scripts/lint.sh` that bootstraps it, or install it into the anaconda env and note that in `CLAUDE.md`.
 
@@ -394,7 +394,7 @@ New `tests/test_session_blocked_domains.py` (15 cases): operator row blocks end-
 
 ## T25 — NIM classifier model EOL
 
-**Phase:** T14 follow-up · **Risk:** low · **Status:** ✅ fixed (PR pending) · Found during T14 live QA 2026-08-31.
+**Phase:** T14 follow-up · **Risk:** low · **Status:** ✅ **CLOSED** — superseded by T27 (model → `meta/llama-3.2-11b-vision-instruct`) then T38 (classifier → Agent SDK default) · Found during T14 live QA 2026-08-31.
 
 `meta/llama-3.1-8b-instruct` (the `config.py` classifier default + `.env.template` + the `.env`) reached end-of-life on NVIDIA NIM 2026-08-26 → HTTP 410. NVIDIA also purged much of the small-model catalog (many IDs now 410 or 404). Live-tested replacements: `google/gemma-4-31b-it` works (clean `json_object`, correct on all probe cases, ~15s/call free tier); `openai/gpt-oss-20b` is a reasoning model with intermittent `None` content; `deepseek-v4-flash` (the `browser_use` default) never returned in >7 min on the free tier.
 
@@ -641,7 +641,7 @@ Reviewer feedback addressed: the earlier revision returned a blanket `min(tot, 2
 
 ## T41 — `_get_profile_value` location branch substring-matches `"city"` inside `"capacity"`
 
-**Phase:** T40 follow-up · **Risk:** low · **Status:** ✅ fixed (PR pending) · **Sev:** P3 · Found while implementing **T40** (PR #41).
+**Phase:** T40 follow-up · **Risk:** low · **Status:** ✅ **CLOSED** (#48, `8d0997d`, 2026-09-07) · **Sev:** P3 · Found while implementing **T40** (PR #41).
 
 **Symptom:** `_get_profile_value`'s city/location branch is a tuple-membership substring test — `any(k in l for k in ("city", "location", "where are you", ...))`. `"city"` is a substring of `"capacity"`, so a label like `"How many years of experience do you have in a professional capacity?"` or `"years of experience in a leadership capacity"` matches the location branch (which runs well before the years-of-experience logic) and returns `profile["location"]` (or `None` when the profile has no location). The applicant never gets a years figure for these phrasings.
 
@@ -683,7 +683,7 @@ Live before/after against the real `user_profile.json` (`years_experience: 4`): 
 
 ## T43 — `_get_profile_value`: a "City, State" label resolves to state only
 
-**Phase:** T41 follow-up · **Risk:** low · **Status:** ✅ **fixed (PR pending)** · **Sev:** P4 · Found by the T41 (PR #48) reviewer.
+**Phase:** T41 follow-up · **Risk:** low · **Status:** ✅ **CLOSED** (#56, `0831c61`, 2026-09-07) · **Sev:** P4 · Found by the T41 (PR #48) reviewer.
 
 **Symptom:** a form field labelled literally `"City, State"` (or `"City/State"`) returns `profile["state"]` (e.g. `"Utah"`) instead of the full location string (`"Salt Lake City, Utah"`) or the city. The state-of-residence branch (`_get_profile_value` ~line 689) matches `"state"` and wins on ordering over the city branch (~line 738).
 
@@ -699,7 +699,7 @@ Before/after (`PROFILE` fixture: `location="Salt Lake City, Utah"`, `state="Utah
 
 ## T44 — `_execute_action` fill selector chokes on React 18 `useId` colon IDs (`#react-select-:Rxxx:-input`)
 
-**Phase:** OffsiteApply reliability · **Risk:** low · **Status:** ✅ fixed (PR pending) · **Sev:** P2 · Found by the T39/T40/T42 combined apply-QA (`apply_jobs.py --auto --limit 20 --verbose`, 2026-09-07), job 8 (Lumenalta "Senior AI Fullstack Software Engineer", `lumenalta.com/jobs/.../apply`).
+**Phase:** OffsiteApply reliability · **Risk:** low · **Status:** ✅ **CLOSED** (#51, `7dff349`, 2026-09-07) · **Sev:** P2 · Found by the T39/T40/T42 combined apply-QA (`apply_jobs.py --auto --limit 20 --verbose`, 2026-09-07), job 8 (Lumenalta "Senior AI Fullstack Software Engineer", `lumenalta.com/jobs/.../apply`).
 
 **Fix (PR pending):** `_safe_selector` moved from a nested closure in `_execute_action`'s `fill` branch to a module-level helper in `linkedin_apply.py`, and generalised from "id starts with a digit" to "id is not a valid bare CSS identifier". Any bare `#id` / `tag#id` whose id contains a CSS-unsafe char (`:` from React `useId`, `.`, etc.) or an invalid start (leading digit / `-<digit>` / `--`) is rewritten to `[id="<id>"]`, with `"` and `\` backslash-escaped inside the quotes. Selectors containing a combinator (whitespace, `>`, `+`, `~`, `,`) pass through untouched — splitting an id from a trailing `:pseudo` / `[attr]` on the same token is deliberately not attempted (documented in the docstring); the LLM apply loop only ever emits bare `#id` / `tag#id` fill selectors. `#1foo` → `[id="1foo"]` exactly as before. `tests/test_offsite_seams.py`: 8 direct `_safe_selector` cases + `_execute_action` `fill`- and `select`-branch tests with a colon id. The `select` branch of `_execute_action` (~L4793) had its own inline `selector[1].isdigit()` normalizer with the identical latent bug (the LLM can emit a `select` action for the same react-select comboboxes); on the reviewer's request it was folded into this PR — replaced with `selector = _safe_selector(selector)`. Both branches now normalise `selector` in place, so the `finally` `state.selector = selector` writeback records the same form in step history.
 
@@ -721,7 +721,7 @@ The LLM re-proposed the same fill, the duplicate-fill guard advanced the section
 
 ## T45 — OffsiteApply "give up" paths always return `-2`; `_form_engaged` set by nav-link / not-found clicks (T39 follow-up)
 
-**Phase:** T39 follow-up · **Risk:** low · **Status:** ✅ fixed (PR pending) · **Sev:** P3 · Found by the T39/T40/T42 combined apply-QA (2026-09-07), job 4 (MedoSync "Backend Software Engineer – Rust", `medosync.com/careers/backend-developer`).
+**Phase:** T39 follow-up · **Risk:** low · **Status:** ✅ **CLOSED** (#54, `9aadbf7`, 2026-09-07) · **Sev:** P3 · Found by the T39/T40/T42 combined apply-QA (2026-09-07), job 4 (MedoSync "Backend Software Engineer – Rust", `medosync.com/careers/backend-developer`).
 
 **Fix (PR pending):** `linkedin_apply.py` — (1) new module-level `_terminal_state_for_stall(page, *, form_engaged)` helper that reproduces T39's inline URL-unchanged check verbatim (`urlparse(page.url).netloc` host + `_FORM_DOMAINS`/`_ATS_REQUIRE_APPLY_PATH` membership); the URL-unchanged stuck guard, the repeated-action give-up (both the fill-branch and the non-fill `else`) and the step-limit exit all `return _terminal_state_for_stall(page, form_engaged=_form_engaged)` instead of an unconditional `"failed"`. (2) `_StepState` gains `click_hit_target`; `_execute_action`'s click branch sets it to `clicked and not _is_anchor_only` (and `True` on a forced submit-button click), and the loop sets `_form_engaged` for `fill`/`select`/`upload` unconditionally but for `click` only when `click_hit_target` — a not-found click or a bare-`<a>` nav link ("Apply" / "Working with us") no longer counts. Net: MedoSync (non-ATS host, nav-chrome only) → `blocked`/`-3`; a stall after real fills, or on an ATS form host, stays `failed`/`-2`. Tests: `tests/test_greenhouse_redirect.py` (`_terminal_state_for_stall` unit + repeated-action / step-limit / not-found-click / form-engaged cases).
 
@@ -751,7 +751,7 @@ The LLM re-proposed the same fill, the duplicate-fill guard advanced the section
 
 ## T46 — `torentify.com` is an aggregator that bounces through jooble.org → talent.com; add to `_OFFSITE_SPAM`
 
-**Phase:** OffsiteApply hygiene · **Risk:** low · **Status:** ✅ fixed (PR pending) · **Sev:** P3 · Found by the T39/T40/T42 combined apply-QA (2026-09-07) — jobs 9, 14, 16 were all Torentify.
+**Phase:** OffsiteApply hygiene · **Risk:** low · **Status:** ✅ **CLOSED** (#52, `97b3d59`, 2026-09-07) · **Sev:** P3 · Found by the T39/T40/T42 combined apply-QA (2026-09-07) — jobs 9, 14, 16 were all Torentify.
 
 **Symptom:** `torentify.com/jobs/<id>` renders an SPA with an "Apply Now" button that navigates to `jooble.org/away/<id>` (an interstitial redirector), which redirects again to either `talent.com/jobs?...&id=<id>` (job 9) or a Cloudflare bot-verification wall (job 16). None of these is the real employer ATS.
 
