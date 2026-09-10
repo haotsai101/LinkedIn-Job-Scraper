@@ -1264,7 +1264,8 @@ _PROFILE_VALUE_RULES: list[_ProfileRule] = [
                  _edu_field("field")),
     _ProfileRule("how_did_you_hear",
                  _kw("where did you hear", "how did you hear", "how did you find out",
-                     "how did you learn about", "source of hire"),
+                     "how did you learn about", "source of hire", "referral source",
+                     "source of application", "how were you referred"),
                  _const("LinkedIn")),
     _ProfileRule("travel",
                  lambda lbl, kind, p: kind in _CHOICE_KINDS
@@ -1389,10 +1390,13 @@ _PROFILE_VALUE_RULES: list[_ProfileRule] = [
     # no referral. Position: BEFORE the broad "name" match below, which would
     # otherwise fill "…please add their name here" with the applicant's OWN name
     # (observed on real Easy Apply forms).
+    # "referral source" / "how were you referred" are handled by how_did_you_hear
+    # above (→ LinkedIn). Anything else mentioning a referral is a name-soliciting
+    # field and must stay blank — never the applicant's own name.
     _ProfileRule("referral_name",
                  _kw("referred by", "referred you", "who referred", "person who referred",
-                     "employee who referred", "referral", "referrer", "refer you to",
-                     "name of the referrer", "referring employee"),
+                     "employee who referred", "referrer", "refer you to",
+                     "name of the referrer", "referring employee", "referral"),
                  _const("")),
     # "name" is a broad substring — MUST be near the end (after first/last/
     # preferred/middle name, company name, etc.).

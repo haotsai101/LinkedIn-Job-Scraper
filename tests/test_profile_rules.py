@@ -121,6 +121,13 @@ def test_plain_name_fields_still_resolve_to_the_applicant():
     assert _gpv(_APPLICANT, "Name", "text") == "Zhi-Hao Tsai"
 
 
+def test_referral_source_is_a_how_did_you_hear_field_not_a_name_field():
+    # "Referral source" / "how were you referred" ask HOW, not WHO — they must
+    # resolve to the channel, never blank and never the applicant's name.
+    assert _gpv(_APPLICANT, "Referral source", "text") == "LinkedIn"
+    assert _gpv(_APPLICANT, "How were you referred to this role?", "text") == "LinkedIn"
+
+
 # ── T48 #1: _anchored_in_bg boundary class includes "-" and "_" ───────────────
 
 _GO_TO_PROFILE = {
