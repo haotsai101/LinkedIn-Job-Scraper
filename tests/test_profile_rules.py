@@ -92,6 +92,35 @@ def test_rule_names_are_unique_and_ordered_list_is_non_empty():
     assert names[-1] == "url_kind_fallback"        # catch-all runs last
 
 
+# ── referral / "who referred you" fields must stay blank ──────────────────────
+
+_APPLICANT = {"full_name": "Zhi-Hao Tsai", "preferred_name": ""}
+
+
+def test_referral_name_field_stays_blank_not_own_name():
+    # The broad "name" match would otherwise fill these with the applicant's own
+    # name. A referral field must be left empty (skipped by the fill loop).
+    for lbl in (
+        "If you were referred by a Resource Innovations employee, please add their name here.",
+        "Who referred you to this role?",
+        "Name of the referring employee",
+        "Referral",
+        "Employee Referral - Referrer Name",
+    ):
+        assert _gpv(_APPLICANT, lbl, "text") == "", lbl
+
+
+def test_referral_rule_precedes_full_name_rule():
+    names = [r.name for r in la._PROFILE_VALUE_RULES]
+    assert names.index("referral_name") < names.index("full_name")
+
+
+def test_plain_name_fields_still_resolve_to_the_applicant():
+    # regression guard — the new rule must not swallow ordinary name fields.
+    assert _gpv(_APPLICANT, "Full name", "text") == "Zhi-Hao Tsai"
+    assert _gpv(_APPLICANT, "Name", "text") == "Zhi-Hao Tsai"
+
+
 # ── T48 #1: _anchored_in_bg boundary class includes "-" and "_" ───────────────
 
 _GO_TO_PROFILE = {

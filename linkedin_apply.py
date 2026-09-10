@@ -1385,6 +1385,15 @@ _PROFILE_VALUE_RULES: list[_ProfileRule] = [
     _ProfileRule("name_pronunciation",
                  _kw("pronunciation", "phonetic", "how to pronounce"),
                  _const("")),
+    # A referral / "who referred you" field must stay blank — the applicant has
+    # no referral. Position: BEFORE the broad "name" match below, which would
+    # otherwise fill "…please add their name here" with the applicant's OWN name
+    # (observed on real Easy Apply forms).
+    _ProfileRule("referral_name",
+                 _kw("referred by", "referred you", "who referred", "person who referred",
+                     "employee who referred", "referral", "referrer", "refer you to",
+                     "name of the referrer", "referring employee"),
+                 _const("")),
     # "name" is a broad substring — MUST be near the end (after first/last/
     # preferred/middle name, company name, etc.).
     _ProfileRule("full_name", _kw("name", "full name"), _pv("full_name")),
@@ -3545,7 +3554,7 @@ class OffsiteApplyFlow:
             "non-zero figure that does not exceed the applicant's overall years of experience "
             "(yrs=...). "
             "CRITICAL: Never fabricate URLs, social media handles, usernames, or any information not in the profile. "
-            "For any field where you have no value (optional URL, referral email, social handle, portfolio, etc.) — do NOT issue a fill action at all. Skip that field entirely and move to the next [EMPTY] field or click Submit. Never fill a field with an empty string (value='') — an empty fill does nothing useful and can trigger browser validation errors. "
+            "For any field where you have no value (optional URL, referral email, social handle, portfolio, a 'who referred you' / 'referred by' / referral name field, etc.) — do NOT issue a fill action at all. Skip that field entirely and move to the next [EMPTY] field or click Submit. Never put the applicant's own name in a referral field. Never fill a field with an empty string (value='') — an empty fill does nothing useful and can trigger browser validation errors. "
             "If all [EMPTY] fields are filled and a submit button is listed as (offscreen), use action=click with its selector to click it — do not scroll first. "
             "Never click bare 'Apply' nav links — only 'Apply Now', 'Apply for this job', 'Submit application'. "
             "Never click Login/Sign-in unless you just filled email+password. "
