@@ -210,12 +210,16 @@ class _UrlOnlyPage:
 
 
 def test_blocked_ats_landing_domain_returns_blocked(monkeypatch):
-    """A landing on an un-automatable ATS (Workday etc.) short-circuits to
+    """A landing on an un-automatable ATS (UltiPro etc.) short-circuits to
     'blocked' before any LLM/browser work — run_session maps that to applied=-3
-    so --reset-failed never brings it back."""
+    so --reset-failed never brings it back.
+
+    T51: this used a myworkdayjobs.com URL before Workday was removed from
+    _BLOCKED_AUTO_APPLY_DOMAINS — swapped to another still-blocked ATS
+    (UltiPro); see test_workday_flow.py for Workday-specific coverage."""
     _install(monkeypatch, _QueryStub())
     flow = _offsite(company_name="ACME", job_title="Dev")
-    out = asyncio.run(flow._llm_guided_apply(_UrlOnlyPage("https://acme.myworkdayjobs.com/en-US/careers/job/123")))
+    out = asyncio.run(flow._llm_guided_apply(_UrlOnlyPage("https://acme.ultipro.com/en-US/careers/job/123")))
     assert out == "blocked"
 
 

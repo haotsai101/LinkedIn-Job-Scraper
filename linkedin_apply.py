@@ -3455,13 +3455,18 @@ class OffsiteApplyFlow:
                 }
                 const visibleText = texts.join(' ').replace(/\\s+/g, ' ').slice(0, 1200);
 
-                // Label resolver — prefers <label for=id>, then aria-label, then placeholder, then name
+                // Label resolver — prefers <label for=id>, then aria-label, then placeholder,
+                // then name, then data-automation-id (T51 — Workday and other ATSes that
+                // identify controls primarily via data-automation-id rather than a visible
+                // <label>/aria-label/name would otherwise surface as unlabeled [EMPTY] fields
+                // the LLM step loop can't act on meaningfully).
                 const lbl = (el) => {
                     const forEl = el.id ? document.querySelector('label[for="' + el.id + '"]') : null;
                     return (forEl && forEl.textContent.trim())
                         || el.getAttribute('aria-label')
                         || el.getAttribute('placeholder')
                         || el.getAttribute('name')
+                        || el.getAttribute('data-automation-id')
                         || '';
                 };
 
@@ -3485,7 +3490,10 @@ class OffsiteApplyFlow:
                     const hasName = !!el.name;
                     const hasLabel = !!(el.getAttribute('aria-label') || el.getAttribute('placeholder') ||
                         (el.id && document.querySelector('label[for="' + el.id + '"]')));
-                    return hasId || hasName || hasLabel;
+                    // T51: a data-automation-id-only control (no id/name/aria-label/placeholder)
+                    // must still be included — otherwise it's dropped before lbl() ever runs.
+                    const hasAutomationId = !!el.getAttribute('data-automation-id');
+                    return hasId || hasName || hasLabel || hasAutomationId;
                 })
                 .map(el => {
                     const f = {
@@ -3802,6 +3810,10 @@ class OffsiteApplyFlow:
     )
     # Domains that are dead ends regardless of path (SSO login walls, enterprise portals).
     _DEAD_END_DOMAINS = ("my.greenhouse.io",)
+    # Workday career-site domains (T51). No longer in _BLOCKED_AUTO_APPLY_DOMAINS —
+    # gates the Workday-specific auth selectors (_try_login/_try_register) and the
+    # "prefer Autofill with Resume over Apply Manually" nudge (_prefer_workday_autofill).
+    _WORKDAY_DOMAINS = ("myworkdayjobs.com", "myworkdaysite.com")
     # Reasons in an LLM "failed" action that mean an unbeatable verification wall → skip.
     _UNBLOCKABLE_WALL_KEYWORDS = ("persona", "identity", "verif", "captcha", "recaptcha")
     # SSO / IdP hosts — handed to _handle_sso_page instead of the LLM loop.
@@ -3871,7 +3883,9 @@ class OffsiteApplyFlow:
         "apply.careers.microsoft.com",  # Requires Microsoft account
         "ycombinator.com",              # YC Work — SSO only
         # ATS platforms with invisible SPA login modals (Apply opens overlay Playwright can't inspect)
-        "myworkdayjobs.com", "myworkdaysite.com",   # Workday
+        # NOTE: Workday (myworkdayjobs.com / myworkdaysite.com) was here until T51 — see
+        # _WORKDAY_DOMAINS above for the Autofill-with-Resume + correction-loop approach
+        # that replaced the blanket block.
         "ultipro.com",                              # UltiPro/UKG
         "bamboohr.com",                             # BambooHR
         "icims.com",                                # iCIMS
@@ -4073,6 +4087,69 @@ class OffsiteApplyFlow:
             except Exception:
                 pass
         return None
+
+    # ── Seam: prefer_workday_autofill (T51) ─────────────────────────────────
+    async def _prefer_workday_autofill(self, page: Page) -> None:
+        """Workday-only nudge: when the application-start page offers both
+        "Autofill with Resume" and "Apply Manually", click Autofill so Workday
+        parses the uploaded resume into My Experience / My Information before
+        the generic step loop starts correcting whatever the parse got wrong
+        (Option C — see docs/TICKETS.md T51).
+
+        Deliberately does NOT handle the resume upload itself: Autofill
+        reveals a ``<input type="file">`` the same way every other ATS's
+        resume-upload step already does on this codebase, and the existing
+        generic ``upload`` action in :meth:`_execute_action` (driven by the
+        LLM step loop) picks it up on the very next step — no Workday-specific
+        upload code needed, matching T51's "the correction loop should fall
+        out of the existing generic step loop" scope.
+
+        A no-op on any non-Workday domain, and a no-op when only one of the
+        two buttons is present (Autofill already used on a prior step, or a
+        Workday tenant that only offers Manual entry) — the LLM step loop
+        continues normally from there either way.
+        """
+        try:
+            _netloc = urlparse(page.url).netloc.lower()
+        except Exception:
+            return
+        if not any(self._domain_matches(_netloc, d) for d in self._WORKDAY_DOMAINS):
+            return
+        try:
+            autofill = page.locator(
+                'button:has-text("Autofill with Resume"), a:has-text("Autofill with Resume"), '
+                '[role="button"]:has-text("Autofill with Resume")'
+            ).first
+            manual = page.locator(
+                'button:has-text("Apply Manually"), a:has-text("Apply Manually"), '
+                '[role="button"]:has-text("Apply Manually")'
+            ).first
+            if await autofill.count() == 0 or await manual.count() == 0:
+                return
+            if not await autofill.is_visible():
+                return
+            print("  [Offsite] Workday: 'Autofill with Resume' + 'Apply Manually' both "
+                  "offered — preferring Autofill")
+            # Same 3-tier click-retry chain used for Workday's registration submit
+            # (_try_register): a transparent overlay div can intercept the real click.
+            try:
+                await autofill.click(timeout=5000)
+            except Exception:
+                try:
+                    await autofill.click(force=True, timeout=5000)
+                except Exception:
+                    try:
+                        await page.locator('[data-automation-id="click_filter"]').first.click(
+                            force=True, timeout=5000
+                        )
+                    except Exception:
+                        print("  [Offsite] Workday: could not click Autofill — "
+                              "falling through to normal step loop")
+                        return
+            await asyncio.sleep(2)
+        except Exception as exc:
+            print(f"  [Offsite] Workday autofill preference check errored ({exc}) — "
+                  "continuing normally")
 
     # ── Seam: handle_auth ─────────────────────────────────────────────────
     # Return protocol for _handle_auth:
@@ -4364,6 +4441,13 @@ class OffsiteApplyFlow:
                 print(f"  [LLM] Redirected to blocked / dead-end domain mid-flow ({_url_domain}) — "
                       f"needs a human, marking blocked (no auto-retry)")
                 return "blocked"
+
+            # T51: Workday-only nudge — prefer "Autofill with Resume" over "Apply
+            # Manually" when both are offered. No-op off Workday or once Autofill
+            # has already been used; runs every iteration since it's unclear
+            # which step (pre- or post-account-creation) a given Workday tenant
+            # shows this choice on.
+            await self._prefer_workday_autofill(page)
 
             # Auth walls (URL-based): SSO / IdP redirects and login/registration
             # pages. Path segments are matched so /joinroot/ != /join, etc.
@@ -5892,14 +5976,18 @@ class OffsiteApplyFlow:
         """Fill login form and submit. Returns True if URL changed away from login page."""
         url_before = page.url
         try:
-            for sel in ('input[type="email"]', '#email', 'input[name*="email" i]',
-                        'input[placeholder*="email" i]', 'input[name*="user" i]'):
+            # T51: Workday-specific automation ids tried first (well-documented, stable
+            # Workday convention) — generic selectors remain the fallback for every other ATS.
+            for sel in ('[data-automation-id="email"]', 'input[type="email"]', '#email',
+                        'input[name*="email" i]', 'input[placeholder*="email" i]',
+                        'input[name*="user" i]'):
                 el = page.locator(sel).first
                 if await el.count() > 0 and await el.is_visible():
                     await _human_type(el, email)
                     await asyncio.sleep(random.uniform(0.3, 0.7))
                     break
-            for sel in ('input[type="password"]', '#password', 'input[name*="password" i]'):
+            for sel in ('[data-automation-id="password"]', 'input[type="password"]', '#password',
+                        'input[name*="password" i]'):
                 el = page.locator(sel).first
                 if await el.count() > 0 and await el.is_visible():
                     await _human_type(el, password)
@@ -5936,9 +6024,11 @@ class OffsiteApplyFlow:
         Returns True if the URL changed after submitting (indicating success).
         """
         try:
-            # Check if we're already on a registration page (has confirm-password field)
+            # Check if we're already on a registration page (has confirm-password field).
+            # T51: Workday's own confirm-password field is data-automation-id="verifyPassword".
             confirm_field = page.locator(
-                'input[name*="confirm" i], input[name*="repeat" i], input[placeholder*="confirm" i]'
+                'input[name*="confirm" i], input[name*="repeat" i], '
+                'input[placeholder*="confirm" i], [data-automation-id="verifyPassword"]'
             ).first
             is_reg_page = await confirm_field.count() > 0
 
@@ -6103,20 +6193,53 @@ class OffsiteApplyFlow:
                     'input[placeholder*="first name" i]'], first)
         await _try(['#lastName', 'input[name="lastName"]', 'input[name*="last" i]',
                     'input[placeholder*="last name" i]'], last)
-        await _try(['input[type="email"]', '#email', 'input[name*="email" i]',
-                    'input[placeholder*="email" i]'], p.get("email", ""))
+        # T51: Workday's create-account email field is data-automation-id="email" —
+        # tried first, generic selectors remain the fallback for every other ATS.
+        await _try(['[data-automation-id="email"]', 'input[type="email"]', '#email',
+                    'input[name*="email" i]', 'input[placeholder*="email" i]'], p.get("email", ""))
 
-        # Fill all visible password fields (covers password + confirm password)
-        pw_fields = page.locator('input[type="password"]')
-        count = await pw_fields.count()
-        for i in range(min(count, 2)):
-            el = pw_fields.nth(i)
-            if await el.is_visible():
-                try:
-                    await _human_type(el, pw)
-                    await asyncio.sleep(random.uniform(0.2, 0.4))
-                except Exception:
-                    pass
+        # T51: Workday exposes explicit automation ids for password + confirm-password
+        # (data-automation-id="password" / "verifyPassword") — try those first so the
+        # right field gets the right value even if DOM order ever differs from the
+        # generic assumption below. Falls back to filling the first two
+        # input[type=password] elements positionally (password, then confirm) for
+        # every other ATS, unchanged from before.
+        _wd_password = page.locator('[data-automation-id="password"]').first
+        _wd_verify_password = page.locator('[data-automation-id="verifyPassword"]').first
+        if await _wd_password.count() > 0 and await _wd_verify_password.count() > 0:
+            for el in (_wd_password, _wd_verify_password):
+                if await el.is_visible():
+                    try:
+                        await _human_type(el, pw)
+                        await asyncio.sleep(random.uniform(0.2, 0.4))
+                    except Exception:
+                        pass
+        else:
+            # Fill all visible password fields (covers password + confirm password)
+            pw_fields = page.locator('input[type="password"]')
+            count = await pw_fields.count()
+            for i in range(min(count, 2)):
+                el = pw_fields.nth(i)
+                if await el.is_visible():
+                    try:
+                        await _human_type(el, pw)
+                        await asyncio.sleep(random.uniform(0.2, 0.4))
+                    except Exception:
+                        pass
 
         await _try(['input[type="tel"]', 'input[name*="phone" i]',
                     'input[placeholder*="phone" i]'], p.get("phone", ""))
+
+        # T51: Workday requires accepting Terms & Conditions before account creation
+        # will succeed — data-automation-id="createAccountCheckbox" is a documented,
+        # stable Workday convention. No generic equivalent is added here (a bare
+        # "any checkbox on the page" selector risks ticking an unrelated marketing/
+        # opt-in checkbox on other ATSes) — Workday-only, by design.
+        _wd_checkbox = page.locator('[data-automation-id="createAccountCheckbox"]').first
+        if await _wd_checkbox.count() > 0 and await _wd_checkbox.is_visible():
+            try:
+                if not await _wd_checkbox.is_checked():
+                    await _wd_checkbox.check()
+                    await asyncio.sleep(random.uniform(0.2, 0.4))
+            except Exception:
+                pass
