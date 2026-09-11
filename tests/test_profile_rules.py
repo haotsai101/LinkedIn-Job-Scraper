@@ -210,3 +210,131 @@ def test_leading_and_in_skills_no_longer_hides_a_single_char_skill():
     assert _gpv(prof, "Years of experience with R", "text") == "7"
     # control: an unlisted single-char skill is still foreign -> floored.
     assert _gpv(prof, "Years of experience with C", "text") == "1"
+
+
+# ── T50: work_history rules ─────────────────────────────────────────────────
+
+_WORK_HISTORY_PROFILE = {
+    "full_name": "Jordan Rivera",
+    "current_title": "Software Engineer",
+    "work_history": [
+        {
+            "employer": "Instructure",
+            "title": "Software Engineer",
+            "location": "American Fork, Utah",
+            "start_date": "2022-09",
+            "end_date": None,
+            "current": True,
+            "bullets": ["Built Go microservices on AWS EKS."],
+        },
+        {
+            "employer": "Qualtrics",
+            "title": "Software Engineer I",
+            "location": "Provo, Utah",
+            "start_date": "2021-01",
+            "end_date": "2022-08",
+            "current": False,
+            "bullets": ["Developed FastAPI services."],
+        },
+    ],
+}
+
+
+def test_latest_work_history_entry_prefers_the_current_flag():
+    # The current:True entry wins even if it isn't first in the list.
+    out_of_order = {
+        "work_history": [
+            {"employer": "Old Co", "current": False},
+            {"employer": "New Co", "current": True},
+        ]
+    }
+    assert la._latest_work_history_entry(out_of_order)["employer"] == "New Co"
+    # No current:True anywhere -> falls back to the first (most-recent-first) entry.
+    assert la._latest_work_history_entry(_WORK_HISTORY_PROFILE)["employer"] == "Instructure"
+
+
+def test_latest_work_history_entry_tolerates_missing_or_malformed_data():
+    assert la._latest_work_history_entry({}) == {}
+    assert la._latest_work_history_entry({"work_history": []}) == {}
+    assert la._latest_work_history_entry({"work_history": "not a list"}) == {}
+    assert la._latest_work_history_entry({"work_history": ["not a dict"]}) == {}
+
+
+def test_current_company_falls_back_to_work_history_employer():
+    # No legacy current_company/employer field -> resolves from work_history.
+    assert _gpv(_WORK_HISTORY_PROFILE, "Current employer", "text") == "Instructure"
+    assert _gpv(_WORK_HISTORY_PROFILE, "Most recent employer", "text") == "Instructure"
+    assert _gpv(_WORK_HISTORY_PROFILE, "Company name", "text") == "Instructure"
+    # No work_history and no legacy field at all -> "N/A" (unchanged pre-T50 behavior).
+    assert _gpv({}, "Current employer", "text") == "N/A"
+
+
+def test_current_company_legacy_field_still_wins_over_work_history():
+    prof = dict(_WORK_HISTORY_PROFILE, current_company="Acme Corp")
+    assert _gpv(prof, "Current employer", "text") == "Acme Corp"
+
+
+def test_work_history_start_date_resolves_from_the_current_entry():
+    assert _gpv(_WORK_HISTORY_PROFILE, "Start Date", "text") == "2022-09"
+    assert _gpv(_WORK_HISTORY_PROFILE, "Employment Start Date", "text") == "2022-09"
+    assert _gpv(_WORK_HISTORY_PROFILE, "From Date", "text") == "2022-09"
+    # No work history at all -> None (no LLM-fabricated date).
+    assert _gpv({}, "Start Date", "text") is None
+
+
+def test_work_history_end_date_resolves_to_present_when_current():
+    assert _gpv(_WORK_HISTORY_PROFILE, "End Date", "text") == "Present"
+    assert _gpv(_WORK_HISTORY_PROFILE, "To Date", "text") == "Present"
+
+
+def test_work_history_end_date_resolves_to_the_real_date_when_not_current():
+    non_current_profile = {"work_history": [_WORK_HISTORY_PROFILE["work_history"][1]]}
+    assert _gpv(non_current_profile, "End Date", "text") == "2022-08"
+
+
+def test_job_offer_start_date_rule_is_unaffected_by_work_history_rules():
+    # work_history_start_date matches "start date" by EXACT label equality, not
+    # substring, precisely so it doesn't steal a qualified job-offer phrasing —
+    # those still fall through to (and substring-match) the job-offer rule and
+    # resolve to "Immediately", even when a work_history entry is present.
+    assert _gpv(_WORK_HISTORY_PROFILE, "When can you start?", "select") == "Immediately"
+    assert _gpv(_WORK_HISTORY_PROFILE, "Earliest available", "text") == "Immediately"
+    assert _gpv(_WORK_HISTORY_PROFILE, "Desired Start Date", "text") == "Immediately"
+    assert _gpv(_WORK_HISTORY_PROFILE, "Earliest Start Date", "text") == "Immediately"
+
+
+def test_up_to_date_and_achievements_to_date_are_not_claimed_by_end_date_rule():
+    # work_history_end_date matches "to date" by EXACT label equality too, so a
+    # field that merely *contains* "to date" ("Is your profile up to date?",
+    # "Summarize your achievements to date") is never misread as an
+    # employment-record end date and correctly falls through to no match.
+    assert _gpv(_WORK_HISTORY_PROFILE, "Is your profile up to date?", "text") is None
+    assert _gpv(_WORK_HISTORY_PROFILE, "Summarize your achievements to date", "textarea") is None
+
+
+def test_work_history_start_date_rule_precedes_the_job_offer_start_date_rule():
+    names = [r.name for r in la._PROFILE_VALUE_RULES]
+    assert names.index("work_history_start_date") < names.index("start_date")
+
+
+def test_currently_work_here_checkbox():
+    assert _gpv(_WORK_HISTORY_PROFILE, "I currently work here", "checkbox") == "on"
+    non_current_profile = {"work_history": [_WORK_HISTORY_PROFILE["work_history"][1]]}
+    # Not current -> "" (skip filling; the checkbox's native default is
+    # unchecked, and _fill_field can only check a box, never uncheck one).
+    assert _gpv(non_current_profile, "I currently work here", "checkbox") == ""
+
+
+def test_currently_work_here_select():
+    assert _gpv(_WORK_HISTORY_PROFILE, "Currently working in this role?", "select") == "Yes"
+    non_current_profile = {"work_history": [_WORK_HISTORY_PROFILE["work_history"][1]]}
+    assert _gpv(non_current_profile, "Currently working in this role?", "select") == "No"
+
+
+def test_job_title_is_covered_by_the_existing_current_title_rule_not_duplicated():
+    # T50 explicitly checked this before adding a new rule: "job title" already
+    # routes through the pre-existing current_title rule. No separate
+    # work-history-sourced "job title" rule was added.
+    assert _gpv(_WORK_HISTORY_PROFILE, "Job Title", "text") == "Software Engineer"
+    names = [r.name for r in la._PROFILE_VALUE_RULES]
+    assert names.count("current_title") == 1

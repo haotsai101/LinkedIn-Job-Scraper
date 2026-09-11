@@ -337,6 +337,52 @@ def save_profile(profile: dict):
     print(f"Profile saved to {PROFILE_PATH}")
 
 
+def _collect_work_history() -> list[dict]:
+    """Interactively collect 1+ work-history entries for the ``--setup`` interview
+    (T50). ``education`` above is a single free-text question later structured by
+    the LLM step — that pattern doesn't fit here since an applicant has multiple
+    past roles, so this loops with the same one-question-at-a-time prompt style
+    as ``PROFILE_QUESTIONS`` instead ("add another job? y/n").
+
+    Structured directly here rather than folded into ``raw_answers`` and run
+    through the LLM profile-structuring step below, so an ATS "My Experience"
+    step always gets a clean {employer, title, location, start_date, end_date,
+    current, bullets} shape to read from — independent of whether LLM_API /
+    LLM_URL / LLM_MODEL are configured.
+    """
+    print("\n  Work history (most recent job first) — used by ATS \"My Experience\"")
+    print("  steps (e.g. Workday) that ask for structured past employment.\n")
+    entries: list[dict] = []
+    while True:
+        print(f"  Job #{len(entries) + 1}:")
+        employer = input("    Employer:\n    > ").strip()
+        title = input("    Job title:\n    > ").strip()
+        location = input("    Location:\n    > ").strip()
+        start_date = input("    Start date (e.g. 2022-09):\n    > ").strip()
+        current = input(
+            "    Do you currently work here? (yes / no):\n    > "
+        ).strip().lower() in ("y", "yes")
+        end_date = "" if current else input("    End date (e.g. 2023-06):\n    > ").strip()
+        bullets_raw = input(
+            "    Key achievements, semicolon-separated (Enter to skip):\n    > "
+        ).strip()
+        bullets = [b.strip() for b in bullets_raw.split(";") if b.strip()]
+        entries.append({
+            "employer": employer,
+            "title": title,
+            "location": location,
+            "start_date": start_date,
+            "end_date": None if current else (end_date or None),
+            "current": current,
+            "bullets": bullets,
+        })
+        again = input("\n  Add another job? (y/n):\n  > ").strip().lower()
+        if again not in ("y", "yes"):
+            break
+        print()
+    return entries
+
+
 def build_profile_interactively(client: "OpenAI | None", model: str) -> dict:
     print("\n── Profile Setup ─────────────────────────────────────────────────────")
     print("Answer the questions below. Your profile is stored locally and used")
@@ -346,12 +392,15 @@ def build_profile_interactively(client: "OpenAI | None", model: str) -> dict:
     for key, prompt in PROFILE_QUESTIONS:
         raw_answers[key] = input(f"  {prompt}:\n  > ").strip()
 
+    work_history = _collect_work_history()
+
     if client is None or not model:
         print(
             "\n  LLM_API / LLM_URL / LLM_MODEL not set — storing your raw answers "
             "as-is. Configure them in .env and re-run `--setup` to have the "
             "profile structured (skills list, education object, etc.)."
         )
+        raw_answers["work_history"] = work_history
         save_profile(raw_answers)
         return raw_answers
 
@@ -379,6 +428,11 @@ def build_profile_interactively(client: "OpenAI | None", model: str) -> dict:
         print(f" failed ({_exc}). Storing raw answers — re-run `--setup` after "
               "checking LLM_API / LLM_URL / LLM_MODEL.")
         profile = raw_answers
+
+    # Merge the separately-collected structured work history back in on both the
+    # LLM-structured and the raw-answers-fallback path — it was never part of
+    # raw_answers/the LLM structuring call above (T50).
+    profile["work_history"] = work_history
 
     print(" done.")
     save_profile(profile)

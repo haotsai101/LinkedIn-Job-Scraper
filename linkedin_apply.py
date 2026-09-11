@@ -1047,8 +1047,58 @@ def _resolve_summary(lbl: str, kind: str, p: dict) -> "str | None":
     return p.get("summary") or p.get("cover_letter_text")
 
 
+def _latest_work_history_entry(p: dict) -> dict:
+    """The applicant's current job, or their most recent one if none is marked
+    current (T50) — the row an ATS "My Experience"/employment-history step reads
+    from. ``work_history`` (see ``user_profile.json``) is expected ordered
+    most-recent-first, but a ``current: True`` entry anywhere in the list still
+    wins first (defensive against a hand-edited or out-of-order profile);
+    otherwise the first entry is used. Returns ``{}`` when there is no usable
+    work history so callers can ``.get(...)`` off it unconditionally.
+    """
+    history = p.get("work_history")
+    if not isinstance(history, list) or not history:
+        return {}
+    for entry in history:
+        if isinstance(entry, dict) and entry.get("current"):
+            return entry
+    first = history[0]
+    return first if isinstance(first, dict) else {}
+
+
 def _resolve_current_company(lbl: str, kind: str, p: dict) -> str:
-    return p.get("current_company") or p.get("employer") or "N/A"
+    # T50: fall back to work_history's current/most-recent employer when the
+    # legacy flat `current_company` / `employer` fields aren't set. The legacy
+    # fields win when present so an explicit override still takes priority.
+    return (p.get("current_company") or p.get("employer")
+            or _latest_work_history_entry(p).get("employer") or "N/A")
+
+
+def _resolve_work_history_start_date(lbl: str, kind: str, p: dict) -> "str | None":
+    return _latest_work_history_entry(p).get("start_date") or None
+
+
+def _resolve_work_history_end_date(lbl: str, kind: str, p: dict) -> str:
+    entry = _latest_work_history_entry(p)
+    if entry.get("current"):
+        return "Present"
+    return entry.get("end_date") or "Present"
+
+
+def _resolve_currently_work_here(lbl: str, kind: str, p: dict) -> str:
+    """"I currently work here" checkbox/select on an employment-history row.
+
+    The deterministic checkbox filler (``_fill_field``) can only *check* a box,
+    never uncheck one, so when the most recent ``work_history`` entry is NOT
+    marked current we deliberately return ``""`` here: that skips filling (and
+    the LLM fallback, since we already have a confident answer) and leaves the
+    checkbox at its native default of unchecked — the correct state. Only the
+    currently-employed case returns a truthy value so the filler checks it.
+    """
+    is_current = bool(_latest_work_history_entry(p).get("current"))
+    if kind in ("select", "select-one"):
+        return "Yes" if is_current else "No"
+    return "on" if is_current else ""
 
 
 def _resolve_job_type(lbl: str, kind: str, p: dict) -> str:
@@ -1181,9 +1231,49 @@ _PROFILE_VALUE_RULES: list[_ProfileRule] = [
                      "company name", "organization name", "most recent employer", "most recent company"))
                  or lbl in ("org", "company", "organization", "employer"),
                  _resolve_current_company),
+    # "job title" is already covered above — current_title is the applicant's
+    # current/most-recent title, kept in sync with work_history[0] by
+    # user_profile.json / build_profile_interactively. No separate work-history
+    # rule needed (T50 checked this explicitly before adding new rules).
     _ProfileRule("current_title",
                  _kw("current title", "job title", "current role", "current position"),
                  _pv("current_title")),
+    # T50: employment-history date/checkbox fields on an ATS "My Experience"
+    # step, sourced from work_history's current/most-recent entry
+    # (_latest_work_history_entry). MUST precede the "start_date" job-offer rule
+    # further down (~"earliest available" / "when can you start") so a bare
+    # "Start Date" on an employment-history row resolves to a real past date
+    # instead of the job-offer-availability constant "Immediately".
+    #
+    # "start date" / "from date" / "from" / "end date" / "to date" / "to" are
+    # matched by EXACT label equality, not substring — deliberately, so a
+    # qualified job-offer phrasing ("Desired Start Date", "Earliest Start
+    # Date") does NOT match here (falls through to the job-offer rule instead,
+    # which still substring-matches "start date") and an unrelated field that
+    # merely contains "to date" ("Is your resume up to date?", "Achievements to
+    # date") is never misread as an employment-record end date. The compound
+    # "employment/job/position start|end date" phrases are unambiguous enough
+    # to stay substring-matched.
+    _ProfileRule("work_history_start_date",
+                 lambda lbl, kind, p: (
+                     lbl in ("start date", "from date", "from")
+                     or any(w in lbl for w in ("employment start date", "job start date",
+                                               "position start date"))
+                 ),
+                 _resolve_work_history_start_date),
+    _ProfileRule("work_history_end_date",
+                 lambda lbl, kind, p: (
+                     lbl in ("end date", "to date", "to")
+                     or any(w in lbl for w in ("employment end date", "job end date",
+                                               "position end date"))
+                 ),
+                 _resolve_work_history_end_date),
+    _ProfileRule("currently_work_here",
+                 _kw_kind(_SELECTISH_KINDS, "currently work here", "currently working here",
+                          "currently work in this role", "currently working in this role",
+                          "currently employed here", "still work here", "still employed here",
+                          "i currently work here"),
+                 _resolve_currently_work_here),
     _ProfileRule("headline",
                  _kw("headline", "professional headline", "profile headline"),
                  _resolve_headline),
@@ -1282,9 +1372,14 @@ _PROFILE_VALUE_RULES: list[_ProfileRule] = [
                  _kw_kind(_CHOICE_KINDS, "commutable", "in-office attendance", "commuting distance",
                           "in commutable"),
                  _const("No")),
+    # "start date" here is still a plain substring match (T50 did NOT remove
+    # it) — the earlier work_history_start_date rule only claims an EXACT
+    # "start date" / "from date" / "from" label, so a qualified phrasing like
+    # "Desired Start Date" / "Earliest Start Date" doesn't match there and
+    # falls through to substring-match "start date" here instead.
     _ProfileRule("start_date",
-                 _kw("earliest available", "start date", "when can you start", "available to start",
-                     "date available", "earliest start"),
+                 _kw("earliest available", "start date", "when can you start",
+                     "available to start", "date available", "earliest start"),
                  _const("Immediately")),
     _ProfileRule("relative_works_here",
                  lambda lbl, kind, p: any(w in lbl for w in ("relative", "friend", "family member"))
