@@ -16,7 +16,7 @@ Baseline captured 2026-08-28. `docs/baseline/db_state.baseline.txt` holds the DB
 | 5 — Phase 4 | **T16b** — decompose `_llm_guided_apply` on the Agent SDK (primary OffsiteApply path) + retire `ScriptApplyEngine` | ✅ **CLOSED** 2026-09-05 — PR 1 (#30) + PR 2 (#31) merged, QA passed (live run: 3 real applications inc. multi-step Rippling, 2 correct `-3` blocks, 0 errors). `ScriptApplyEngine` gone; OffsiteApply is a single decomposed step-loop engine. |
 | 6 — Phase 5 | T17 — scraper cleanup | ✅ **CLOSED** 2026-09-09 — PR 1 (#61, loop consolidation + tenacity) + PR 2 (#62, Selenium→Playwright `storage_state`, `selenium` dropped). QA: cold headless login → 25 real jobs; warm path enriches 25 with no browser. |
 | Follow-ups | T19 ✅ + T24 ✅ (PR pending) · T22 ✅ (PR pending) · T21 **CLOSED** (#33) · T20 ✅ (PR pending) · T30 **CLOSED — superseded by T38** (NIM classifier now opt-in; Agent SDK is the default) | P2–P3 |
-| 7 | **T50** (prerequisite: structured `work_history` in `user_profile.json`), **T51** (Workday support via Autofill-with-Resume, depends on T50) | 🔜 **OPEN** — filed 2026-09-10, owner chose Option C for Workday |
+| 7 | **T50** ✅ CLOSED (#71) — structured `work_history` in `user_profile.json`. **T51** 🔜 OPEN — Workday support via Autofill-with-Resume (depends on T50, now unblocked) | in progress |
 
 **Direction change (2026-09-03):** T14b live-QA runs confirmed the Agent SDK classifier is 100% reliable where NIM's model isn't (T30), but NIM stays for OffsiteApply classification with the circuit breaker as the safety net. The browser-use spike (T15) is dropped — the free NIM tier can't host an agentic browser model reliably. Remaining apply-agent work goes straight to hardening + decomposing `_llm_guided_apply` on the Agent SDK.
 
@@ -861,7 +861,9 @@ Rarely a crash can also take the `BrowserContext` (or the whole browser) with it
 
 ## T50 — `user_profile.json` has no structured work history
 
-**Phase:** apply-quality (prerequisite for T51) · **Risk:** low · **Status:** 🔜 **OPEN** · **Sev:** P2 · Filed 2026-09-10 (owner requested Workday support — Option C, T51 — which needs this first).
+**Phase:** apply-quality (prerequisite for T51) · **Risk:** low · **Status:** ✅ **CLOSED** (#71, `d527508`, 2026-09-10 — 448 tests, reviewer verified rule ordering + collision cases live) · **Sev:** P2 · Filed 2026-09-10 (owner requested Workday support — Option C, T51 — which needs this first).
+
+**Shipped:** `work_history` schema + `--setup` interview (`_collect_work_history`) + 3 new `_PROFILE_VALUE_RULES` entries (start/end date, "currently work here", `_resolve_current_company` fallback), sourced via `_latest_work_history_entry`. **Note:** the SWE agent's first pass populated the live `user_profile.json` with *fabricated* former employers/achievements ("consistent with the profile" was interpreted too literally) — caught before any apply run or push (the file is gitignored, never left the PR diff), stripped, and replaced with the applicant's real work history transcribed from `media/Resume-Zhi-Hao-Tsai.pdf` (Nice inContact Inc. Apr–Nov 2024, Neighbor Storage Inc. Jan 2021–Jan 2024). **Lesson:** never ask an agent to "populate realistic/plausible" values into a real person's profile file — ask for real data or leave it empty.
 
 **Symptom:** `user_profile.json` has `current_title`, `years_experience`, a prose `summary`, and exactly one `education` entry — no `work_history` (employer / title / start-end dates / bullets). Any ATS "My Experience"-style step that requires at least one structured employment row (Workday, and several offsite Greenhouse/Ashby forms observed 2026-09-10: Coinbase, BNSF) can't pass Review no matter how good the step-loop is — `_get_profile_value` / `_ask_llm` have nothing to give it. This showed up as "submit clicked but form still showing validation errors: ['required']" auto-fails in both the 2026-09-02 and 2026-09-10 apply runs.
 
