@@ -3042,6 +3042,10 @@ class OffsiteApplyFlow:
         # Reset at the top of each _llm_guided_apply run; declared here so the
         # auth seams are safe to call standalone (tests, _fill_external_form).
         self._auth_attempted = False
+        # T52: guards _try_register from being invoked more than once per job —
+        # reset alongside _auth_attempted at the top of _llm_guided_apply, set
+        # True the first time either auth call site invokes _try_register.
+        self._registration_attempted = False
         # T36: latched True when a Chromium tab/renderer crash is caught mid-apply.
         # run_session reads it to rebuild the shared browser page before the next
         # job (a swallowed crash otherwise poisons every subsequent job).
@@ -4170,7 +4174,8 @@ class OffsiteApplyFlow:
         :meth:`_fill_registration_form` / ``EmailInbox`` — can create an
         account). ``phase="form"`` (after the snapshot): a bare
         ``input[type=password]`` on the page is a login gate — try stored
-        credentials, else it needs a human.
+        credentials, else (T52) fall back to :meth:`_try_register` under the
+        same inbox-availability gate, else it needs a human.
 
         Preserves the T34/T35 blocked-vs-failed split exactly: "no credentials
         exist / domain is a dead end" → ``"blocked"`` (-3); "stored credentials
@@ -4237,6 +4242,19 @@ class OffsiteApplyFlow:
                     return self._AUTH_PROCEED   # logged in — keep going this iteration
                 print(f"  [LLM] Login with stored credentials failed for {_cur_domain} — marking failed")
                 return "failed"
+
+            # T52: no stored credentials — attempt registration (same
+            # inbox-gate + one-shot-per-job guard as _handle_auth_page).
+            if self.inbox and not self._registration_attempted:
+                self._registration_attempted = True
+                print(f"  [LLM] Login wall detected (password field) on {_cur_domain} — "
+                      f"attempting registration")
+                if await self._try_register(page, _cur_domain):
+                    return self._AUTH_PROCEED   # registered — keep going this iteration
+                print(f"  [LLM] Registration failed for {_cur_domain} — needs a human, "
+                      f"marking blocked (no auto-retry)")
+                return "blocked"
+
             print(f"  [LLM] Login wall detected (password field) on {_cur_domain} — needs a human, "
                   f"marking blocked (no auto-retry)")
             return "blocked"
@@ -4254,6 +4272,7 @@ class OffsiteApplyFlow:
         Returns 'applied' | 'skipped' | 'failed' | 'blocked' | 'expired'.
         """
         self._auth_attempted = False
+        self._registration_attempted = False
         action_history: list[str] = []
         context_notes: list[str] = []   # per-step observations from the LLM, accumulated as running context
         prev_url = ""
@@ -5967,6 +5986,20 @@ class OffsiteApplyFlow:
                 return True
             print(f"  [Auth] Login failed with stored credentials for {domain} — marking failed")
             return "failed"
+
+        # T52: no stored credentials — attempt to register a new account, but
+        # only when we have a way to complete email verification if the site
+        # requires it. Creating an account with no inbox access would strand
+        # a half-finished signup the applicant can't use.
+        if self.inbox and not self._registration_attempted:
+            self._registration_attempted = True
+            print(f"  [Auth] No stored credentials for {domain} — attempting registration")
+            if await self._try_register(page, domain):
+                print(f"  [Auth] Registration successful for {domain}")
+                return True
+            print(f"  [Auth] Registration failed for {domain} — needs a human, "
+                  f"marking blocked (no auto-retry)")
+            return "blocked"
 
         print(f"  [Auth] No stored credentials for {domain} — needs a human, "
               f"marking blocked (no auto-retry)")
