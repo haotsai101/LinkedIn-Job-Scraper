@@ -81,7 +81,10 @@ def test_classify_domain_spam_returns_skipped():
 
 
 def test_classify_domain_blocked_ats_returns_blocked():
-    assert _offsite()._classify_domain("acme.myworkdayjobs.com") == "blocked"
+    # T51: myworkdayjobs.com/myworkdaysite.com were removed from
+    # _BLOCKED_AUTO_APPLY_DOMAINS — see test_workday_flow.py for the
+    # "no longer blocked" coverage. ultipro.com is still blocked.
+    assert _offsite()._classify_domain("acme.ultipro.com") == "blocked"
     assert _offsite()._classify_domain("careers.airbnb.com") == "blocked"
 
 

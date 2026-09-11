@@ -5,7 +5,7 @@ outcome T33 already wired up for the *pre-flight* domain/login checks in
 through to the generic ``"failed"`` (``applied=-2``, retried):
 
   1. a Step-0 deterministic Apply-button click that navigates into a domain
-     on ``_blocked_auto_apply_domains`` (e.g. Workday) partway through the
+     on ``_blocked_auto_apply_domains`` (e.g. UltiPro) partway through the
      flow, instead of being caught by the pre-flight landing-domain check;
   2. a password field appearing mid-flow with no stored credentials for that
      domain at all.
@@ -141,11 +141,16 @@ class _FakeContext:
 
 def test_post_navigation_into_blocked_domain_returns_blocked(monkeypatch):
     """A Step-0 deterministic Apply click can redirect into a domain on
-    _blocked_auto_apply_domains (e.g. Workday) — same dead end the pre-flight
-    check catches, so it must land on -3, not the retryable -2."""
+    _blocked_auto_apply_domains (e.g. UltiPro) — same dead end the pre-flight
+    check catches, so it must land on -3, not the retryable -2.
+
+    T51: this used a myworkdayjobs.com URL before Workday was removed from
+    _blocked_auto_apply_domains — swapped to another still-blocked ATS
+    (UltiPro) so the test keeps exercising the generic post-navigation
+    blocked-domain path it's named for."""
     _install_common(monkeypatch)
     landing = _FakePage("https://jobs.acme.com/careers/123", apply_button=True)
-    blocked_after_click = _FakePage("https://usbank.wd1.myworkdayjobs.com/en-US/apply/123")
+    blocked_after_click = _FakePage("https://usbank.ultipro.com/en-US/apply/123")
     flow = _offsite()
     flow.context = _FakeContext(blocked_after_click)
     out = asyncio.run(flow._llm_guided_apply(landing))
