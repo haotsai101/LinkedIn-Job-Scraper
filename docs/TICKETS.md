@@ -16,6 +16,7 @@ Baseline captured 2026-08-28. `docs/baseline/db_state.baseline.txt` holds the DB
 | 5 — Phase 4 | **T16b** — decompose `_llm_guided_apply` on the Agent SDK (primary OffsiteApply path) + retire `ScriptApplyEngine` | ✅ **CLOSED** 2026-09-05 — PR 1 (#30) + PR 2 (#31) merged, QA passed (live run: 3 real applications inc. multi-step Rippling, 2 correct `-3` blocks, 0 errors). `ScriptApplyEngine` gone; OffsiteApply is a single decomposed step-loop engine. |
 | 6 — Phase 5 | T17 — scraper cleanup | ✅ **CLOSED** 2026-09-09 — PR 1 (#61, loop consolidation + tenacity) + PR 2 (#62, Selenium→Playwright `storage_state`, `selenium` dropped). QA: cold headless login → 25 real jobs; warm path enriches 25 with no browser. |
 | Follow-ups | T19 ✅ + T24 ✅ (PR pending) · T22 ✅ (PR pending) · T21 **CLOSED** (#33) · T20 ✅ (PR pending) · T30 **CLOSED — superseded by T38** (NIM classifier now opt-in; Agent SDK is the default) | P2–P3 |
+| 7 | **T50** (prerequisite: structured `work_history` in `user_profile.json`), **T51** (Workday support via Autofill-with-Resume, depends on T50) | 🔜 **OPEN** — filed 2026-09-10, owner chose Option C for Workday |
 
 **Direction change (2026-09-03):** T14b live-QA runs confirmed the Agent SDK classifier is 100% reliable where NIM's model isn't (T30), but NIM stays for OffsiteApply classification with the circuit breaker as the safety net. The browser-use spike (T15) is dropped — the free NIM tier can't host an agentic browser model reliably. Remaining apply-agent work goes straight to hardening + decomposing `_llm_guided_apply` on the Agent SDK.
 
@@ -855,5 +856,44 @@ Rarely a crash can also take the `BrowserContext` (or the whole browser) with it
 **Not a regression from T22/T31/T32/T37/T38/T39/T44/T45** — none touch the Playwright lifecycle; this is a pre-existing gap present since the shared-browser session model was introduced.
 
 **Affected users / impact:** any `--auto` run that hits an ATS SPA heavy enough to crash a Chromium tab — before this fix, the crash cascades and every remaining job in the session auto-fails; after, the job is a clean `-2` and the session continues on a fresh page.
+
+---
+
+## T50 — `user_profile.json` has no structured work history
+
+**Phase:** apply-quality (prerequisite for T51) · **Risk:** low · **Status:** 🔜 **OPEN** · **Sev:** P2 · Filed 2026-09-10 (owner requested Workday support — Option C, T51 — which needs this first).
+
+**Symptom:** `user_profile.json` has `current_title`, `years_experience`, a prose `summary`, and exactly one `education` entry — no `work_history` (employer / title / start-end dates / bullets). Any ATS "My Experience"-style step that requires at least one structured employment row (Workday, and several offsite Greenhouse/Ashby forms observed 2026-09-10: Coinbase, BNSF) can't pass Review no matter how good the step-loop is — `_get_profile_value` / `_ask_llm` have nothing to give it. This showed up as "submit clicked but form still showing validation errors: ['required']" auto-fails in both the 2026-09-02 and 2026-09-10 apply runs.
+
+**Fix:**
+- `user_profile.json` schema: add `work_history: [{employer, title, location, start_date, end_date, current: bool, bullets: [str]}]` (2–3 entries covering the applicant's real work history).
+- `apply_jobs.py --setup` (`build_profile_interactively`): extend the interview to collect 1+ work-history entries (reuse the existing single-`education` collection pattern already in that function).
+- `linkedin_apply.py` `_PROFILE_VALUE_RULES`: new rules for "current/most recent employer", "job title", "start date", "end date", "currently work here" (checkbox), sourced from `work_history[0]` (most recent / current entry — `current: True` if present, else the first entry). Keep `_resolve_current_company` (already exists) consistent with the new field name.
+- `tests/test_profile_rules.py` / `test_profile_value.py`: new assertions for the work-history rules; run the full suite to confirm no existing "employer"/"current company"/"job title" assertions regress.
+
+**Not urgent on its own** (no ticket depended on it before now) but blocks T51 — do it first.
+
+---
+
+## T51 — Workday support via "Autofill with Resume" + correction loop (Option C)
+
+**Phase:** apply-quality · **Risk:** medium (drives real submissions on a new ATS family) · **Depends on:** T50 · **Status:** 🔜 **OPEN** · **Sev:** P2 · Filed 2026-09-10 (owner choice: "Let's do C for now" — see the Workday options discussed the same session).
+
+**Context:** `myworkdayjobs.com` / `myworkdaysite.com` are in `OffsiteApplyFlow._BLOCKED_AUTO_APPLY_DOMAINS` (`linkedin_apply.py:3779`) — every Workday job is marked `-3` (blocked, no auto-retry) today. Workday was 5/11 blocked jobs in the 2026-09-10 run alone and is consistently the largest single block category. It is **not** CAPTCHA-gated; the blockers are (1) a per-company account wall with email verification, (2) a form-field snapshot that may not surface Workday's `data-automation-id`-attributed elements, and (3) the "My Experience" step needing structured work history (→ T50).
+
+**Chosen approach (Option C — cheaper than a bespoke deterministic `WorkdayApplyFlow`):** let Workday's own "Autofill with Resume" parse the uploaded resume into My Experience/My Information, then let the existing generic `_llm_guided_apply` step-loop walk the remaining steps (Application Questions, Voluntary Disclosures, Self Identify, Review) and correct whatever the parse got wrong, same as any other offsite ATS.
+
+**Scope:**
+1. Remove `myworkdayjobs.com` / `myworkdaysite.com` from `_BLOCKED_AUTO_APPLY_DOMAINS` — but only after 2–5 land, so Workday jobs don't silently degrade from a clean `-3` to a worse outcome in the interim.
+2. **Snapshot:** verify (with a saved real Workday DOM fixture, not guesswork) whether `_get_page_snapshot`'s field/button walk already surfaces `data-automation-id`-labelled elements via existing `aria-label`/`name`/`placeholder` fallbacks. If not, add `data-automation-id` as a label source and confirm it isn't behind an iframe boundary Playwright's locator can't pierce.
+3. **Account wall:** confirm `_handle_auth_page` / `_try_register` / `EmailInbox.fetch_verification` (Gmail) actually complete Workday's specific create-account form (its own field ids/selectors — verify against the fixture, don't assume the generic selectors in `_try_register` match). Workday's overlay-click-interception is already handled at submit time (`[data-automation-id="click_filter"]` force-click, `linkedin_apply.py:~5911`) — confirm the same applies earlier in the flow (account creation, "Autofill with Resume" click) or extend it.
+4. **Prefer autofill over manual:** on a Workday domain, the step loop (or a small Workday-specific nudge in `_ask_llm_action`'s prompt) should click "Autofill with Resume" over "Apply Manually" when both are offered, then upload the resume.
+5. **Correction loop:** should mostly fall out of the existing generic step-loop once 1–4 land and T50 gives it real work-history data to fill gaps with — verify live, don't assume.
+6. **Submission detection:** confirm `verify_submission` / `_check_submission_result` recognize a Workday confirmation page/state.
+7. **Safety net:** the existing stuck-step / `_terminal_state_for_stall` give-up logic must still catch a Workday flow that goes wrong (unexpected step, autofill button never appears, account creation fails) and mark it `-2`/`-3` rather than submitting garbage or looping forever.
+
+**Tests:** new `tests/test_workday_flow.py` (or extend `test_offsite_seams.py`) against a synthetic Workday-shaped DOM (data-automation-id attributes on the account-wall, autofill button, and a couple of "My Experience"/"Application Questions" fields) — domain no longer instant-blocks, autofill preferred over manual, account-wall handling invoked, snapshot surfaces the right labels. Full suite must stay green.
+
+**QA:** requires a live run against a real Workday job (several in the current `blocked` pool after `--reset-failed`-style re-queue, once unblocked) — this is the kind of change that can't be fully trusted from unit tests alone; do not close without a live QA application (success or a clean, well-labelled failure — not a silent bad submission).
 
 ---
