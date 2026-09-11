@@ -14,6 +14,16 @@ Covers:
     (email/password/verifyPassword/createAccountCheckbox/
     createAccountSubmitButton) are tried and actually fill/check/click the
     right elements on a synthetic Workday create-account fixture.
+  * T52 — ``_try_register`` is actually *called*. It was fully implemented
+    but had zero call sites; both ``_handle_auth_page`` (URL-phase) and
+    ``_handle_auth(phase="form")`` (mid-loop password-field wall) now fall
+    back to it when no stored credentials exist, gated on ``self.inbox``
+    being set (no inbox → no way to complete email verification → don't
+    strand a half-created account) and on a new one-shot-per-job
+    ``self._registration_attempted`` guard. This wiring is generic (not
+    Workday-specific) — it's tested here, alongside T51, only because this
+    file already has the real-Chromium create-account fixture the T51 tests
+    built.
 
 Some of the above can only be proven against a *real* DOM — a mocked
 ``page.evaluate()`` (as ``test_offsite_seams.py`` uses for the other seams)
@@ -313,3 +323,163 @@ def test_workday_verify_password_field_recognized_as_registration_page():
             return await confirm_field.count()
 
     assert _run(_scenario()) > 0
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 5) T52 — _try_register actually gets called from both auth call sites
+# ══════════════════════════════════════════════════════════════════════════
+#
+# Reuses the T51 create-account fixture (_CREATE_ACCOUNT_HTML) purely as a
+# convenient "registration form that fills and submits successfully" DOM —
+# none of what's tested below is Workday-specific. `_find_account_for_domain`
+# is monkeypatched to `None` (no stored credentials) to reach the new
+# registration fallback in each test; a "save_account" callback stub is
+# always supplied so a passing registration never writes to the real
+# created_accounts.json.
+
+_T52_PROFILE = {
+    "full_name": "Jamie Testperson",
+    "email": "jamie.testperson@example.com",
+    "phone": "",
+}
+
+
+def _t52_offsite(**kw):
+    kw.setdefault("profile", _T52_PROFILE)
+    kw.setdefault("callbacks", {"save_account": lambda _record: None})
+    return _offsite(**kw)
+
+
+def test_handle_auth_page_registers_when_no_stored_credentials(monkeypatch):
+    """URL-phase call site (_handle_auth_page): no stored credentials + a
+    registration form + an available inbox → _try_register is invoked and a
+    successful registration returns True (same contract as a successful
+    login), not "blocked"."""
+    monkeypatch.setattr(linkedin_apply, "_find_account_for_domain", lambda _d: None)
+
+    async def _scenario():
+        async with _fixture_page(
+            _CREATE_ACCOUNT_HTML,
+            url="https://t52-fixture-url.myworkdaysite.com/en-US/careers/job/TEST-1",
+        ) as page:
+            flow = _t52_offsite(inbox=object())
+            return await flow._handle_auth_page(page)
+
+    assert _run(_scenario()) is True
+
+
+def test_handle_auth_form_phase_registers_when_no_stored_credentials(monkeypatch):
+    """Form-phase call site (_handle_auth(phase="form")): the mid-loop
+    password-field wall — the branch that actually fired in T51's live QA.
+    Same inputs, reached via the other call site."""
+    monkeypatch.setattr(linkedin_apply, "_find_account_for_domain", lambda _d: None)
+
+    async def _scenario():
+        async with _fixture_page(
+            _CREATE_ACCOUNT_HTML,
+            url="https://t52-fixture-form.myworkdaysite.com/en-US/careers/job/TEST-1",
+        ) as page:
+            flow = _t52_offsite(inbox=object())
+            return await flow._handle_auth(page, phase="form")
+
+    assert _run(_scenario()) == OFF._AUTH_PROCEED
+
+
+def test_registration_only_attempted_once_per_job(monkeypatch):
+    """Guard regression: a second password-field sighting in the same job
+    (e.g. the step loop re-checking after a failed/incomplete registration)
+    must not invoke _try_register a second time. The form-phase branch had
+    NO guard at all before T52 — this is the case that matters most."""
+    monkeypatch.setattr(linkedin_apply, "_find_account_for_domain", lambda _d: None)
+    calls = {"n": 0}
+
+    async def _fake_try_register(self, page, domain):
+        calls["n"] += 1
+        return True
+    monkeypatch.setattr(linkedin_apply.OffsiteApplyFlow, "_try_register", _fake_try_register)
+
+    async def _scenario():
+        async with _fixture_page(
+            _CREATE_ACCOUNT_HTML,
+            url="https://t52-fixture-guard.myworkdaysite.com/en-US/careers/job/TEST-1",
+        ) as page:
+            flow = _t52_offsite(inbox=object())
+            first = await flow._handle_auth(page, phase="form")
+            second = await flow._handle_auth(page, phase="form")
+            return first, second, flow._registration_attempted
+
+    first, second, attempted = _run(_scenario())
+    assert first == OFF._AUTH_PROCEED
+    assert calls["n"] == 1
+    assert attempted is True
+    # Guard already tripped — the second sighting falls straight to the
+    # existing "no path forward" outcome instead of retrying registration.
+    assert second == "blocked"
+
+
+def test_registration_failure_returns_blocked_not_infinite_retry(monkeypatch):
+    """_try_register returning False (registration attempted but failed)
+    must resolve to "blocked" — same non-retryable semantics as "no
+    credentials and can't make any" — not a crash or an unbounded retry."""
+    monkeypatch.setattr(linkedin_apply, "_find_account_for_domain", lambda _d: None)
+
+    async def _fake_try_register(self, page, domain):
+        return False
+    monkeypatch.setattr(linkedin_apply.OffsiteApplyFlow, "_try_register", _fake_try_register)
+
+    async def _scenario():
+        async with _fixture_page(
+            _CREATE_ACCOUNT_HTML,
+            url="https://t52-fixture-fail.myworkdaysite.com/en-US/careers/job/TEST-1",
+        ) as page:
+            flow = _t52_offsite(inbox=object())
+            return await flow._handle_auth_page(page)
+
+    assert _run(_scenario()) == "blocked"
+
+
+def test_no_inbox_skips_registration_url_phase(monkeypatch):
+    """Safety requirement, not an optimization: with no inbox available
+    (self.inbox is None, the default), registration must never be attempted
+    at all — creating an account with no way to complete email verification
+    would strand a half-finished signup the applicant can't use."""
+    monkeypatch.setattr(linkedin_apply, "_find_account_for_domain", lambda _d: None)
+    calls = {"n": 0}
+
+    async def _fake_try_register(self, page, domain):
+        calls["n"] += 1
+        return True
+    monkeypatch.setattr(linkedin_apply.OffsiteApplyFlow, "_try_register", _fake_try_register)
+
+    async def _scenario():
+        async with _fixture_page(
+            _CREATE_ACCOUNT_HTML,
+            url="https://t52-fixture-noinbox-url.myworkdaysite.com/en-US/careers/job/TEST-1",
+        ) as page:
+            flow = _t52_offsite()  # inbox defaults to None
+            return await flow._handle_auth_page(page)
+
+    assert _run(_scenario()) == "blocked"
+    assert calls["n"] == 0
+
+
+def test_no_inbox_skips_registration_form_phase(monkeypatch):
+    """Same safety requirement, form-phase call site."""
+    monkeypatch.setattr(linkedin_apply, "_find_account_for_domain", lambda _d: None)
+    calls = {"n": 0}
+
+    async def _fake_try_register(self, page, domain):
+        calls["n"] += 1
+        return True
+    monkeypatch.setattr(linkedin_apply.OffsiteApplyFlow, "_try_register", _fake_try_register)
+
+    async def _scenario():
+        async with _fixture_page(
+            _CREATE_ACCOUNT_HTML,
+            url="https://t52-fixture-noinbox-form.myworkdaysite.com/en-US/careers/job/TEST-1",
+        ) as page:
+            flow = _t52_offsite()  # inbox defaults to None
+            return await flow._handle_auth(page, phase="form")
+
+    assert _run(_scenario()) == "blocked"
+    assert calls["n"] == 0
