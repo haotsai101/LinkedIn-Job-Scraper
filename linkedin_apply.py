@@ -6150,6 +6150,32 @@ class OffsiteApplyFlow:
                     break
             await asyncio.sleep(3)
 
+            # T53: capture the intermediate state right after the submit click, before
+            # we decide success/failure — this is the gap the outer step-loop's
+            # `_verbose_screenshot`/step screenshots don't cover (registration happens
+            # entirely inside one LLM-decision step). Diagnostic only; must never let a
+            # screenshot/logging failure interrupt the actual registration flow.
+            if self.verbose:
+                try:
+                    import os as _os
+                    _os.makedirs("debug_screenshots", exist_ok=True)
+                    _safe_domain = "".join(
+                        c if c.isalnum() or c in "-_" else "_" for c in (domain or "unknown")
+                    )
+                    _reg_shot_path = f"debug_screenshots/{_SESSION_TS}_{_safe_domain}_register.png"
+                    await page.screenshot(path=_reg_shot_path, full_page=False)
+                    print(f"  [verbose] Registration screenshot → {_reg_shot_path}")
+                except Exception as _reg_shot_exc:
+                    print(f"  [verbose] Registration screenshot failed: {_reg_shot_exc}")
+            try:
+                _reg_visible_text = await page.evaluate(
+                    "() => (document.body.innerText || '').slice(0, 400)"
+                )
+                print(f"  [Auth] Page text after registration submit: {_reg_visible_text!r}")
+            except Exception as _reg_text_exc:
+                print(f"  [Auth] Could not read page text after registration submit: "
+                      f"{_reg_text_exc}")
+
             # Determine success: URL changed OR confirmation text present
             url_changed = page.url != url_before
             try:
