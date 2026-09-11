@@ -326,6 +326,78 @@ def test_workday_verify_password_field_recognized_as_registration_page():
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# 4b) T53 — registration-attempt diagnostic screenshot + page-text log
+# ══════════════════════════════════════════════════════════════════════════
+#
+# Diagnostic-only instrumentation: _try_register takes a screenshot (gated
+# on --verbose, same as the outer step-loop's screenshots) and logs a short
+# page-text snippet (always, so a plain non-verbose log run still gives a
+# first read) right after the submit click, before it decides success vs.
+# failure. Neither must ever be able to break the actual registration flow.
+
+def test_try_register_verbose_writes_registration_screenshot(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+
+    async def _scenario():
+        async with _fixture_page(
+            _CREATE_ACCOUNT_HTML,
+            url="https://acme-fixture.myworkdaysite.com/en-US/careers/job/TEST-1",
+        ) as page:
+            flow = _offsite(callbacks={"save_account": lambda record: None}, verbose=True)
+            return await flow._try_register(page, "acme-fixture.myworkdaysite.com")
+
+    ok = _run(_scenario())
+
+    assert ok is True
+    shots = list((tmp_path / "debug_screenshots").glob("*.png"))
+    assert shots, "expected a registration screenshot under debug_screenshots/"
+    assert any("register" in p.name for p in shots)
+
+
+def test_try_register_not_verbose_writes_no_screenshot(tmp_path, monkeypatch):
+    # verbose=False (the _offsite() default) must not create debug_screenshots/
+    # at all — matches the existing step-loop screenshot's opt-in behavior.
+    monkeypatch.chdir(tmp_path)
+
+    async def _scenario():
+        async with _fixture_page(
+            _CREATE_ACCOUNT_HTML,
+            url="https://acme-fixture.myworkdaysite.com/en-US/careers/job/TEST-1",
+        ) as page:
+            flow = _offsite(callbacks={"save_account": lambda record: None})
+            return await flow._try_register(page, "acme-fixture.myworkdaysite.com")
+
+    ok = _run(_scenario())
+
+    assert ok is True
+    assert not (tmp_path / "debug_screenshots").exists()
+
+
+def test_try_register_screenshot_failure_does_not_break_registration(tmp_path, monkeypatch, capsys):
+    # A broken screenshot write (e.g. a full disk, a permissions issue) must
+    # degrade gracefully — registration itself still has to complete and
+    # _try_register must still return its normal result.
+    monkeypatch.chdir(tmp_path)
+
+    async def _boom(*a, **kw):
+        raise RuntimeError("disk full")
+
+    async def _scenario():
+        async with _fixture_page(
+            _CREATE_ACCOUNT_HTML,
+            url="https://acme-fixture.myworkdaysite.com/en-US/careers/job/TEST-1",
+        ) as page:
+            monkeypatch.setattr(page, "screenshot", _boom)
+            flow = _offsite(callbacks={"save_account": lambda record: None}, verbose=True)
+            return await flow._try_register(page, "acme-fixture.myworkdaysite.com")
+
+    ok = _run(_scenario())
+
+    assert ok is True
+    assert "Registration screenshot failed" in capsys.readouterr().out
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # 5) T52 — _try_register actually gets called from both auth call sites
 # ══════════════════════════════════════════════════════════════════════════
 #
