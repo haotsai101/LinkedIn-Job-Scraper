@@ -16,7 +16,7 @@ Baseline captured 2026-08-28. `docs/baseline/db_state.baseline.txt` holds the DB
 | 5 — Phase 4 | **T16b** — decompose `_llm_guided_apply` on the Agent SDK (primary OffsiteApply path) + retire `ScriptApplyEngine` | ✅ **CLOSED** 2026-09-05 — PR 1 (#30) + PR 2 (#31) merged, QA passed (live run: 3 real applications inc. multi-step Rippling, 2 correct `-3` blocks, 0 errors). `ScriptApplyEngine` gone; OffsiteApply is a single decomposed step-loop engine. |
 | 6 — Phase 5 | T17 — scraper cleanup | ✅ **CLOSED** 2026-09-09 — PR 1 (#61, loop consolidation + tenacity) + PR 2 (#62, Selenium→Playwright `storage_state`, `selenium` dropped). QA: cold headless login → 25 real jobs; warm path enriches 25 with no browser. |
 | Follow-ups | T19 ✅ + T24 ✅ (PR pending) · T22 ✅ (PR pending) · T21 **CLOSED** (#33) · T20 ✅ (PR pending) · T30 **CLOSED — superseded by T38** (NIM classifier now opt-in; Agent SDK is the default) | P2–P3 |
-| 7 | **T50** ✅ CLOSED (#71). **T52** ✅ CLOSED (#75) — `_try_register` wired up and confirmed live against real Workday. **T51** 🔜 OPEN (code merged #73, live QA round 2 confirms the wiring reaches a real Create-account form) blocked on **T53** 🔜 OPEN P2 — registration doesn't yet complete successfully; needs a diagnostic screenshot to see why. | in progress |
+| 7 | **T50** ✅ CLOSED (#71). **T52** ✅ CLOSED (#75) — `_try_register` wired up and confirmed live against real Workday. **T51** 🔜 OPEN, blocked on **T53** 🔜 OPEN P2 — 3 live QA rounds run; registration is genuinely attempted against real Workday forms but doesn't yet complete (round 3: Alteryx landed on an unrecognizable page, likely a SPA render fault — unconfirmed). **Paused 2026-09-14 (owner decision)** — resume only on request. | ⏸️ paused |
 
 **Direction change (2026-09-03):** T14b live-QA runs confirmed the Agent SDK classifier is 100% reliable where NIM's model isn't (T30), but NIM stays for OffsiteApply classification with the circuit breaker as the safety net. The browser-use spike (T15) is dropped — the free NIM tier can't host an agentic browser model reliably. Remaining apply-agent work goes straight to hardening + decomposing `_llm_guided_apply` on the Agent SDK.
 
@@ -879,7 +879,7 @@ Rarely a crash can also take the `BrowserContext` (or the whole browser) with it
 
 ## T51 — Workday support via "Autofill with Resume" + correction loop (Option C)
 
-**Phase:** apply-quality · **Risk:** medium (drives real submissions on a new ATS family) · **Depends on:** T50 (closed), T52 (closed) · **Blocked on:** T53 · **Status:** 🔜 **OPEN — code merged (#73), live QA round 2 done** · **Sev:** P2 · Filed 2026-09-10 (owner choice: "Let's do C for now" — see the Workday options discussed the same session).
+**Phase:** apply-quality · **Risk:** medium (drives real submissions on a new ATS family) · **Depends on:** T50 (closed), T52 (closed) · **Blocked on:** T53 · **Status:** ⏸️ **PAUSED 2026-09-14 (owner decision)** — code merged (#73), 3 live QA rounds run; resume only on request · **Sev:** P2 · Filed 2026-09-10 (owner choice: "Let's do C for now" — see the Workday options discussed the same session).
 
 **Context:** `myworkdayjobs.com` / `myworkdaysite.com` are in `OffsiteApplyFlow._BLOCKED_AUTO_APPLY_DOMAINS` (`linkedin_apply.py:3779`) — every Workday job is marked `-3` (blocked, no auto-retry) today. Workday was 5/11 blocked jobs in the 2026-09-10 run alone and is consistently the largest single block category. It is **not** CAPTCHA-gated; the blockers are (1) a per-company account wall with email verification, (2) a form-field snapshot that may not surface Workday's `data-automation-id`-attributed elements, and (3) the "My Experience" step needing structured work history (→ T50).
 
@@ -945,5 +945,13 @@ Rarely a crash can also take the `BrowserContext` (or the whole browser) with it
 3. Consider whether the `click_filter` overlay selector being tried *first* in `reg_submit_selectors` (`linkedin_apply.py:~6095`) is correct — clicking a page-covering overlay div isn't the same as clicking the real submit button; confirm intent (pre-existing code, not part of T51/T52) or reorder.
 
 **Not urgent / not blocking anything else** — T51 and T52's own scope (unblock the domain, prefer Autofill, wire up registration) is done and proven live. This is the next incremental step toward Workday applications actually succeeding, not a regression.
+
+**Diagnostics shipped (#77, `fbaabef`)** — `_try_register` now takes a `--verbose`-gated screenshot and logs a page-text snippet right after the submit click.
+
+**Live QA round 3 (2026-09-11/14, same 2 jobs, `--verbose`):**
+- **BECU** hit an unrelated LLM selector flake this round (`button:has-text("Apply")` instead of the `a:has-text("Apply")` that worked in rounds 1-2) and never reached registration at all — non-deterministic noise, not a new finding.
+- **Alteryx** reached registration and produced real diagnostic output: the post-submit screenshot and page-text log show **Alteryx's general public careers homepage** (marketing hero image, a "Search for Jobs" box) — not a form, not an error message, not a recognizable confirmation. Puzzling detail: `_try_register`'s `confirmed = url_changed or <success phrase>` check said `False` (declared failure), which means `page.url` after the click chain was judged unchanged from `url_before` — so despite the visibly different rendered content, this does **not** look like a real navigation to a different page. Best working theory: a Workday SPA client-side rendering fault after the submit POST (e.g. a caught JS exception falling back to a shared default/error shell that reuses the same header/hero/footer components as the marketing homepage) rather than a real page navigation — but this is unconfirmed; the current diagnostics (screenshot + page text) can't distinguish "real homepage navigation with an unchanged URL string" from "SPA error-shell render," and browser console errors were not captured.
+
+**Paused here 2026-09-14 (owner decision)** — T50/T52/T53(diagnostics) are solid, merged, real progress; T51 stays open. The next concrete step, if picked back up, is straightforward: add `page.on("console", ...)` error capture + log the exact `page.url` at the same point the existing screenshot fires (same small-diagnostic-PR pattern as #77), re-run live QA once more. Not resumed without explicit owner request.
 
 ---
