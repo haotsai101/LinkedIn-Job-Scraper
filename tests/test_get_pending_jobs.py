@@ -108,16 +108,27 @@ def test_blocked_status_minus_3_is_never_a_candidate(conn):
     assert got == {1, 3}  # -2 comes back, -3 does not
 
 
-def test_reset_failed_sql_leaves_blocked_rows_alone(conn):
-    """The --reset-failed UPDATE targets applied = -2 only."""
+def test_reset_failed_jobs_leaves_blocked_rows_alone(conn):
+    """--reset-failed (apply_jobs.reset_failed_jobs) targets applied = -2 only,
+    and clears applied_at back to NULL alongside applied — a pending job has no
+    application timestamp. The -3 (blocked) row, applied_at included, is left
+    untouched."""
     _add_job(conn, 1, listed_epoch=10, applied=-2, scraped=1)
     _add_job(conn, 2, listed_epoch=20, applied=-3, scraped=1)
     conn.commit()
     cur = conn.cursor()
-    cur.execute("UPDATE jobs SET applied = NULL WHERE applied = -2")
+    # Simulate both rows already having an applied_at stamp from mark_job.
+    cur.execute("UPDATE jobs SET applied_at = 12345 WHERE job_id IN (1, 2)")
     conn.commit()
-    rows = dict(conn.execute("SELECT job_id, applied FROM jobs").fetchall())
-    assert rows == {1: None, 2: -3}
+
+    count = apply_jobs.reset_failed_jobs(conn, cur)
+
+    assert count == 1
+    rows = {
+        r[0]: (r[1], r[2])
+        for r in conn.execute("SELECT job_id, applied, applied_at FROM jobs").fetchall()
+    }
+    assert rows == {1: (None, None), 2: (-3, 12345)}
 
 
 def test_print_stats_counts_blocked(conn, capsys):

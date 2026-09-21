@@ -66,6 +66,7 @@ def create_tables(conn, cursor):
           posting_domain TEXT,
           sponsored INTEGER,
           applied INTEGER DEFAULT NULL,
+          applied_at INTEGER DEFAULT NULL,
           listed_epoch INTEGER
         );
     ''')
@@ -242,9 +243,15 @@ def ensure_schema_current(conn, cursor):
       2. ``jobs.listed_epoch INTEGER`` added if absent; the shared
          ``LISTED_EPOCH_BACKFILL_SQL`` runs only when the column was just added
          or a probe finds ``listed_epoch IS NULL`` rows still outstanding.
-      3. A stale ``idx_jobs_listed`` (built on the old TEXT
+      3. ``jobs.applied_at INTEGER`` added if absent — a nullable epoch-seconds
+         companion to ``applied``, written by ``apply_jobs.mark_job`` /
+         ``skip_ineligible_jobs`` / ``--reset-failed`` going forward. Deliberately
+         **no backfill**: a row whose ``applied`` status was already set before
+         this column existed has a genuinely unknown application time, and
+         guessing "now" would misrepresent history.
+      4. A stale ``idx_jobs_listed`` (built on the old TEXT
          ``original_listed_time`` column) is dropped.
-      4. On an actual schema change only: ``create_indexes()`` rebuilds every
+      5. On an actual schema change only: ``create_indexes()`` rebuilds every
          secondary index (``CREATE INDEX IF NOT EXISTS`` — so ``idx_jobs_listed``
          comes back on ``jobs(applied, listed_epoch DESC)`` even for callers that
          never go through ``create_tables()``), then ``ANALYZE`` refreshes
@@ -285,7 +292,12 @@ def ensure_schema_current(conn, cursor):
     elif cursor.execute(LISTED_EPOCH_PENDING_PROBE_SQL).fetchone():
         cursor.execute(LISTED_EPOCH_BACKFILL_SQL)
 
-    # ── 3. drop a stale idx_jobs_listed so it is rebuilt on the new shape ────
+    # ── 3. jobs.applied_at column (no backfill — see docstring) ──────────────
+    if "applied_at" not in cols:
+        cursor.execute("ALTER TABLE jobs ADD COLUMN applied_at INTEGER")
+        schema_changed = True
+
+    # ── 4. drop a stale idx_jobs_listed so it is rebuilt on the new shape ────
     stale = _index_sql(cursor, "idx_jobs_listed")
     if stale is not None and "listed_epoch" not in stale:
         cursor.execute("DROP INDEX IF EXISTS idx_jobs_listed")
@@ -293,7 +305,7 @@ def ensure_schema_current(conn, cursor):
 
     conn.commit()
 
-    # ── 4. on an actual schema change: (re)build indexes + refresh stats ────
+    # ── 5. on an actual schema change: (re)build indexes + refresh stats ────
     # Recreating the indexes here (not just in create_tables) is what makes this
     # the single home for schema modernization — an apply-only clone that never
     # runs a retriever still ends up with idx_jobs_listed on the new shape, so

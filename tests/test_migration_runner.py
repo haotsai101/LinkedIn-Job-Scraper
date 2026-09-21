@@ -265,6 +265,41 @@ def test_ensure_db_ready_on_fresh_checkout(tmp_path):
         assert _table_exists(db, t)
     cols = {r[1] for r in conn.execute("PRAGMA table_info(jobs)")}
     assert "listed_epoch" in cols
+    assert "applied_at" in cols
+    conn.close()
+
+
+def test_ensure_schema_current_adds_applied_at_without_backfill(tmp_path):
+    """New column: additive only, no backfill. A row whose ``applied`` status
+    was already set before this column existed has a genuinely unknown
+    application time, so ensure_schema_current must not write a fabricated
+    "now" timestamp into it."""
+    db = tmp_path / "linkedin_jobs.db"
+    _bare_db(db)  # pre-migrations jobs table: no listed_epoch, no applied_at
+    conn = sqlite3.connect(str(db))
+    conn.execute(
+        "INSERT INTO jobs (job_id, scraped, applied) VALUES (1, 1, 1), (2, 1, -2)"
+    )
+    conn.commit()
+
+    changed = ensure_schema_current(conn, conn.cursor())
+
+    assert changed is True
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(jobs)")}
+    assert "applied_at" in cols
+    rows = dict(conn.execute("SELECT job_id, applied_at FROM jobs").fetchall())
+    assert rows == {1: None, 2: None}
+    conn.close()
+
+
+def test_ensure_schema_current_applied_at_is_idempotent(tmp_path):
+    db = tmp_path / "linkedin_jobs.db"
+    _current_db(db)
+    conn = sqlite3.connect(str(db))
+
+    assert ensure_schema_current(conn, conn.cursor()) is False  # already current
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(jobs)")}
+    assert "applied_at" in cols
     conn.close()
 
 
