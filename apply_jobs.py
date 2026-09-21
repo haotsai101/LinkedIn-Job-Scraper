@@ -1380,6 +1380,10 @@ async def run_session(
 
     started_at   = datetime.now(timezone.utc).isoformat()
     session_date = datetime.now().strftime("%Y-%m-%d")
+    # Each dict appended below carries its own "applied_at": an ISO-8601 string
+    # timestamp for application_log.json's report, unrelated to jobs.applied_at
+    # (the DB column — epoch seconds, written by mark_job()). Same key name,
+    # different data, different purpose — don't conflate the two.
     applications: list[dict] = []
     applied_count = skipped_count = error_count = 0
     # Jobs left pending because classification failed/timed out — NOT skipped

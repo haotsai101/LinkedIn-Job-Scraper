@@ -67,6 +67,10 @@ def create_tables(conn, cursor):
           sponsored INTEGER,
           applied INTEGER DEFAULT NULL,
           applied_at INTEGER DEFAULT NULL,
+          -- epoch seconds, kept in sync with `applied` by mark_job() et al.
+          -- Not the same thing as the "applied_at" key in application_log.json,
+          -- which is an ISO-8601 string timestamp for that session's report
+          -- (see apply_jobs.py's `applications` list) — same name, unrelated data.
           listed_epoch INTEGER
         );
     ''')
@@ -243,12 +247,30 @@ def ensure_schema_current(conn, cursor):
       2. ``jobs.listed_epoch INTEGER`` added if absent; the shared
          ``LISTED_EPOCH_BACKFILL_SQL`` runs only when the column was just added
          or a probe finds ``listed_epoch IS NULL`` rows still outstanding.
-      3. ``jobs.applied_at INTEGER`` added if absent — a nullable epoch-seconds
+      3. ``jobs.applied_at INTEGER`` added if absent — a nullable epoch-*seconds*
          companion to ``applied``, written by ``apply_jobs.mark_job`` /
          ``skip_ineligible_jobs`` / ``--reset-failed`` going forward. Deliberately
          **no backfill**: a row whose ``applied`` status was already set before
          this column existed has a genuinely unknown application time, and
-         guessing "now" would misrepresent history.
+         guessing "now" would misrepresent history. (Not to be confused with
+         ``application_log.json``'s per-application ``applied_at`` key, an
+         ISO-8601 string timestamp for that session's report — unrelated data
+         with the same name; see the comment on the DDL column and on
+         ``apply_jobs.py``'s ``applications`` list.)
+
+         This check-then-``ALTER`` is exposed to the same
+         "two Dagster ops race a not-yet-migrated DB" scenario documented in
+         ``scripts/migrations/runner.py`` for ``002_schema``'s ``listed_epoch``
+         ALTER — except *that* one is reached only through
+         ``run_pending_migrations``, which serialises callers with
+         ``fcntl.flock``. This step runs straight out of ``create_tables()`` on
+         every process startup with no such lock (so does step 2's own
+         ``listed_epoch`` ALTER above, an equivalent pre-existing gap left
+         alone here as out of scope). Rather than reproduce
+         ``duplicate column name`` as a new failure mode for this column, the
+         loser of the race just swallows its own "duplicate column name:
+         applied_at" ``OperationalError`` below and moves on — self-healing,
+         same as a losing migration retry.
       4. A stale ``idx_jobs_listed`` (built on the old TEXT
          ``original_listed_time`` column) is dropped.
       5. On an actual schema change only: ``create_indexes()`` rebuilds every
@@ -294,8 +316,16 @@ def ensure_schema_current(conn, cursor):
 
     # ── 3. jobs.applied_at column (no backfill — see docstring) ──────────────
     if "applied_at" not in cols:
-        cursor.execute("ALTER TABLE jobs ADD COLUMN applied_at INTEGER")
-        schema_changed = True
+        try:
+            cursor.execute("ALTER TABLE jobs ADD COLUMN applied_at INTEGER")
+        except sqlite3.OperationalError as exc:
+            # Lost the race to another process's concurrent ensure_schema_current()
+            # call (see docstring) — the column is there now regardless of who
+            # added it, so just move on without flipping schema_changed.
+            if "duplicate column name" not in str(exc):
+                raise
+        else:
+            schema_changed = True
 
     # ── 4. drop a stale idx_jobs_listed so it is rebuilt on the new shape ────
     stale = _index_sql(cursor, "idx_jobs_listed")

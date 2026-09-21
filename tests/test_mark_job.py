@@ -71,22 +71,18 @@ def test_mark_job_stamps_applied_at_for_every_terminal_status(conn, status):
     assert before <= applied_at <= after
 
 
-def test_mark_job_with_none_status_clears_applied_at():
+def test_mark_job_with_none_status_clears_applied_at(conn):
     """Defensive path: no current caller passes status=None, but a pending job
     should never carry a stale applied_at."""
-    import tempfile
-    with tempfile.TemporaryDirectory() as d:
-        conn = _make_db(Path(d) / "t.db")
-        _add_job(conn, 1, applied=-2, applied_at=12345)
-        conn.commit()
-        cur = conn.cursor()
+    _add_job(conn, 1, applied=-2, applied_at=12345)
+    conn.commit()
+    cur = conn.cursor()
 
-        apply_jobs.mark_job(conn, cur, 1, None)
+    apply_jobs.mark_job(conn, cur, 1, None)
 
-        applied, applied_at = _row(conn, 1)
-        assert applied is None
-        assert applied_at is None
-        conn.close()
+    applied, applied_at = _row(conn, 1)
+    assert applied is None
+    assert applied_at is None
 
 
 def test_skip_ineligible_jobs_stamps_applied_at(conn):
