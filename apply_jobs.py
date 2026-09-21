@@ -1138,8 +1138,20 @@ def get_pending_jobs(cursor, limit=None, apply_type=None, include_failed=False):
 
 
 def mark_job(conn, cursor, job_id: int, status: int):
-    """status: 1=applied, -1=skipped, -2=auto-failed, -3=blocked (no auto-retry)."""
-    cursor.execute("UPDATE jobs SET applied = ? WHERE job_id = ?", (status, job_id))
+    """status: 1=applied, -1=skipped, -2=auto-failed, -3=blocked (no auto-retry).
+
+    Stamps ``applied_at`` with the current epoch time in the same UPDATE
+    whenever ``status`` is not None, so "how many jobs were applied / skipped /
+    failed / blocked in the last week" is answerable straight from the DB for
+    any terminal outcome. No caller currently passes ``status=None`` here (that
+    is what a still-pending row already looks like), but it is handled
+    defensively by clearing ``applied_at`` back to NULL to match.
+    """
+    applied_at = int(time.time()) if status is not None else None
+    cursor.execute(
+        "UPDATE jobs SET applied = ?, applied_at = ? WHERE job_id = ?",
+        (status, applied_at, job_id),
+    )
     conn.commit()
 
 
@@ -1147,16 +1159,31 @@ def skip_ineligible_jobs(conn, cursor) -> int:
     """Mark all pending scraped jobs that are not remote/Utah as skipped. Returns count."""
     cursor.execute("""
         UPDATE jobs
-        SET applied = -1
+        SET applied = -1, applied_at = ?
         WHERE scraped > 0
           AND applied IS NULL
           AND remote_allowed IS NOT 1
           AND LOWER(COALESCE(location, '')) NOT LIKE '%remote%'
           AND LOWER(COALESCE(location, '')) NOT LIKE '%utah%'
           AND LOWER(COALESCE(location, '')) NOT LIKE '%, ut%'
-    """)
+    """, (int(time.time()),))
     conn.commit()
     return cursor.rowcount
+
+
+def reset_failed_jobs(conn, cursor) -> int:
+    """Reset all auto-failed jobs (applied=-2) back to pending (NULL), clearing
+    ``applied_at`` in the same UPDATE — a pending job has no application
+    timestamp. Returns the count of rows reset.
+
+    Only -2 (auto-failed) is retryable. -3 (blocked ATS / login wall) is
+    deliberately left alone — those need a human, not another agent run.
+    """
+    cursor.execute("SELECT COUNT(*) FROM jobs WHERE applied = -2")
+    count = cursor.fetchone()[0]
+    cursor.execute("UPDATE jobs SET applied = NULL, applied_at = NULL WHERE applied = -2")
+    conn.commit()
+    return count
 
 
 def print_stats(cursor):
@@ -1353,6 +1380,10 @@ async def run_session(
 
     started_at   = datetime.now(timezone.utc).isoformat()
     session_date = datetime.now().strftime("%Y-%m-%d")
+    # Each dict appended below carries its own "applied_at": an ISO-8601 string
+    # timestamp for application_log.json's report, unrelated to jobs.applied_at
+    # (the DB column — epoch seconds, written by mark_job()). Same key name,
+    # different data, different purpose — don't conflate the two.
     applications: list[dict] = []
     applied_count = skipped_count = error_count = 0
     # Jobs left pending because classification failed/timed out — NOT skipped
@@ -1866,12 +1897,7 @@ def main():
         return
 
     if args.reset_failed:
-        # Only -2 (auto-failed) is retryable. -3 (blocked ATS / login wall) is
-        # deliberately left alone — those need a human, not another agent run.
-        cursor.execute("SELECT COUNT(*) FROM jobs WHERE applied = -2")
-        count = cursor.fetchone()[0]
-        cursor.execute("UPDATE jobs SET applied = NULL WHERE applied = -2")
-        conn.commit()
+        count = reset_failed_jobs(conn, cursor)
         print(f"Reset {count} auto-failed job(s) back to pending.")
         print_stats(cursor)
         conn.close()

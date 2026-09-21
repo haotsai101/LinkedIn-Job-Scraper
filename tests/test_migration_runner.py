@@ -265,6 +265,120 @@ def test_ensure_db_ready_on_fresh_checkout(tmp_path):
         assert _table_exists(db, t)
     cols = {r[1] for r in conn.execute("PRAGMA table_info(jobs)")}
     assert "listed_epoch" in cols
+    assert "applied_at" in cols
+    conn.close()
+
+
+def test_ensure_schema_current_adds_applied_at_without_backfill(tmp_path):
+    """New column: additive only, no backfill. A row whose ``applied`` status
+    was already set before this column existed has a genuinely unknown
+    application time, so ensure_schema_current must not write a fabricated
+    "now" timestamp into it."""
+    db = tmp_path / "linkedin_jobs.db"
+    _bare_db(db)  # pre-migrations jobs table: no listed_epoch, no applied_at
+    conn = sqlite3.connect(str(db))
+    conn.execute(
+        "INSERT INTO jobs (job_id, scraped, applied) VALUES (1, 1, 1), (2, 1, -2)"
+    )
+    conn.commit()
+
+    changed = ensure_schema_current(conn, conn.cursor())
+
+    assert changed is True
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(jobs)")}
+    assert "applied_at" in cols
+    rows = dict(conn.execute("SELECT job_id, applied_at FROM jobs").fetchall())
+    assert rows == {1: None, 2: None}
+    conn.close()
+
+
+def test_ensure_schema_current_applied_at_is_idempotent(tmp_path):
+    db = tmp_path / "linkedin_jobs.db"
+    _current_db(db)
+    conn = sqlite3.connect(str(db))
+
+    assert ensure_schema_current(conn, conn.cursor()) is False  # already current
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(jobs)")}
+    assert "applied_at" in cols
+    conn.close()
+
+
+class _RaceCursor:
+    """Wraps a real cursor; raises sqlite3's exact error for a losing
+    concurrent ALTER on ``sql_target`` instead of running it, so a race can be
+    simulated deterministically without real threads."""
+
+    def __init__(self, real, sql_target: str, message: str):
+        self._real = real
+        self._sql_target = sql_target
+        self._message = message
+
+    def execute(self, sql, *args):
+        if sql.strip() == self._sql_target:
+            raise sqlite3.OperationalError(self._message)
+        return self._real.execute(sql, *args)
+
+    def executemany(self, sql, *args):
+        return self._real.executemany(sql, *args)
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+def _db_missing_only_applied_at(path: Path) -> None:
+    """The realistic shape of an existing production DB the first time this
+    PR's migration runs against it: already through the T9 listed_epoch step
+    (column added, stale index rebuilt) but predating jobs.applied_at — so
+    ensure_schema_current has exactly one pending step, and ``schema_changed``
+    cleanly reflects only what happens to that step."""
+    _bare_db(path)
+    conn = sqlite3.connect(str(path))
+    conn.execute("ALTER TABLE jobs ADD COLUMN listed_epoch INTEGER")
+    conn.execute("DROP INDEX IF EXISTS idx_jobs_listed")
+    conn.execute("CREATE INDEX idx_jobs_listed ON jobs(applied, listed_epoch DESC)")
+    conn.commit()
+    conn.close()
+
+
+def test_ensure_schema_current_survives_concurrent_applied_at_add(tmp_path):
+    """SHOULD-FIX regression: unlike ``run_pending_migrations`` (serialised by
+    ``fcntl.flock``, see runner.py's docstring), this check-then-ALTER runs
+    unlocked straight out of create_tables() on every process startup — two
+    Dagster ops racing a not-yet-migrated DB can both see applied_at missing
+    and both ALTER. This is the exact bug class T23 fixed for listed_epoch's
+    ``duplicate column name`` on the migration path; here the loser must
+    swallow its own "duplicate column name: applied_at" instead of raising."""
+    db = tmp_path / "linkedin_jobs.db"
+    _db_missing_only_applied_at(db)
+    conn = sqlite3.connect(str(db))
+    spy = _RaceCursor(
+        conn.cursor(),
+        "ALTER TABLE jobs ADD COLUMN applied_at INTEGER",
+        "duplicate column name: applied_at",
+    )
+
+    changed = ensure_schema_current(conn, spy)  # must not raise
+
+    assert changed is False  # this call's only pending step was swallowed
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(jobs)")}
+    assert "applied_at" not in cols  # this connection's own ALTER never ran
+    conn.close()
+
+
+def test_ensure_schema_current_reraises_unrelated_operational_error(tmp_path):
+    """The guard is scoped to the specific race — a genuine failure (e.g. a
+    locked DB) must still propagate, not be silently swallowed."""
+    db = tmp_path / "linkedin_jobs.db"
+    _db_missing_only_applied_at(db)
+    conn = sqlite3.connect(str(db))
+    spy = _RaceCursor(
+        conn.cursor(),
+        "ALTER TABLE jobs ADD COLUMN applied_at INTEGER",
+        "database is locked",
+    )
+
+    with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+        ensure_schema_current(conn, spy)
     conn.close()
 
 
