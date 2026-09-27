@@ -113,8 +113,8 @@ def test_ask_llm_long_labelled_scale_field_yields_bare_integer(monkeypatch):
         GUIDED_MODEL, {"years_experience": 8}, {"label": label, "kind": "text"},
     ))
     assert out == "7"
-    # The non-long-form prompt was used (no "2-4 sentence" instruction).
-    assert "2-4 sentence" not in stub.calls[0]["prompt"]
+    # The non-long-form prompt was used (no "1-2 sentence" instruction).
+    assert "1-2 sentence" not in stub.calls[0]["prompt"]
 
 
 def test_ask_llm_genuine_free_text_still_gets_prose(monkeypatch):
@@ -127,7 +127,7 @@ def test_ask_llm_genuine_free_text_still_gets_prose(monkeypatch):
          "kind": "text"},
     ))
     assert out == prose
-    assert "2-4 sentence" in stub.calls[0]["prompt"]
+    assert "1-2 sentence" in stub.calls[0]["prompt"]
 
 
 def test_ask_llm_star_question_with_a_hint_token_gets_prose(monkeypatch):
@@ -143,7 +143,7 @@ def test_ask_llm_star_question_with_a_hint_token_gets_prose(monkeypatch):
                   "decision? Give an example.", "kind": "text"},
     ))
     assert out == prose
-    assert "2-4 sentence" in stub.calls[0]["prompt"]
+    assert "1-2 sentence" in stub.calls[0]["prompt"]
 
 
 # ── _ask_llm_action decide-action loop ─────────────────────────────────────
