@@ -1960,7 +1960,8 @@ async def _ask_llm(model: str, profile: dict, field: dict) -> str | None:
     if is_long_form:
         prompt += (
             f"\nUser profile:\n{json.dumps(profile, indent=2)}\n\n"
-            "Write a professional 2-4 sentence answer for this job application field. "
+            "Write a professional 1-2 sentence answer for this job application field. "
+            "Be concise and direct — no filler, no padding, no unnecessary elaboration. "
             "Draw on the profile's skills, experience, and background. "
             "If the question is about the company specifically, write a plausible, enthusiastic answer based on the applicant's goals. "
             "Never leave it blank — always produce a meaningful answer. "
