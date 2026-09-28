@@ -158,6 +158,33 @@ def test_classifier_route_bad_value_warns_and_defaults(monkeypatch):
         assert config.get_classifier_route() == "agent"
 
 
+# ── offsite engine (T54) ────────────────────────────────────────────────────────
+
+def test_offsite_engine_defaults_to_stepwise():
+    assert config.get_offsite_engine() == "stepwise"
+
+
+def test_offsite_engine_agentic_opt_in(monkeypatch):
+    monkeypatch.setenv("OFFSITE_ENGINE", "agentic")
+    assert config.get_offsite_engine() == "agentic"
+
+
+def test_offsite_engine_is_case_insensitive_and_trimmed(monkeypatch):
+    monkeypatch.setenv("OFFSITE_ENGINE", "  AGENTIC  ")
+    assert config.get_offsite_engine() == "agentic"
+
+
+def test_offsite_engine_blank_falls_through_to_stepwise(monkeypatch):
+    monkeypatch.setenv("OFFSITE_ENGINE", "   ")
+    assert config.get_offsite_engine() == "stepwise"
+
+
+def test_offsite_engine_bad_value_warns_and_defaults(monkeypatch):
+    monkeypatch.setenv("OFFSITE_ENGINE", "browser-use")
+    with pytest.warns(RuntimeWarning, match="browser-use"):
+        assert config.get_offsite_engine() == "stepwise"
+
+
 def test_apply_jobs_nim_flag_defaults_off_on_clean_import():
     """The T38 contract: a clean-env import of apply_jobs resolves the NIM
     classifier route OFF, so no CLASSIFIER_API is needed by default. (The

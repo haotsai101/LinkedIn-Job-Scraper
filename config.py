@@ -39,6 +39,7 @@ from typing import Literal, Optional
 
 Role = Literal["classifier", "browser_use", "guided_apply"]
 ClassifierRoute = Literal["agent", "nim"]
+OffsiteEngine = Literal["stepwise", "agentic"]
 
 _NIM_BASE_URL = "https://integrate.api.nvidia.com/v1"
 
@@ -213,6 +214,45 @@ def get_classifier_route() -> ClassifierRoute:
             stacklevel=2,
         )
         return _DEFAULT_CLASSIFIER_ROUTE
+    return raw  # type: ignore[return-value]
+
+
+# ── Offsite engine (T54) ────────────────────────────────────────────────────────
+
+_DEFAULT_OFFSITE_ENGINE: OffsiteEngine = "stepwise"
+
+
+def get_offsite_engine() -> OffsiteEngine:
+    """Which engine drives ``OffsiteApply`` form-filling.
+
+    * ``"stepwise"`` (default) — the existing stateless step-loop engine
+      (``linkedin_apply.OffsiteApplyFlow._llm_guided_apply``): each iteration
+      rebuilds one prompt from scratch and fires an isolated Claude Agent SDK
+      call.
+    * ``"agentic"`` — the opt-in tool-calling engine
+      (``offsite_agentic.AgenticOffsiteApplyFlow``): a persistent OpenAI-style
+      chat-completions conversation with real function calling, on the
+      ``browser_use`` role's OpenAI-compatible endpoint (any provider — see
+      ``browser_use_client.BrowserUseConfigError`` for how to point it at your
+      own key/endpoint).
+
+    Set with ``OFFSITE_ENGINE`` in ``.env`` (or a real env var). An empty or
+    unrecognised value resolves to ``"stepwise"`` (with a warning for a
+    non-empty bad value).
+    """
+    _load_dotenv()
+    original = os.environ.get("OFFSITE_ENGINE")
+    raw = (original or "").strip().lower()
+    if not raw:
+        return _DEFAULT_OFFSITE_ENGINE
+    if raw not in ("stepwise", "agentic"):
+        warnings.warn(
+            f"OFFSITE_ENGINE={original!r} is not 'stepwise' or 'agentic'; using "
+            f"{_DEFAULT_OFFSITE_ENGINE!r}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return _DEFAULT_OFFSITE_ENGINE
     return raw  # type: ignore[return-value]
 
 

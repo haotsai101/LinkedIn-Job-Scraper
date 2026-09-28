@@ -64,6 +64,7 @@ from playwright.async_api import async_playwright
 import config
 import llm
 import nim_client
+import offsite_agentic
 from common import prune_debug_screenshots, rotate_llm_log
 from common import write_llm_log as _write_llm_log
 from linkedin_apply import (
@@ -102,6 +103,28 @@ ACCOUNTS_PATH = "created_accounts.json"
 # route: set ``CLASSIFIER_ROUTE=nim`` in ``.env`` to re-enable it (see
 # ``config.get_classifier_route``). Resolved once at import.
 _NIM_CLASSIFIER_ENABLED = config.get_classifier_route() == "nim"
+
+
+def _offsite_flow_class():
+    """Which OffsiteApplyFlow (sub)class to construct — T54.
+
+    ``OFFSITE_ENGINE=agentic`` (default "stepwise", see
+    ``config.get_offsite_engine``) swaps in the opt-in tool-calling engine at
+    both construction sites below. Same constructor signature —
+    ``AgenticOffsiteApplyFlow`` adds no required args — so this is a class
+    choice, not a call-site rewrite. ``isinstance(flow, OffsiteApplyFlow)``
+    checks elsewhere in this file still hold since it's a subclass.
+
+    Deliberately re-resolved on every call rather than cached at import: the
+    bare ``OffsiteApplyFlow`` name below is looked up from this module's
+    globals at call time, so a test's
+    ``monkeypatch.setattr(apply_jobs, "OffsiteApplyFlow", ...)`` (see
+    ``tests/test_browser_crash_recovery.py``) still takes effect exactly as
+    it did before T54.
+    """
+    if config.get_offsite_engine() == "agentic":
+        return offsite_agentic.AgenticOffsiteApplyFlow
+    return OffsiteApplyFlow
 
 # Domains we never open a browser tab for: pure aggregators, contractor-only
 # platforms, assessment mills, and known scam/broker sites. Checked against a
@@ -1577,7 +1600,7 @@ async def run_session(
                 if (application_type or "") == "OffsiteApply":
                     # Spam/aggregator domains were already filtered before the
                     # classifier call (see _match_spam_domain above).
-                    flow = OffsiteApplyFlow(
+                    flow = _offsite_flow_class()(
                         page=page,
                         context=context,
                         profile=profile,
@@ -1624,7 +1647,7 @@ async def run_session(
                 # Easy Apply job switched to external apply — retry with OffsiteApplyFlow
                 if status == "external_apply" and not isinstance(flow, OffsiteApplyFlow):
                     print("  [~] Job switched from Easy Apply to external — retrying with OffsiteApplyFlow…")
-                    flow = OffsiteApplyFlow(
+                    flow = _offsite_flow_class()(
                         page=page,
                         context=context,
                         profile=profile,
