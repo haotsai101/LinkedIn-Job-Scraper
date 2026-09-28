@@ -48,10 +48,13 @@ class _Loc:
 
 
 class _Page:
-    """Just what _agentic_guided_apply's pre-turn checks touch."""
+    """Just what _agentic_guided_apply's pre-turn checks (and now the vision
+    follow-up) touch."""
 
-    def __init__(self, url="https://jobs.acme.com/careers/1"):
+    def __init__(self, url="https://jobs.acme.com/careers/1", *, screenshot_raises=False):
         self.url = url
+        self._screenshot_raises = screenshot_raises
+        self.screenshot_calls: list = []
 
     def locator(self, _selector):
         return _Loc(0)
@@ -64,6 +67,12 @@ class _Page:
 
     async def content(self):
         return "<html></html>"
+
+    async def screenshot(self, **kwargs):
+        self.screenshot_calls.append(kwargs)
+        if self._screenshot_raises:
+            raise RuntimeError("screenshot capture failed")
+        return b"fake-jpeg-bytes"
 
 
 class _Context:
@@ -596,6 +605,139 @@ def test_browser_use_config_error_propagates_without_fallback(monkeypatch):
 
     with pytest.raises(offsite_agentic.browser_use_client.BrowserUseConfigError):
         _run(flow._agentic_guided_apply(_Page()))
+
+
+# ── vision (T54 follow-up) ────────────────────────────────────────────────
+
+def _messages_have_image(messages):
+    for m in messages:
+        content = m.get("content")
+        if isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "image_url":
+                    return True
+    return False
+
+
+def test_vision_off_mode_never_builds_image_message():
+    flow = _agentic()
+    flow._vision_mode = "off"
+    out = _run(flow._maybe_capture_screenshot_message(_Page()))
+    assert out is None
+
+
+def test_vision_auto_mode_skips_when_already_known_unsupported():
+    flow = _agentic()
+    flow._vision_mode = "auto"
+    flow._vision_supported = False
+    page = _Page()
+    out = _run(flow._maybe_capture_screenshot_message(page))
+    assert out is None
+    assert page.screenshot_calls == []  # never even attempted
+
+
+def test_vision_screenshot_capture_failure_skips_this_call_only():
+    flow = _agentic()
+    flow._vision_mode = "auto"
+    flow._vision_supported = None
+    page = _Page(screenshot_raises=True)
+    out = _run(flow._maybe_capture_screenshot_message(page))
+    assert out is None
+    # A screenshot CAPTURE failure is not evidence the endpoint rejects
+    # images — must not be confused with a model/endpoint rejection.
+    assert flow._vision_supported is None
+
+
+def test_vision_message_shape_and_screenshot_args_when_capture_succeeds():
+    flow = _agentic()
+    flow._vision_mode = "on"
+    page = _Page()
+    msg = _run(flow._maybe_capture_screenshot_message(page))
+    assert msg["role"] == "user"
+    assert msg["content"][0] == {"type": "text", "text": "Screenshot of the current page:"}
+    assert msg["content"][1]["type"] == "image_url"
+    assert msg["content"][1]["image_url"]["url"].startswith("data:image/jpeg;base64,")
+    # Viewport only, not full-page, per the design brief.
+    assert page.screenshot_calls == [{"type": "jpeg", "quality": 60, "full_page": False}]
+
+
+def test_vision_auto_mode_falls_back_to_text_only_after_first_failure_and_stays_off(monkeypatch):
+    """Full-loop scenario: read_page attaches a screenshot; the very next
+    model call rejects it; the engine retries that same turn text-only,
+    latches vision off, and never attaches an image again for the rest of
+    the (simulated) job."""
+    flow = _agentic()
+    monkeypatch.setattr(offsite_agentic.config, "get_vision_mode", lambda: "auto")
+    _wire_common_seams(monkeypatch, flow)
+
+    async def fake_snapshot(_self, _page):
+        return {"visible_text": "hi", "fields": [], "buttons": []}
+    monkeypatch.setattr(type(flow), "_page_snapshot", fake_snapshot)
+
+    has_image_log: list = []
+    state = {"n": 0}
+
+    def fake_call_with_tools(client, model, messages, tools, *, tool_choice="auto"):
+        state["n"] += 1
+        has_image_log.append(_messages_have_image(messages))
+        if state["n"] == 1:
+            return _FakeMessage(tool_calls=[_FakeToolCall("c1", "read_page", {})])
+        if state["n"] == 2:
+            # This turn's messages include the screenshot from the first
+            # read_page call -- simulate the endpoint rejecting image input.
+            raise RuntimeError("model does not support image content")
+        if state["n"] == 3:
+            # Retry of the SAME turn, now text-only -- another read_page to
+            # prove vision stays off on every later call too.
+            return _FakeMessage(tool_calls=[_FakeToolCall("c3", "read_page", {})])
+        if state["n"] == 4:
+            return _FakeMessage(tool_calls=[
+                _FakeToolCall("c4", "finish", {"status": "failed", "reason": "done testing"}),
+            ])
+        raise AssertionError(f"unexpected extra call_with_tools invocation #{state['n']}")
+
+    monkeypatch.setattr(
+        offsite_agentic.browser_use_client, "resolve_browser_use", lambda cfg=None: ("C", "m"),
+    )
+    monkeypatch.setattr(offsite_agentic.browser_use_client, "call_with_tools", fake_call_with_tools)
+
+    out = _run(flow._agentic_guided_apply(_Page()))
+
+    assert out == "failed"
+    assert flow._vision_supported is False
+    # call #1: no image yet. call #2: image attached, rejected. call #3: the
+    # retry, text-only. call #4: a later turn, still text-only.
+    assert has_image_log == [False, True, False, False]
+
+
+def test_vision_on_mode_propagates_failure_without_degrading(monkeypatch):
+    """"on" mode never falls back -- a rejection must propagate out of
+    _agentic_guided_apply so a user who explicitly forced vision on finds
+    out their model doesn't support it, instead of silently losing it."""
+    flow = _agentic()
+    monkeypatch.setattr(offsite_agentic.config, "get_vision_mode", lambda: "on")
+    _wire_common_seams(monkeypatch, flow)
+
+    async def fake_snapshot(_self, _page):
+        return {"visible_text": "hi", "fields": [], "buttons": []}
+    monkeypatch.setattr(type(flow), "_page_snapshot", fake_snapshot)
+
+    state = {"n": 0}
+
+    def fake_call_with_tools(client, model, messages, tools, *, tool_choice="auto"):
+        state["n"] += 1
+        if state["n"] == 1:
+            return _FakeMessage(tool_calls=[_FakeToolCall("c1", "read_page", {})])
+        raise RuntimeError("model does not support image content")
+
+    monkeypatch.setattr(
+        offsite_agentic.browser_use_client, "resolve_browser_use", lambda cfg=None: ("C", "m"),
+    )
+    monkeypatch.setattr(offsite_agentic.browser_use_client, "call_with_tools", fake_call_with_tools)
+
+    with pytest.raises(RuntimeError, match="does not support image"):
+        _run(flow._agentic_guided_apply(_Page()))
+    assert flow._vision_supported is None  # never touched -- "on" mode doesn't degrade
 
 
 # ── acceptance guard: no Claude/Anthropic import in this module ─────────

@@ -40,6 +40,7 @@ from typing import Literal, Optional
 Role = Literal["classifier", "browser_use", "guided_apply"]
 ClassifierRoute = Literal["agent", "nim"]
 OffsiteEngine = Literal["stepwise", "agentic"]
+VisionMode = Literal["auto", "on", "off"]
 
 _NIM_BASE_URL = "https://integrate.api.nvidia.com/v1"
 
@@ -253,6 +254,46 @@ def get_offsite_engine() -> OffsiteEngine:
             stacklevel=2,
         )
         return _DEFAULT_OFFSITE_ENGINE
+    return raw  # type: ignore[return-value]
+
+
+# ── Vision mode (T54 follow-up) ──────────────────────────────────────────────────
+
+_DEFAULT_VISION_MODE: VisionMode = "auto"
+
+
+def get_vision_mode() -> VisionMode:
+    """Whether ``offsite_agentic.AgenticOffsiteApplyFlow`` attaches a page
+    screenshot alongside its ``read_page`` tool result.
+
+    * ``"auto"`` (default) — attempt a screenshot; if the ``browser_use``
+      endpoint/model rejects it, fall back to text-only for the rest of that
+      job (detected at runtime, not from a hardcoded per-provider capability
+      list — this stays provider-agnostic exactly like the rest of the
+      ``browser_use`` role).
+    * ``"on"`` — always attempt a screenshot; a rejection propagates instead
+      of silently degrading, so a user who explicitly forced this on finds
+      out their model doesn't support it.
+    * ``"off"`` — never attempt one; identical behavior to before this
+      option existed.
+
+    Set with ``BROWSER_USE_VISION`` in ``.env`` (or a real env var). An empty
+    or unrecognised value resolves to ``"auto"`` (with a warning for a
+    non-empty bad value).
+    """
+    _load_dotenv()
+    original = os.environ.get("BROWSER_USE_VISION")
+    raw = (original or "").strip().lower()
+    if not raw:
+        return _DEFAULT_VISION_MODE
+    if raw not in ("auto", "on", "off"):
+        warnings.warn(
+            f"BROWSER_USE_VISION={original!r} is not 'auto', 'on', or 'off'; using "
+            f"{_DEFAULT_VISION_MODE!r}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return _DEFAULT_VISION_MODE
     return raw  # type: ignore[return-value]
 
 

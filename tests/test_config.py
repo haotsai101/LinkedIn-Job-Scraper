@@ -185,6 +185,38 @@ def test_offsite_engine_bad_value_warns_and_defaults(monkeypatch):
         assert config.get_offsite_engine() == "stepwise"
 
 
+# ── vision mode (T54 follow-up) ──────────────────────────────────────────────────
+
+def test_vision_mode_defaults_to_auto():
+    assert config.get_vision_mode() == "auto"
+
+
+def test_vision_mode_on_opt_in(monkeypatch):
+    monkeypatch.setenv("BROWSER_USE_VISION", "on")
+    assert config.get_vision_mode() == "on"
+
+
+def test_vision_mode_off_opt_in(monkeypatch):
+    monkeypatch.setenv("BROWSER_USE_VISION", "off")
+    assert config.get_vision_mode() == "off"
+
+
+def test_vision_mode_is_case_insensitive_and_trimmed(monkeypatch):
+    monkeypatch.setenv("BROWSER_USE_VISION", "  ON  ")
+    assert config.get_vision_mode() == "on"
+
+
+def test_vision_mode_blank_falls_through_to_auto(monkeypatch):
+    monkeypatch.setenv("BROWSER_USE_VISION", "   ")
+    assert config.get_vision_mode() == "auto"
+
+
+def test_vision_mode_bad_value_warns_and_defaults(monkeypatch):
+    monkeypatch.setenv("BROWSER_USE_VISION", "maybe")
+    with pytest.warns(RuntimeWarning, match="maybe"):
+        assert config.get_vision_mode() == "auto"
+
+
 def test_apply_jobs_nim_flag_defaults_off_on_clean_import():
     """The T38 contract: a clean-env import of apply_jobs resolves the NIM
     classifier route OFF, so no CLASSIFIER_API is needed by default. (The

@@ -47,17 +47,28 @@ Ships opt-in (``OFFSITE_ENGINE=agentic``, default ``stepwise`` — see
 ``config.get_offsite_engine``). The default ``browser_use`` NIM model
 (``deepseek-ai/deepseek-v4-flash-0731``) has never been validated for
 tool-calling reliability specifically — see docs/TICKETS.md T54.
+
+**Vision (T54 follow-up)**: ``read_page`` can additionally attach a viewport
+screenshot as a separate follow-up message, controlled by
+``config.get_vision_mode()`` (``BROWSER_USE_VISION``, default ``"auto"``).
+Detection is fully runtime/provider-agnostic — no hardcoded per-model
+capability list: ``"auto"`` just tries it and, if the very next model call
+raises, retries that call text-only and remembers not to try again for the
+rest of the job; ``"on"`` never falls back (a rejection propagates); ``"off"``
+never attempts one. See :meth:`_maybe_capture_screenshot_message`.
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
 from typing import Any
 from urllib.parse import urlparse
 
 import browser_use_client
+import config
 from linkedin_apply import (
     OffsiteApplyFlow,
     Page,
@@ -296,6 +307,13 @@ class AgenticOffsiteApplyFlow(OffsiteApplyFlow):
         self._forced_filled: dict[str, str] = {}
         self._submit_clicked = False
         self._form_engaged = False
+        # Vision (T54 follow-up): resolved once per job in
+        # _agentic_guided_apply. _vision_supported is tri-state: None =
+        # unknown/untested yet, True = confirmed working, False = confirmed
+        # unsupported by the endpoint this job (only ever set False in "auto"
+        # mode — "on" mode lets a rejection propagate instead).
+        self._vision_mode: str = "off"
+        self._vision_supported: bool | None = None
 
     # ── entry points: reuse OffsiteApplyFlow.run() unchanged; only the final
     # hop into the loop changes ──────────────────────────────────────────────
@@ -362,6 +380,13 @@ class AgenticOffsiteApplyFlow(OffsiteApplyFlow):
             "When the application is fully submitted or unrecoverable, call "
             "finish with the appropriate status.\n\n" + rules
         )
+        if self._vision_mode != "off":
+            system += (
+                " Some read_page calls may be followed by a screenshot of the "
+                "current page as an extra image message for visual context -- "
+                "the structured text read_page itself returns remains the "
+                "authoritative source for exact selectors and field state."
+            )
         job_ctx = (
             f"Job: {self.job_title} at {self.company_name}\n"
             f"Summary: {job_summary}\n\n"
@@ -419,6 +444,43 @@ class AgenticOffsiteApplyFlow(OffsiteApplyFlow):
 
     async def _tool_read_page(self) -> dict:
         return await self._page_snapshot(self.page)
+
+    async def _maybe_capture_screenshot_message(self, page: Page) -> dict | None:
+        """Build the vision follow-up message for a ``read_page`` call, or
+        ``None`` when vision should not be attempted this call.
+
+        Called for every ``read_page`` tool call, not just the first — the
+        "try once, remember the answer" detection in :meth:`_agentic_guided_apply`
+        is what makes this a one-time cost in practice: ``_vision_supported``
+        latches ``False`` the first time the endpoint rejects an image, and
+        every call after that short-circuits here without ever touching
+        ``page.screenshot()`` again for the rest of the job.
+
+        A screenshot CAPTURE failure (e.g. a Playwright error) is unrelated to
+        whether the *endpoint* supports image input, so it does not touch
+        ``_vision_supported`` — just skips attaching an image for this one
+        call and tries again next time.
+        """
+        if self._vision_mode == "off":
+            return None
+        if self._vision_mode == "auto" and self._vision_supported is False:
+            return None
+        try:
+            # Viewport only (matches what the text snapshot's `inViewport`
+            # fields already represent) and JPEG at a modest quality to keep
+            # payload/token size down — this rides on every read_page call.
+            screenshot_bytes = await page.screenshot(type="jpeg", quality=60, full_page=False)
+        except Exception as exc:
+            print(f"  [Agentic] Screenshot capture failed ({exc}) — read_page stays text-only")
+            return None
+        data_url = "data:image/jpeg;base64," + base64.b64encode(screenshot_bytes).decode("ascii")
+        return {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Screenshot of the current page:"},
+                {"type": "image_url", "image_url": {"url": data_url}},
+            ],
+        }
 
     async def _tool_fill_field(self, selector: str, value: str) -> str | None:
         return await self._dispatch("fill", selector=selector, value=value)
@@ -520,6 +582,8 @@ class AgenticOffsiteApplyFlow(OffsiteApplyFlow):
         self._forced_filled = {}
         self._submit_clicked = False
         self._form_engaged = False
+        self._vision_mode = config.get_vision_mode()
+        self._vision_supported = None
 
         # Hard config failure for this whole engine — propagate, do not fall
         # back to the stepwise engine (that decision belongs to apply_jobs.py,
@@ -563,6 +627,11 @@ class AgenticOffsiteApplyFlow(OffsiteApplyFlow):
         last_call_url = ""
         repeat_count = 0
         prev_url = page.url
+        # Index of a not-yet-confirmed vision (image) message appended to
+        # `messages` by the previous read_page call, or None. Resolved (kept,
+        # or popped + _vision_supported latched False) by the very next
+        # model call below — see the try/except around it.
+        _pending_vision_msg_idx: int | None = None
 
         try:
             while total_tool_calls < self._MAX_TOOL_CALLS:
@@ -627,9 +696,35 @@ class AgenticOffsiteApplyFlow(OffsiteApplyFlow):
                 if total_tool_calls > 0:
                     await asyncio.sleep(8)
 
-                response_message = await asyncio.to_thread(
-                    browser_use_client.call_with_tools, client, model, messages, self._TOOLS,
-                )
+                try:
+                    response_message = await asyncio.to_thread(
+                        browser_use_client.call_with_tools, client, model, messages, self._TOOLS,
+                    )
+                except Exception:
+                    # Vision fallback (T54 follow-up): a pending image from
+                    # the previous read_page call is the ONLY case this
+                    # engine treats a model-call failure as recoverable —
+                    # everything else propagates exactly as before this
+                    # feature existed. "on" mode never falls back here: a
+                    # user who explicitly forced vision on wants the failure,
+                    # not a silent downgrade.
+                    if _pending_vision_msg_idx is None or self._vision_mode == "on":
+                        raise
+                    print(
+                        "  [Agentic] Model call failed with a screenshot attached — "
+                        "retrying this turn text-only; vision disabled for the rest "
+                        "of this job"
+                    )
+                    messages.pop(_pending_vision_msg_idx)
+                    self._vision_supported = False
+                    _pending_vision_msg_idx = None
+                    response_message = await asyncio.to_thread(
+                        browser_use_client.call_with_tools, client, model, messages, self._TOOLS,
+                    )
+                else:
+                    if _pending_vision_msg_idx is not None:
+                        self._vision_supported = True
+                    _pending_vision_msg_idx = None
                 messages.append(self._message_to_dict(response_message))
 
                 tool_calls = list(getattr(response_message, "tool_calls", None) or [])
@@ -689,6 +784,12 @@ class AgenticOffsiteApplyFlow(OffsiteApplyFlow):
                     if terminal is not None:
                         print(f"  [Agentic] Terminal result from {name!r}: {terminal}")
                         return terminal
+
+                    if name == "read_page":
+                        _vision_msg = await self._maybe_capture_screenshot_message(page)
+                        if _vision_msg is not None:
+                            messages.append(_vision_msg)
+                            _pending_vision_msg_idx = len(messages) - 1
 
                     _terminal2 = await self._detect_terminal_state(page, step=total_tool_calls)
                     if _terminal2 is not None:
