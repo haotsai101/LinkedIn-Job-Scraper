@@ -1064,13 +1064,27 @@ async def run_session(
     })
     all_unanswered_fields: list[str] = []
 
-    # Skip LinkedIn login when every job in the queue is OffsiteApply —
-    # those jobs navigate directly to the company ATS via application_url.
-    _all_offsite = all(row[7] == "OffsiteApply" for row in jobs)
-    if _all_offsite:
-        print("\nOpening browser (OffsiteApply only — skipping LinkedIn login)…")
-    else:
-        print("\nOpening browser and signing into LinkedIn…")
+    # OffsiteApply automation was removed in full (pending a from-scratch
+    # redesign, T54) — if every pending job in this batch is OffsiteApply,
+    # every one of them will immediately loop-skip below without ever
+    # touching a page, so there is nothing a browser session could do. Skip
+    # opening one entirely rather than launching Chromium, logging into
+    # LinkedIn, and idling through a batch of no-ops.
+    if jobs and all((row[7] or "") == "OffsiteApply" for row in jobs):
+        print(f"\nAll {total} pending job(s) are OffsiteApply — automation for "
+              f"that application_type was removed and is pending a "
+              f"from-scratch redesign. Nothing to do this session "
+              f"(jobs.applied left untouched).")
+        _write_llm_log({
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "type": "session_end",
+            "note": "all-offsite batch, no browser session opened",
+            "total_jobs": total,
+        })
+        conn.close()
+        return
+
+    print("\nOpening browser and signing into LinkedIn…")
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=False)
@@ -1079,15 +1093,12 @@ async def run_session(
         )
         page    = await context.new_page()
 
-        if not _all_offsite:
-            try:
-                await login_linkedin_playwright(page)
-                print("  Session ready.\n")
-            except Exception as _login_err:
-                await browser.close()
-                raise
-        else:
+        try:
+            await login_linkedin_playwright(page)
             print("  Session ready.\n")
+        except Exception as _login_err:
+            await browser.close()
+            raise
 
         if not _check_recent_session_health():
             print("\n  [!] Warning: the last 3 sessions all had >80% error rates.")
@@ -1102,20 +1113,21 @@ async def run_session(
                 print(f"  [{idx}/{total}]  {title or 'Unknown'}  |  {company_name or 'Unknown company'}")
                 print(f"  Location : {location or 'N/A'}   Level: {exp_level or 'N/A'}")
 
+                # OffsiteApply automation (OffsiteApplyFlow) was removed in full
+                # and is pending a from-scratch redesign — pass these jobs over
+                # entirely, before any other check that would write to the DB
+                # (the staff/principal title skip below, classification, etc.).
+                # No classification, no mark_job: jobs.applied stays NULL so
+                # nothing here needs --reset-failed once the new engine lands.
+                if (application_type or "") == "OffsiteApply":
+                    print("  [Offsite apply not yet implemented — skipping]")
+                    continue
+
                 _title_lower = (title or "").lower()
                 if ("staff" in _title_lower or "principal" in _title_lower) and "engineer" in _title_lower:
                     mark_job(conn, cursor, job_id, -1)
                     skipped_count += 1
                     print("  Auto-skipped — staff/principal engineer position.")
-                    continue
-
-                # OffsiteApply automation (OffsiteApplyFlow) was removed in full
-                # and is pending a from-scratch redesign — pass these jobs over
-                # entirely. No classification, no mark_job: jobs.applied stays
-                # NULL so nothing here needs --reset-failed once the new engine
-                # lands.
-                if (application_type or "") == "OffsiteApply":
-                    print("  [Offsite apply not yet implemented — skipping]")
                     continue
 
                 print("  Classifying…", end="", flush=True)
@@ -1377,7 +1389,11 @@ async def run_session(
                 try:
                     context, page = await _recover_browser_if_crashed(
                         browser, context, page,
-                        need_login=not _all_offsite,
+                        # This point is only reached when the batch has at
+                        # least one non-OffsiteApply job (an all-offsite batch
+                        # returns before a browser is even opened — see above)
+                        # — a rebuilt page always needs a fresh LinkedIn login.
+                        need_login=True,
                         suspect=browser_crashed,
                     )
                 except Exception as _rec_exc:

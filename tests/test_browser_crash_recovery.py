@@ -321,3 +321,59 @@ def test_job1_crash_does_not_cascade_into_job2(monkeypatch):
     # outcomes: job 1 auto-failed (-2, retryable), job 2 applied (1)
     assert (1, -2) in marks
     assert (2, 1) in marks
+
+
+# ── all-OffsiteApply batch: no browser session at all (T54 review follow-up) ──
+#
+# OffsiteApplyFlow was removed in full; an OffsiteApply job now just loop-skips
+# inside run_session without ever touching a page. If literally every pending
+# job in the batch is OffsiteApply, opening a whole Chromium session to idle
+# through nothing but no-ops is pointless — run_session should return before
+# ever calling async_playwright().
+
+class _ExplodingPlaywright:
+    """Stand-in for async_playwright() that fails the test if it's ever entered —
+    proof no browser session was opened."""
+
+    def __call__(self):
+        raise AssertionError("async_playwright() should not have been called")
+
+
+def test_all_offsite_batch_skips_browser_session_entirely(monkeypatch):
+    closed = {"conn": False}
+
+    class _TrackedConn:
+        def close(self):
+            closed["conn"] = True
+
+    marks: list[tuple] = []
+    logs: list[dict] = []
+
+    monkeypatch.setattr(apply_jobs, "async_playwright", _ExplodingPlaywright())
+    monkeypatch.setattr(apply_jobs, "JobAgent", lambda _p: _FakeAgent())
+    monkeypatch.setattr(apply_jobs, "load_session_blocked_domains", lambda _c: set())
+    monkeypatch.setattr(apply_jobs, "write_session_log", lambda _r: None)
+    monkeypatch.setattr(apply_jobs, "send_session_email", lambda *_a: None)
+    monkeypatch.setattr(apply_jobs, "_write_llm_log", logs.append)
+    monkeypatch.setattr(apply_jobs, "mark_job",
+                        lambda _cn, _cu, jid, st: marks.append((jid, st)))
+
+    jobs = [
+        (1, "Backend Engineer", "https://li/1", "Remote", "Mid", "d", "Acme",
+         "OffsiteApply", "acme.com", "https://acme.com/apply"),
+        (2, "Platform Engineer", "https://li/2", "Remote", "Mid", "d", "Beta",
+         "OffsiteApply", "beta.com", "https://beta.com/apply"),
+    ]
+
+    _run(apply_jobs.run_session(
+        jobs, len(jobs), {"name": "T"}, _TrackedConn(), object(),
+        auto_mode=True, max_apply=10,
+    ))
+
+    # zero DB writes — every job stays applied=NULL, ready for a future engine
+    assert marks == []
+    # the DB connection run_session owns was still closed (mirrors every other
+    # early-return branch in main())
+    assert closed["conn"] is True
+    # a session_end marker was logged even though no browser session ran
+    assert any(entry.get("type") == "session_end" for entry in logs)
