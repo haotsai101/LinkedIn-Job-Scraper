@@ -43,7 +43,7 @@ testpaths = ["tests"]
 # Flat layout with several top-level modules alongside the `scripts` package —
 # setuptools auto-discovery can't handle that, so state it explicitly.
 [tool.setuptools]
-packages = ["scripts"]
+packages = ["scripts", "offsite"]
 py-modules = [
     "config",
     "common",
