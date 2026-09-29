@@ -89,6 +89,7 @@ class SubmitGuard:
     async def install(self, guard: GuardMCP) -> None:
         guard.add_check(self.check)
         guard.add_observer(self.observe)
+        guard.add_refusal_listener(self._on_refusal)
         ctx = self.browser.context
         if ctx is None:
             raise RuntimeError("browser not started")
@@ -101,6 +102,25 @@ class SubmitGuard:
 
     async def unlock(self) -> None:
         await self._each_frame("() => window.__oaSetLock && window.__oaSetLock(false)")
+
+    async def show(self, message: str) -> None:
+        """Put ``message`` on the active page's guard banner (for the human watching)."""
+        try:
+            await self.browser.page.evaluate(
+                "(m) => window.__oaBanner && window.__oaBanner(m)", message)
+        except Exception:
+            pass  # navigating / no page: the model still got the tool error
+
+    async def _on_refusal(self, name: str, args: dict[str, Any], reason: str) -> None:
+        # the model-facing reason ends with instructions for the model; the human
+        # watching the browser only needs what was refused and why
+        if reason.startswith("STOP: "):
+            await self.show("agent stopped — " + reason.removeprefix("STOP: ").split(".")[0])
+            return
+        what = str(args.get("element") or args.get("key") or "").strip()
+        await self.show(f"agent {name.removeprefix('browser_')}"
+                        + (f" '{what}'" if what else "") + " refused — "
+                        + reason.split(" — ")[0])
 
     async def is_locked(self) -> bool:
         """Locked state of the active page's main frame."""

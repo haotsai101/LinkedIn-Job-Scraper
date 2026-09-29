@@ -222,28 +222,44 @@ python -m offsite.guard_mcp --url http://127.0.0.1:8811/multipage.html
 **Depends on** OA4.
 
 **Build.**
-- `offsite/schemas.py`: `GeneratedAnswer` (design §6).
-- Control tools on guard-mcp:
-  - `report_ready(answers: list[GeneratedAnswer])` — validates; flags answers
-    whose label mentions "cover letter" and that are non-empty; stores the
-    result; tells the model to stop.
-  - `request_human(reason: "login"|"register"|"captcha"|"stuck", detail: str)` —
-    stores it; tells the model to stop.
-- Accounting per `(application, model)`: tool-call count; loop signal when the
-  same tool + same args hit an unchanged page (URL + snapshot hash) twice in a
-  row; budget signal at 40 calls. On a signal every further call returns
-  `"STOP: <reason>"`. The orchestrator reads `guard.outcome` =
-  `ready | human | loop | budget | none`, and `guard.reset(model=...)`
-  starts a fresh count.
+- `offsite/schemas.py`: `GeneratedAnswer` (design §6; `extra="forbid"`,
+  `confidence` 0..1).
+- `offsite/control.py` (`RunControl`), installed on guard-mcp
+  (`add_local_tool`, `add_check(first=True)`, `add_observer`):
+  - `report_ready(answers: GeneratedAnswer[])` — validated (bad / empty →
+    tool error, run continues); a filled cover-letter answer is kept but
+    warned about; sets `outcome="ready"`.
+  - `request_human(reason: login|register|captcha|stuck, detail)` →
+    `outcome="human"`, `human_reason` / `human_detail`.
+  - Accounting per `(application, model)`: every call counts, including ones
+    a later guard refuses. **Loop**: the same tool + args on an unchanged page
+    (URL + snapshot hash, from the observer) twice in a row — three times for
+    read-only tools (snapshot / find / wait_for / screenshot / tabs).
+    **Budget**: more than 40 calls.
+  - Once `outcome` is set, further browser calls return
+    `BLOCKED by guard: STOP: …`; `report_ready` is still accepted after a
+    loop/budget stop (a finished form beats a fallback).
+  - The orchestrator reads `control.outcome` = `ready | human | loop | budget | None`
+    and calls `control.reset(model=...)` before each model's run.
+- Tool schemas are flat JSON Schema (no `$ref`) for NIM tool calling.
+- `python -m offsite.guard_mcp` installs it and prints the outcome + answers on exit.
 
 **Acceptance.** Outcomes are exact for scripted call sequences.
 
 **How to test.**
 ```bash
-pytest tests/offsite/test_control_tools.py tests/offsite/test_accounting.py
-#  cases: valid report_ready → ready; malformed answers → tool error, outcome none;
-#  same click twice on unchanged page → loop; 40 calls → budget; request_human → human
+pytest tests/offsite/test_control.py
+python -m tests.fixtures.offsite.serve &
+python -m offsite.guard_mcp --url http://127.0.0.1:8811/multipage.html
+#  Inspector: report_ready / request_human are listed; call browser_click on
+#  "Submit Application" twice → 2nd answer is "STOP: … repeated …";
+#  press Enter in the terminal → "outcome : loop (…)"
+pytest tests/offsite/test_guard_cli_e2e.py   # the OA4–OA6 walkthrough above, automated
 ```
+
+Every refusal guard-mcp makes is also shown on the page banner, with a
+running count (`BLOCKED by guard (#n): agent click 'Submit Application'
+refused — …` / `agent stopped — …`), so the human watching sees each one.
 
 ---
 
@@ -322,13 +338,13 @@ pytest tests/offsite/test_runner_claude.py
 
 **Build.** `offsite/controller.py`: `fill_application(job, browser, guard) ->
 FillResult(outcome, answers, model_used, fallback_reason, tool_calls)`:
-- NIM first; on `error | loop | budget | none` → `guard.reset(model="claude")`,
+- NIM first; on `error | loop | budget | none` → `control.reset(model="claude")`,
   build the handoff note, run Claude **on the same page**.
 - On `human` → return to the caller (OA11 pauses, then calls
   `resume(job, human_action)` which re-runs the *same* model with a note).
 - Claude also fails → `outcome="needs_human"`.
-- CLI flag for testing: `--force-fallback-after N` (guard emits `budget` after
-  N NIM calls).
+- CLI flag for testing: `--force-fallback-after N` (RunControl budget = N for
+  the NIM run).
 
 **Acceptance.** Fallback continues in place (fields NIM filled are still filled
 and not re-typed); `model_used` = `nim→claude`.

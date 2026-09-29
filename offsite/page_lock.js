@@ -20,7 +20,11 @@
   }});
   Object.defineProperty(window, '__oaIsLocked', {value: () => locked()});
 
-  function toast(what) {
+  // One banner per page, with a running count so repeated blocks are visible.
+  // Also called from Python (SubmitGuard.show) for refusals guard-mcp makes
+  // before a call ever reaches the page.
+  let shown = 0;
+  function banner(message, gesture) {
     try {
       let t = document.getElementById('__oa_guard_toast');
       if (!t) {
@@ -28,12 +32,20 @@
         t.id = '__oa_guard_toast';
         t.setAttribute('role', 'status');
         t.style.cssText = 'position:fixed;z-index:2147483647;bottom:12px;right:12px;' +
-          'background:#b00020;color:#fff;padding:8px 12px;border-radius:6px;font:13px system-ui';
+          'max-width:420px;background:#b00020;color:#fff;padding:8px 12px;' +
+          'border-radius:6px;font:13px system-ui';
         (document.body || document.documentElement).appendChild(t);
       }
-      t.textContent = 'BLOCKED by guard: ' + what + ' is reserved for the human reviewer.';
+      // one physical gesture fires pointerdown/mousedown/…/click: count it once.
+      // Refusals reported from guard-mcp (no `gesture`) always count.
+      const now = Date.now();
+      if (!gesture || message !== banner.last || now - banner.at > 800) shown += 1;
+      if (gesture) { banner.last = message; banner.at = now; } else { banner.last = null; }
+      t.textContent = 'BLOCKED by guard (#' + shown + '): ' + message;
     } catch (e) {}
   }
+  const toast = (what) => banner(what + ' is reserved for the human reviewer.', true);
+  Object.defineProperty(window, '__oaBanner', {value: (m) => banner(m, false)});
   const label = (el) => ((el.innerText || el.value || el.getAttribute('aria-label') || el.title || '') + '').trim();
   function submitControl(target) {
     const el = target && target.closest && target.closest(
