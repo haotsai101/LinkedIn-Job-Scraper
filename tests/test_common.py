@@ -4,8 +4,8 @@ Covers ``strip_code_fence`` (plain / ```json / bare ``` / surrounding whitespace
 no fence) and ``extract_json_object`` (clean / prose-wrapped / nested braces /
 malformed / absent). ``write_llm_log`` is exercised for its append + error-swallow
 contract. The final block characterizes the *composed* parse pipeline exactly as
-``OffsiteApplyFlow._decide_action`` and ``JobAgent.classify`` run it — this is the
-safety net T14 will lean on when it replaces the salvage code.
+``JobAgent.classify`` run it — this is the safety net T14 will lean on when it
+replaces the salvage code.
 """
 
 import json
@@ -102,11 +102,14 @@ def test_write_llm_log_swallows_bad_path(monkeypatch):
 
 
 # ── composed parse pipeline (characterization) ────────────────────────────────
-# Mirrors OffsiteApplyFlow._decide_action / JobAgent.classify exactly:
+# Standalone characterization of strip_code_fence + extract_json_object
+# composed together:
 #   strip_code_fence -> record first-'{' index -> extract_json_object
 #   -> json.loads, with a "first object only" fallback on JSONDecodeError.
-# NOTE: `start` deliberately indexes the *pre-extraction* string, matching the
-# live call sites (see linkedin_apply.py `_decide_action`).
+# This used to mirror the salvage pipeline OffsiteApplyFlow._decide_action ran
+# on raw LLM output; that call site is gone (T-teardown), and JobAgent.classify
+# now uses the Agent SDK's native structured output instead of this salvage
+# path. Kept as a characterization test of the composed helpers themselves.
 
 def _parse_like_decide_action(raw):
     clean = common.strip_code_fence(raw)

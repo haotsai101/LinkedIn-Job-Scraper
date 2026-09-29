@@ -235,7 +235,7 @@ class _FakePlaywrightCM:
 
 
 class _CascadeFlow:
-    """OffsiteApplyFlow stand-in. Job 1 crashes the shared page; job 2 records
+    """EasyApplyFlow stand-in. Job 1 crashes the shared page; job 2 records
     the page it was handed and asserts it is alive."""
 
     def __init__(self, *, page, **_kw):
@@ -261,6 +261,13 @@ class _DummyConn:
         pass
 
 
+class _FakeAgent:
+    """Stand-in for JobAgent — classify always says relevant, no LLM call."""
+
+    async def classify(self, title, description, application_type):
+        return (True, "relevant", False)
+
+
 def test_job1_crash_does_not_cascade_into_job2(monkeypatch):
     # every context.new_page() call (initial + recovery) yields a fresh live tab
     ctx = _FakeContext(new_page_result=lambda: _FakePage(alive=True))
@@ -270,24 +277,22 @@ def test_job1_crash_does_not_cascade_into_job2(monkeypatch):
     _CASCADE.update(browser=browser, flows=[], pages_seen=[])
 
     marks: list[tuple] = []
+
+    async def _fake_login(_page):
+        return None
+
     monkeypatch.setattr(apply_jobs, "async_playwright", lambda: _FakePlaywrightCM())
-    monkeypatch.setattr(apply_jobs, "OffsiteApplyFlow", _CascadeFlow)
-    monkeypatch.setattr(apply_jobs, "JobAgent", lambda _p: object())
-    monkeypatch.setattr(apply_jobs, "_new_classifier_breaker", lambda: {})
+    monkeypatch.setattr(apply_jobs, "login_linkedin_playwright", _fake_login)
+    monkeypatch.setattr(apply_jobs, "EasyApplyFlow", _CascadeFlow)
+    monkeypatch.setattr(apply_jobs, "JobAgent", lambda _p: _FakeAgent())
     monkeypatch.setattr(apply_jobs, "load_session_blocked_domains", lambda _c: set())
     monkeypatch.setattr(apply_jobs, "_check_recent_session_health", lambda: True)
-    monkeypatch.setattr(apply_jobs, "_match_spam_domain", lambda *_a: None)
     monkeypatch.setattr(apply_jobs, "_match_blocked_domain", lambda *_a: None)
     monkeypatch.setattr(apply_jobs, "write_session_log", lambda _r: None)
     monkeypatch.setattr(apply_jobs, "send_session_email", lambda *_a: None)
     monkeypatch.setattr(apply_jobs, "_write_llm_log", lambda _e: None)
     monkeypatch.setattr(apply_jobs, "mark_job",
                         lambda _cn, _cu, jid, st: marks.append((jid, st)))
-
-    async def _fake_classify(*_a, **_kw):
-        return (True, "relevant", False)
-
-    monkeypatch.setattr(apply_jobs, "classify_with_circuit_breaker", _fake_classify)
 
     async def _fast_sleep(*_a, **_kw):
         return None
@@ -296,9 +301,9 @@ def test_job1_crash_does_not_cascade_into_job2(monkeypatch):
 
     jobs = [
         (1, "Backend Engineer", "https://li/1", "Remote", "Mid", "d", "Acme",
-         "OffsiteApply", "acme.com", "https://acme.com/apply"),
+         "SimpleOnsiteApply", "acme.com", ""),
         (2, "Platform Engineer", "https://li/2", "Remote", "Mid", "d", "Beta",
-         "OffsiteApply", "beta.com", "https://beta.com/apply"),
+         "SimpleOnsiteApply", "beta.com", ""),
     ]
 
     _run(apply_jobs.run_session(

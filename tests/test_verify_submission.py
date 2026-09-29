@@ -1,8 +1,11 @@
 """Unit tests for the unified ``linkedin_apply.verify_submission`` helper (T33).
 
-Covers the shared logic behind both ``EasyApplyFlow._check_submission_result``
-(modal semantics, stricter phrase subset, no navigation) and
-``OffsiteApplyFlow._check_submission_result`` (URL-change analysis).
+Covers the general-purpose logic behind ``EasyApplyFlow._check_submission_result``
+(modal semantics, stricter phrase subset, no navigation) and the navigation
+/ URL-change analysis (``url_before``, ``submit_attempted``) that used to back
+``OffsiteApplyFlow._check_submission_result`` before that flow was removed —
+``verify_submission`` was kept general-purpose (see its docstring) so a
+from-scratch OffsiteApply redesign can reuse it as-is.
 
 The helper only ever *grants* a success verdict, and a wrong ``True`` is
 unrecoverable (``applied=1`` is not in the ``--reset-failed`` pool), so the

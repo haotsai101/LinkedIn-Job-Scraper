@@ -68,14 +68,15 @@ python apply_jobs.py --stats                      # Print pending/applied/skippe
 python apply_jobs.py --verbose                    # Save debug screenshots on failures
 python apply_jobs.py --limit 5                    # Review at most 5 jobs this session
 python apply_jobs.py --max-apply 10              # Cap submissions this session
-python apply_jobs.py --type OffsiteApply          # Filter by application type
 python apply_jobs.py --type SimpleOnsiteApply,ComplexOnsiteApply  # LinkedIn Easy Apply only
 python apply_jobs.py --reset-failed               # Reset auto-failed jobs back to pending
 ```
 
 **Application types:**
-- `SimpleOnsiteApply` / `ComplexOnsiteApply` — LinkedIn Easy Apply (in-modal multi-step form)
-- `OffsiteApply` — External company career sites (LLM fills arbitrary HTML forms)
+- `SimpleOnsiteApply` / `ComplexOnsiteApply` — LinkedIn Easy Apply (in-modal multi-step form). Automated.
+- `OffsiteApply` — External company career sites. Automation for this type was removed in full and is
+  pending a from-scratch redesign; `apply_jobs.py` skips these jobs (prints a notice, leaves `applied`
+  as `NULL`) instead of processing them.
 
 Results are written to `application_log.json` and emailed if Gmail credentials are set.
 
