@@ -84,6 +84,8 @@ _SNAPSHOT_LINK = re.compile(r"- \[Snapshot\]\((/[^)\n]+\.yml)\)")
 Check = Callable[[str, dict[str, Any]], Awaitable[str | None]]
 # An observer sees every forwarded call and its (snapshot-inlined) result.
 Observer = Callable[[str, dict[str, Any], types.CallToolResult], Awaitable[None]]
+# Told about every refusal (tool, args, reason) — OA5 mirrors them onto the page.
+RefusalListener = Callable[[str, dict[str, Any], str], Awaitable[None]]
 # A local tool is served by guard-mcp itself (OA6 control tools), never forwarded.
 LocalHandler = Callable[[dict[str, Any]], Awaitable[types.CallToolResult]]
 
@@ -113,6 +115,7 @@ class GuardMCP:
         self._checks: list[Check] = []
         self._observers: list[Observer] = []
         self._local: dict[str, tuple[types.Tool, LocalHandler]] = {}
+        self._refusal_listeners: list[RefusalListener] = []
         self._stack = contextlib.AsyncExitStack()
         self._upstream: Client | None = None
         self._tools: list[types.Tool] = []
@@ -182,6 +185,10 @@ class GuardMCP:
         else:
             self._checks.append(check)
 
+    def add_refusal_listener(self, listener: RefusalListener) -> None:
+        """Called after a call is refused (errors in the listener are ignored)."""
+        self._refusal_listeners.append(listener)
+
     def add_local_tool(self, tool: types.Tool, handler: LocalHandler) -> None:
         """Serve ``tool`` from guard-mcp itself (listed alongside the allowlist)."""
         self._local[tool.name] = (tool, handler)
@@ -217,6 +224,9 @@ class GuardMCP:
                         break
             if reason:
                 entry["blocked"] = reason
+                for listener in self._refusal_listeners:
+                    with contextlib.suppress(Exception):
+                        await listener(name, args, reason)
                 return _error(BLOCKED_PREFIX + reason)
             if name in self._local:
                 result = await self._local[name][1](args)
@@ -295,6 +305,7 @@ async def _main(argv: list[str]) -> int:
             print(f"guards    : ON (page locked; uploads limited to {resume})")
         await browser.open(args.url)
         print(f"guard-mcp : {guard.url}   (streamable HTTP)")
+        print(f"browser   : {browser.cdp_endpoint}   (CDP)")
         print(f"tools     : {', '.join(guard.tool_names)}")
         print("Inspector : npx @modelcontextprotocol/inspector  → Transport 'Streamable HTTP', "
               "URL above")

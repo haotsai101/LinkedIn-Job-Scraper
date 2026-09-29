@@ -254,7 +254,12 @@ python -m offsite.guard_mcp --url http://127.0.0.1:8811/multipage.html
 #  Inspector: report_ready / request_human are listed; call browser_click on
 #  "Submit Application" twice → 2nd answer is "STOP: … repeated …";
 #  press Enter in the terminal → "outcome : loop (…)"
+pytest tests/offsite/test_guard_cli_e2e.py   # the OA4–OA6 walkthrough above, automated
 ```
+
+Every refusal guard-mcp makes is also shown on the page banner, with a
+running count (`BLOCKED by guard (#n): agent click 'Submit Application'
+refused — …` / `agent stopped — …`), so the human watching sees each one.
 
 ---
 

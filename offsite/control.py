@@ -7,7 +7,9 @@ answer to "how did the model's run end?" — ``outcome``:
 * ``"human"``  — it called ``request_human(reason, detail)`` (login, register,
   captcha, stuck);
 * ``"loop"``   — the same action with the same arguments hit an unchanged page
-  twice in a row (read-only tools: three times);
+  twice in a row — read-only calls in between (snapshot, wait, …) don't break
+  the streak, and the guard banner is not part of "the page"; read-only tools
+  on their own loop at three identical calls in a row;
 * ``"budget"`` — it made ``BUDGET`` (40) tool calls on this application;
 * ``None``     — none of the above (the run ended on its own — OA10 treats
   this as a fallback trigger too).
@@ -43,6 +45,8 @@ Outcome = Literal["ready", "human", "loop", "budget"]
 _READ_ONLY = {"browser_snapshot", "browser_find", "browser_wait_for",
               "browser_take_screenshot", "browser_tabs"}
 _COVER = re.compile(r"cover[\s_-]*letter", re.I)
+_PAGE_URL = re.compile(r"^- Page URL: .*$", re.M)
+_YAML = re.compile(r"```yaml\n(.*?)```", re.S)
 _ANSWERS = TypeAdapter(list[GeneratedAnswer])
 
 REPORT_READY = types.Tool(
@@ -107,8 +111,9 @@ class RunControl:
         self.warnings: list[str] = []
         self.human_reason: str | None = None
         self.human_detail: str | None = None
-        self._last_sig: str | None = None
-        self._repeats = 0
+        self._last_action: str | None = None   # last state-changing call (+ page)
+        self._last_read: str | None = None     # last read-only call (+ page)
+        self._read_repeats = 0
         self._page_sig = ""
 
     def _stop(self, outcome: Outcome, reason: str) -> None:
@@ -134,10 +139,16 @@ class RunControl:
         sig = hashlib.sha1(
             json.dumps([name, args, self._page_sig], sort_keys=True, default=str).encode()
         ).hexdigest()
-        self._repeats = self._repeats + 1 if sig == self._last_sig else 0
-        self._last_sig = sig
-        needed = 2 if name in _READ_ONLY else 1
-        if self._repeats >= needed:
+        if name in _READ_ONLY:
+            self._read_repeats = self._read_repeats + 1 if sig == self._last_read else 0
+            self._last_read = sig
+            looped = self._read_repeats >= 2
+        else:
+            # click → snapshot → the same click on the same page is still a loop
+            looped = sig == self._last_action
+            self._last_action = sig
+            self._last_read, self._read_repeats = None, 0
+        if looped:
             self._stop("loop", f"{name} repeated with the same arguments and no page change")
             return self._stop_text()
         if self.calls > self.budget:
@@ -160,8 +171,14 @@ class RunControl:
         """Track the page state (URL + snapshot) from every result that carries it."""
         for c in result.content:
             text = getattr(c, "text", None) or ""
-            if "```yaml" in text or "- Page URL:" in text:
-                self._page_sig = hashlib.sha1(text.split("### Page", 1)[-1].encode()).hexdigest()
+            url, yaml = _PAGE_URL.search(text), _YAML.search(text)
+            if not (url or yaml):
+                continue
+            # the guard banner changes on every refusal; it is not "the page"
+            body = "\n".join(line for line in (yaml.group(1) if yaml else "").splitlines()
+                             if "BLOCKED by guard" not in line)
+            page = (url.group(0) if url else "") + "\n" + body
+            self._page_sig = hashlib.sha1(page.encode()).hexdigest()
 
     # ── control tools ─────────────────────────────────────────────────────────
     async def _report_ready(self, args: dict[str, Any]) -> types.CallToolResult:

@@ -71,6 +71,33 @@ def test_same_action_after_page_changed_is_not_a_loop():
     assert rc.outcome is None
 
 
+def test_action_repeated_around_a_snapshot_is_still_a_loop():
+    """click → snapshot → the same click on the same page: what a stuck model does."""
+    rc = RunControl()
+    page = _snap("http://x/form", "- button \"Submit\" [ref=e9]")
+    args = {"element": "Submit", "target": "e9"}
+    assert run(rc.check("browser_click", args)) is None
+    assert run(rc.check("browser_snapshot", {})) is None
+    run(rc.observe("browser_snapshot", {}, page))
+    assert run(rc.check("browser_click", args)) is None      # page sig changed: first seen
+    assert run(rc.check("browser_snapshot", {})) is None
+    run(rc.observe("browser_snapshot", {}, page))
+    assert run(rc.check("browser_click", args)).startswith(STOP_PREFIX)
+    assert rc.outcome == "loop"
+
+
+def test_guard_banner_is_not_part_of_the_page():
+    rc = RunControl()
+    body = "- button \"Submit\" [ref=e9]"
+    run(rc.observe("x", {}, _snap("http://x/form", body)))
+    sig = rc._page_sig
+    banner = "\n- status [ref=e40]: BLOCKED by guard (#7): agent click refused"
+    run(rc.observe("x", {}, _snap("http://x/form", body + banner)))
+    assert rc._page_sig == sig
+    run(rc.observe("x", {}, _snap("http://x/form", body + "\n- alert: Please fix 1 field(s).")))
+    assert rc._page_sig != sig
+
+
 def test_read_only_tools_get_one_more_repeat():
     rc = RunControl()
     assert run(rc.check("browser_snapshot", {})) is None
@@ -213,6 +240,36 @@ def test_live_blocked_submit_repeated_counts_as_loop(lg):
     assert STOP_PREFIX in _text(after)
     # snapshot + both refused submit clicks were counted; calls after the stop are not
     assert lg.rc.calls == 3
+
+
+def test_live_refused_submit_around_snapshots_loops_and_banner_counts_each(lg):
+    lg.open("multipage.html")
+    lg.rc.reset(model="nim")
+
+    def banner_no(snap):
+        import re
+        m = re.search(r"BLOCKED by guard \(#(\d+)\)", snap)
+        return int(m.group(1)) if m else 0
+
+    async def go(c):
+        args = {"element": "Submit Application", "target": "#submit"}
+        await c.call_tool("browser_snapshot", {})
+        first = await c.call_tool("browser_click", args)
+        s1 = _text(await c.call_tool("browser_snapshot", {}))
+        second = await c.call_tool("browser_click", args)
+        s2 = _text(await c.call_tool("browser_snapshot", {}))
+        return first, s1, second, s2
+
+    first, s1, second, s2 = mcp(lg, go)
+    assert "reserved for the human" in _text(first)
+    assert STOP_PREFIX in _text(second) and lg.rc.outcome == "loop"
+    # the banner the human sees moved on at each refusal (no merging of quick repeats)
+    n1 = banner_no(s1)
+    assert n1 >= 1 and "agent click 'Submit Application' refused" in s1
+    assert STOP_PREFIX in s2          # snapshots after the stop are refused too…
+    toast = lg.run(lg.browser.page.inner_text("#__oa_guard_toast"))
+    # …and each of those two refusals moved the banner on: stop (+1), snapshot (+1)
+    assert banner_no(toast) == n1 + 2 and "agent stopped" in toast
 
 
 def test_live_report_ready_ends_the_run(lg):
