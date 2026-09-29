@@ -7,8 +7,8 @@ to the existing ``LLM_API`` when ``LLM_URL`` points at NIM.
 
 * Agents SDK **tracing is disabled** — it would upload prompts (the applicant
   profile) to OpenAI.
-* MCP calls get a 90 s session timeout (the SDK default of 5 s is shorter than
-  a page navigation).
+* MCP calls get a 300 s session timeout (the SDK default of 5 s is shorter than
+  a navigation, and guard-mcp types a long answer at ~0.2 s per character).
 * The run stops as soon as ``RunControl.outcome`` is set (``stop_when``), so a
   stubborn model doesn't burn turns on ``STOP`` replies.
 * Errors map to ``RunResult(status="error", error=…)``: timeout, HTTP error,
@@ -44,7 +44,7 @@ DEFAULT_MODEL = "deepseek-ai/deepseek-v4.1-flash"
 DEFAULT_BASE_URL = "https://integrate.api.nvidia.com/v1"
 MAX_TURNS = 60          # > RunControl.BUDGET (40): the guard's budget ends runs first
 REQUEST_TIMEOUT = 90    # seconds per NIM completion request (x2 with the one retry)
-RUN_TIMEOUT = 15 * 60   # whole run
+RUN_TIMEOUT = 30 * 60   # whole run (human-paced typing makes long forms take 10+ min)
 
 set_tracing_disabled(True)
 
@@ -151,8 +151,9 @@ async def run(
 
     try:
         async with MCPServerStreamableHttp(
-            params={"url": guard_url, "timeout": 60},
-            name="guard", cache_tools_list=True, client_session_timeout_seconds=90,
+            # long: human-paced typing of a free-text answer takes ~0.2 s per character
+            params={"url": guard_url, "timeout": 60, "sse_read_timeout": 600},
+            name="guard", cache_tools_list=True, client_session_timeout_seconds=300,
         ) as server:
             agent = Agent(
                 name="offsite-nim", instructions=system, model=model, mcp_servers=[server],

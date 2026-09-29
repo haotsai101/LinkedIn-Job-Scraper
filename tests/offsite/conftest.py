@@ -16,6 +16,7 @@ import pytest
 
 from offsite.browser import OffsiteBrowser
 from offsite.guard_mcp import GuardMCP
+from offsite.human_typing import HumanTyping
 from tests.fixtures.offsite.serve import fixture_server
 
 
@@ -60,7 +61,10 @@ def live_guard(tmp_path_factory):
 
         async def host():
             try:
-                async with OffsiteBrowser(profile, headless=True) as b, GuardMCP(b) as g:
+                # fast typing keeps the suite quick; test_human_typing checks the real pacing
+                fast = HumanTyping(mean=0.005, std=0.0, min_delay=0.0)
+                async with OffsiteBrowser(profile, headless=True) as b, \
+                        GuardMCP(b, typing=fast) as g:
                     ready.set_result((b, g))
                     await stop.wait()
             except BaseException as e:

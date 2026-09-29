@@ -15,6 +15,9 @@ this MCP server — never to Playwright directly. It:
   model without file tools can't read. Its output goes to a private temp dir
   (never the repo) and guard-mcp replaces each link with the YAML itself, so
   the model sees the page after every action (validation errors included);
+* **types like a person**: ``browser_type`` / ``browser_fill_form`` text is
+  typed character by character, Normal(0.2 s, 0.1 s) apart
+  (``offsite/human_typing.py``) instead of being set in one go;
 * runs **pre-call checks** and **post-call observers** (OA5 guards, OA6
   accounting plug in via ``add_check`` / ``add_observer``), serves **local
   tools** (OA6 ``report_ready`` / ``request_human`` via ``add_local_tool``) and
@@ -51,6 +54,7 @@ from mcp.server.lowlevel import Server
 
 from common import write_llm_log
 from offsite.browser import OffsiteBrowser, free_port
+from offsite.human_typing import HumanTyping
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -107,8 +111,12 @@ class GuardMCP:
         *,
         port: int | None = None,
         playwright_mcp_args: list[str] | None = None,
+        typing: HumanTyping | None | bool = True,
     ) -> None:
         self.browser = browser
+        # human-paced typing for browser_type / browser_fill_form (True → env / defaults;
+        # None or False → Playwright MCP's instant fill)
+        self.typing = HumanTyping.from_env() if typing is True else (typing or None)
         self.port = port or free_port()
         self.url = f"http://127.0.0.1:{self.port}/mcp"
         self._extra_args = playwright_mcp_args or []
@@ -234,8 +242,7 @@ class GuardMCP:
                 entry["is_error"] = bool(result.is_error)
                 entry["local"] = True
                 return result
-            assert self._upstream is not None
-            result = self._inline_snapshots(await self._upstream.call_tool(name, args))
+            result = await self._forward(name, args)
             for observer in self._observers:
                 await observer(name, args, result)
             entry["is_error"] = bool(result.is_error)
@@ -248,6 +255,15 @@ class GuardMCP:
             entry["ms"] = int((time.monotonic() - t0) * 1000)
             write_llm_log(entry)
 
+
+    async def _upstream_call(self, name: str, args: dict[str, Any]) -> types.CallToolResult:
+        assert self._upstream is not None
+        return self._inline_snapshots(await self._upstream.call_tool(name, args))
+
+    async def _forward(self, name: str, args: dict[str, Any]) -> types.CallToolResult:
+        if self.typing is not None and name in ("browser_type", "browser_fill_form"):
+            return await self.typing.handle(name, args, self._upstream_call, self.browser)
+        return await self._upstream_call(name, args)
 
     def _inline_snapshots(self, result: types.CallToolResult) -> types.CallToolResult:
         """Replace ``- [Snapshot](<file>.yml)`` links with the file's YAML (only

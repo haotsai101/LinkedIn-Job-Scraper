@@ -173,6 +173,28 @@ npx @modelcontextprotocol/inspector   # Transport "Streamable HTTP", URL http://
 pytest tests/offsite/test_guard_allowlist.py
 ```
 
+### OA4b — Human-paced typing ✅ (added 2026-09-29, owner request; shipped with OA8)
+
+**Build.** `offsite/human_typing.py`, used by guard-mcp for `browser_type` and
+the `textbox` fields of `browser_fill_form`: click the field (focus), clear it,
+then type one character at a time from our own browser handle with
+**Normal(mean 0.2 s, std 0.1 s)** between characters (clamped to 0.03–1.0 s;
+keystroke time subtracted so the gap *is* the drawn delay). Newlines only go
+into `<textarea>` / contenteditable. Other `fill_form` field types are forwarded
+unchanged. `OFFSITE_TYPING_MEAN` / `OFFSITE_TYPING_STD` override;
+`GuardMCP(typing=None)` restores instant fill. Runner MCP timeouts raised to
+match (a 400-character answer takes ~80 s).
+
+**Measured.** 110 keystrokes in-page: mean 0.202 s, std 0.095 s, min 0.027 s.
+NIM on `multipage.html` at full pace: ready, 13 calls, 11.5 min, 0 submissions.
+
+**How to test.**
+```bash
+pytest tests/offsite/test_human_typing.py   # distribution + real in-page keystroke gaps
+python -m offsite.run_agent --model nim --url http://127.0.0.1:8811/multipage.html
+#  (headed) watch the fields fill character by character
+```
+
 ### OA5 — Guards: no submit, no Enter-submit, resume/cover-letter
 
 **Depends on** OA4.
@@ -313,11 +335,12 @@ pytest tests/offsite/test_prompts.py      # deterministic, no secrets, every rul
   `deepseek-ai/deepseek-v4.1-flash`); key `NVIDIA_API_KEY`, else the existing
   `LLM_API` when `LLM_URL` is NIM.
 - **Agents SDK tracing disabled** (it would upload the prompt — the profile —
-  to OpenAI). MCP session timeout 90 s (SDK default 5 s < a navigation).
+  to OpenAI). MCP session timeout 300 s (SDK default 5 s < a navigation; long answers are
+  typed at human pace).
 - Connects to guard-mcp via `MCPServerStreamableHttp`; `parallel_tool_calls=False`.
 - `run(system, task, guard_url, stop_when=…) -> RunResult(status, error, …)`:
   stops as soon as `RunControl.outcome` is set; timeouts (90 s per request,
-  15 min per run), HTTP errors, 429, turn limit (60) and invalid tool calls
+  30 min per run), HTTP errors, 429, turn limit (60) and invalid tool calls
   (after one retry on the same page) → `status="error"` with a reason.
 - Every model turn's latency is logged to `llm_debug.jsonl` (`nim_runner`).
 - CLI: `python -m offsite.run_agent --model nim --url <url> [--job-id N] [--headless] [--no-wait]`
