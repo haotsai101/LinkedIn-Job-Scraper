@@ -23,7 +23,52 @@ BLOCKED_ENTITIES_SEED = [
     ("ats_domain", "theladders.com", "paid job board"),
     ("ats_domain", "ed.crossover.com", "Apply with Google/LinkedIn only — no form"),
     ("ats_domain", "rex.zone", "OAuth-only apply flow"),
+    # OA1: scam / gig-site / aggregator hosts kept from the pre-#82 offsite skip
+    # list. Enterprise ATS hosts (Workday, iCIMS, SuccessFactors, Oracle, ...) are
+    # deliberately NOT blocked — the new offsite agent handles them with human
+    # login pauses (docs/NEW_AGENTIC_APPLY_PLAN.md).
+    ("ats_domain", "alignerr.com", "gig / AI-training marketplace"),
+    ("ats_domain", "micro1.ai", "gig / AI-training marketplace"),
+    ("ats_domain", "mercor.com", "gig / AI-training marketplace"),
+    ("ats_domain", "jobright.ai", "job aggregator, not an employer ATS"),
+    ("ats_domain", "dice.com", "job aggregator, not an employer ATS"),
+    ("ats_domain", "remotehunter.com", "job aggregator, not an employer ATS"),
+    ("ats_domain", "talentally.com", "job aggregator, not an employer ATS"),
+    ("ats_domain", "haystack.cv", "job aggregator, not an employer ATS"),
+    ("ats_domain", "scale.jobs", "paid job-application service"),
+    ("ats_domain", "sundayy.com", "paid job-application service"),
+    ("ats_domain", "tenex.ai", "gig / AI-training marketplace"),
+    ("ats_domain", "sourcehire.app", "job aggregator, not an employer ATS"),
 ]
+
+# ── offsite_applications: one row per OffsiteApply agent attempt (OA1) ────────
+# Design: docs/NEW_AGENTIC_APPLY_PLAN.md §7. ``jobs.applied`` stays the single
+# per-job outcome field; this table holds the per-attempt detail (answers +
+# evidence, model used, fallback reason, account email — never a password).
+# The latest row per job_id is the current attempt. Imported by
+# scripts/migrations/003_offsite_applications.py.
+OFFSITE_APPLICATIONS_DDL = (
+    "CREATE TABLE IF NOT EXISTS offsite_applications ("
+    "id INTEGER PRIMARY KEY, "
+    "job_id INTEGER NOT NULL REFERENCES jobs(job_id), "
+    "status TEXT NOT NULL, "
+    "ats_host TEXT, "
+    "model_used TEXT, "
+    "fallback_reason TEXT, "
+    "answers_json TEXT, "
+    "tool_calls INTEGER, "
+    "account_email TEXT, "
+    "account_host TEXT, "
+    "confirmation TEXT, "
+    "error TEXT, "
+    "created_at INTEGER NOT NULL, "
+    "updated_at INTEGER NOT NULL, "
+    "submitted_at INTEGER)"
+)
+OFFSITE_APPLICATIONS_INDEX_DDL = (
+    "CREATE INDEX IF NOT EXISTS idx_offsite_applications_job "
+    "ON offsite_applications(job_id, id DESC)"
+)
 
 
 def seed_blocked_entities(conn, cursor):
@@ -76,6 +121,8 @@ def create_tables(conn, cursor):
     ''')
 
     cursor.execute(BLOCKED_ENTITIES_DDL)
+    cursor.execute(OFFSITE_APPLICATIONS_DDL)
+    cursor.execute(OFFSITE_APPLICATIONS_INDEX_DDL)
 
     cursor.execute('''
       CREATE TABLE IF NOT EXISTS skills (
