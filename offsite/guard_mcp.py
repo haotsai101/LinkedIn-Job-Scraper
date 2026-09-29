@@ -212,7 +212,8 @@ class GuardMCP:
         """Guarded call — what the MCP handler runs. Also usable in-process."""
         self.calls += 1
         t0 = time.monotonic()
-        entry: dict[str, Any] = {"source": "guard_mcp", "tool": name, "args": _log_args(args)}
+        entry: dict[str, Any] = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                                 "source": "guard_mcp", "tool": name, "args": _log_args(args)}
         try:
             if name not in ALLOWED_TOOLS and name not in self._local:
                 reason = f"tool {name!r} is not available"

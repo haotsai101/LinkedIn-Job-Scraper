@@ -307,26 +307,41 @@ pytest tests/offsite/test_prompts.py      # deterministic, no secrets, every rul
 
 **Depends on** OA7.
 
-**Build.** `offsite/runners/nim.py`:
-- `openai-agents` (pinned) with `OpenAIChatCompletionsModel` on the NIM
-  OpenAI-compatible endpoint; model from `OFFSITE_NIM_MODEL`
-  (default `deepseek-ai/deepseek-v4.1-flash`); key `NVIDIA_API_KEY`.
-- Connects to guard-mcp via `MCPServerStreamableHttp`.
-- `run(prompt) -> RunResult(outcome, error)`; maps timeouts / HTTP errors /
-  429 / invalid tool calls (after one retry) to `outcome="error"` with a reason.
-- CLI: `python -m offsite.run_agent --model nim --url <url> [--job-id N]`.
-- `.env.template` gains `OFFSITE_NIM_MODEL`, `NVIDIA_API_KEY`.
+**Build.** `offsite/runners/nim.py` + shared `RunResult` (`offsite/runners/__init__.py`):
+- `openai-agents==0.22.3` with `OpenAIChatCompletionsModel` on the NIM
+  OpenAI-compatible endpoint; model `OFFSITE_NIM_MODEL` (default
+  `deepseek-ai/deepseek-v4.1-flash`); key `NVIDIA_API_KEY`, else the existing
+  `LLM_API` when `LLM_URL` is NIM.
+- **Agents SDK tracing disabled** (it would upload the prompt — the profile —
+  to OpenAI). MCP session timeout 90 s (SDK default 5 s < a navigation).
+- Connects to guard-mcp via `MCPServerStreamableHttp`; `parallel_tool_calls=False`.
+- `run(system, task, guard_url, stop_when=…) -> RunResult(status, error, …)`:
+  stops as soon as `RunControl.outcome` is set; timeouts (90 s per request,
+  15 min per run), HTTP errors, 429, turn limit (60) and invalid tool calls
+  (after one retry on the same page) → `status="error"` with a reason.
+- Every model turn's latency is logged to `llm_debug.jsonl` (`nim_runner`).
+- CLI: `python -m offsite.run_agent --model nim --url <url> [--job-id N] [--headless] [--no-wait]`
+  — full stack (browser, guard-mcp, RunControl, SubmitGuard), prints how the
+  run ended and the reported answers; browser left open until Enter.
 
 **Acceptance.** On `multipage.html` the model fills all three steps, calls
 `report_ready`, and `/__submissions` stays 0.
+
+**Result (2026-09-29).** `multipage.html`: ✅ twice — 13 tool calls, 14 turns,
+2–5 min, 16 sensible answers (sponsorship Yes from the profile, salary from
+`preferred_salary`, cover letter blank, EEO flagged). `greenhouse.html` /
+`ashby.html`: fields filled correctly, then the model burns calls on widgets
+that are dead in the static recordings (React dropdown, JS upload button) until
+the run cap / a NIM timeout — a fallback trigger, as designed. NIM turn latency
+is 5–15 s typically with spikes of 60–155 s. Submissions: 0 in every run.
 
 **How to test.**
 ```bash
 python -m tests.fixtures.offsite.serve &
 python -m offsite.run_agent --model nim --url http://127.0.0.1:8811/multipage.html
-#  watch it fill; expect "outcome=ready", answers table printed, /__submissions == 0
-python -m offsite.run_agent --model nim --url http://127.0.0.1:8811/greenhouse.html
-pytest tests/offsite/test_runner_nim.py     # error mapping with a stubbed client
+#  watch it fill; expect "run : finished", "outcome : ready", answers, /__submissions == 0
+pytest tests/offsite/test_runner_nim.py                      # stubbed: config, errors, stop, tracing
+OFFSITE_LIVE=1 pytest tests/offsite/test_runner_nim.py -k live   # real NIM, ~2–5 min
 ```
 
 ### OA9 — Claude runner (Agent SDK)
