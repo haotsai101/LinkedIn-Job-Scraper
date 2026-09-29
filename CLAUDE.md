@@ -52,30 +52,15 @@ Workflow for every code change:
 1. Create a feature branch: `git checkout -b feature/<short-description>`
 2. Implement and commit on the feature branch with a descriptive message.
 3. Push the branch: `git push origin feature/<short-description>`
-4. Open a PR targeting `master` and follow the development workflow below (review → approve → merge).
+4. Open a PR targeting `master`.
 
 Never push commits directly to `master`. If a change accidentally lands on `master`, move it to a feature branch immediately (`git checkout -b feature/...`, then revert the commit on `master`).
 
 ## Development workflow
 
-When tickets are created (e.g. by the log-bug-detector agent after a run), follow this pipeline:
-
-1. **Triage & dependencies** — Before assigning any ticket, determine dependencies between tickets. Block a ticket on its prerequisites and order work accordingly. State the dependency graph explicitly before dispatching agents.
-
-2. **Implementation — `senior-swe` agent** — Assign each ready (unblocked) ticket to the `senior-swe` agent. The SWE implements the fix end-to-end and opens a GitHub pull request. Brief the agent with: ticket title, root cause, affected files, and any blocking tickets that were already merged.
-
-3. **Code review — `pr-code-reviewer` agent** — Once a PR is open, assign it to the `pr-code-reviewer` agent with the PR number. The reviewer reads the diff, leaves inline comments, and returns an **approve** or **request changes** verdict.
-
-4. **Iterate** — If the reviewer requests changes, send the feedback back to the `senior-swe` agent (use `SendMessage` with the same agent ID to resume context). Repeat until approved, then merge.
-
-5. **QA — `log-bug-detector` agent** — After the PR is merged, run a test (`python apply_jobs.py --auto --limit 3`) and pass the output to the `log-bug-detector` agent. It verifies the fix resolved the original symptom and checks for regressions. If it finds new failures, they re-enter the workflow as new tickets at step 1.
-
-**Rules:**
-- Never merge a PR without a reviewer approval.
-- Never close a ticket without a passing QA run from the monitor agent.
-- Dispatch the SWE and reviewer as separate agents — the SWE must not review its own work.
-- The monitor agent acts independently of the SWE and reviewer — it only sees runtime output, not the diff.
-- When multiple tickets are independent, dispatch their SWE agents in parallel (one `Agent` call per ticket in the same message).
+The owner and Claude work tickets directly (no SWE / reviewer / QA subagent pipeline).
+Tickets live in `docs/TICKETS.md`; each has a "How to test" section the owner runs
+before the ticket is closed. One feature branch + PR per ticket.
 
 ## Architecture
 
@@ -98,7 +83,7 @@ Reads jobs where `scraped=1 AND applied IS NULL` (filtered to remote/Utah). For 
 2. **Playwright browser** logs into LinkedIn and runs `EasyApplyFlow` — LinkedIn's native in-modal multi-step form (`SimpleOnsiteApply`, `ComplexOnsiteApply`).
 3. `jobs.applied` is set to: `1`=applied, `-1`=skipped/irrelevant, `-2`=auto-failed, `-3`=blocked (un-automatable ATS / login wall — needs a human, not in the `--reset-failed` retry pool).
 
-**`OffsiteApply` (external company career sites) automation was removed in full** and is pending a from-scratch redesign — the `OffsiteApplyFlow` engine, the opt-in NVIDIA NIM classifier route (`CLASSIFIER_ROUTE=nim`), `nim_client.py`, and the career-site account-registration plumbing (`EmailInbox`, `created_accounts.json` writer) are all gone. `run_session` now passes `application_type == "OffsiteApply"` jobs over with a `"[Offsite apply not yet implemented — skipping]"` message and leaves `jobs.applied` as `NULL` for them — no classification, no DB mutation, so nothing needs `--reset-failed` once a new engine lands. Classification and Easy Apply form-filling both run on the Claude Agent SDK (subscription auth, no per-token cost) via `config.py` `get_llm_config("guided_apply")`.
+**`OffsiteApply` (external company career sites) automation was removed in full** and is being rebuilt per `docs/NEW_AGENTIC_APPLY_PLAN.md` (Playwright MCP behind a submit-blocking guard, NIM → Claude fallback, human clicks submit; tickets OA1–OA14 in `docs/TICKETS.md`) — the `OffsiteApplyFlow` engine, the opt-in NVIDIA NIM classifier route (`CLASSIFIER_ROUTE=nim`), `nim_client.py`, and the career-site account-registration plumbing (`EmailInbox`, `created_accounts.json` writer) are all gone. `run_session` now passes `application_type == "OffsiteApply"` jobs over with a `"[Offsite apply not yet implemented — skipping]"` message and leaves `jobs.applied` as `NULL` for them — no classification, no DB mutation, so nothing needs `--reset-failed` once a new engine lands. Classification and Easy Apply form-filling both run on the Claude Agent SDK (subscription auth, no per-token cost) via `config.py` `get_llm_config("guided_apply")`.
 
 ### SQLite database (`linkedin_jobs.db`)
 
