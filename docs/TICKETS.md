@@ -86,13 +86,12 @@ that remembers ATS logins between runs.
 
 **How to test.**
 ```bash
-python -m offsite.browser https://my.greenhouse.io     # log in by hand, press Enter
-python -m offsite.browser https://my.greenhouse.io     # still logged in
-python -m offsite.browser https://example.com &        # then, from another shell:
-python -c "import asyncio;from playwright.async_api import async_playwright as p
-async def m():
-  async with p() as pw: b=await pw.chromium.connect_over_cdp('http://127.0.0.1:<port>'); print(b.contexts[0].pages[0].url)
-asyncio.run(m())"
+pytest tests/offsite/test_browser.py        # headless: CDP attach, cookie survives restart, profile lock
+python -m offsite.browser https://my.greenhouse.io   # log in by hand, press Enter
+python -m offsite.browser https://my.greenhouse.io   # still logged in
+python -m offsite.browser https://example.com --port 9333 &
+curl -s http://127.0.0.1:9333/json/list     # → the example.com page is listed (CDP reachable)
+python -m offsite.browser https://example.com # while the one above is open → "already open" error
 ```
 
 ### OA3 — Recorded fixture forms + local fixture server
