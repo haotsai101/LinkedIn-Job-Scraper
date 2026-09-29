@@ -15,8 +15,9 @@ this MCP server — never to Playwright directly. It:
   model without file tools can't read. Its output goes to a private temp dir
   (never the repo) and guard-mcp replaces each link with the YAML itself, so
   the model sees the page after every action (validation errors included);
-* runs **pre-call checks** (OA5 guards, OA6 accounting plug in via
-  ``add_check``) and logs every call to ``llm_debug.jsonl``;
+* runs **pre-call checks** and **post-call observers** (OA5 guards, OA6
+  accounting plug in via ``add_check`` / ``add_observer``) and logs every
+  call to ``llm_debug.jsonl``;
 * serves streamable HTTP on 127.0.0.1 **inside the orchestrator's process**, so
   guard state is plain Python.
 
@@ -80,6 +81,8 @@ _SNAPSHOT_LINK = re.compile(r"- \[Snapshot\]\((/[^)\n]+\.yml)\)")
 
 # A pre-call check returns None to allow the call, or a one-line reason to refuse it.
 Check = Callable[[str, dict[str, Any]], Awaitable[str | None]]
+# An observer sees every forwarded call and its (snapshot-inlined) result.
+Observer = Callable[[str, dict[str, Any], types.CallToolResult], Awaitable[None]]
 
 
 def _error(text: str) -> types.CallToolResult:
@@ -105,6 +108,7 @@ class GuardMCP:
         self.url = f"http://127.0.0.1:{self.port}/mcp"
         self._extra_args = playwright_mcp_args or []
         self._checks: list[Check] = []
+        self._observers: list[Observer] = []
         self._stack = contextlib.AsyncExitStack()
         self._upstream: Client | None = None
         self._tools: list[types.Tool] = []
@@ -169,6 +173,10 @@ class GuardMCP:
         """Register a pre-call check; the first non-None reason refuses the call."""
         self._checks.append(check)
 
+    def add_observer(self, observer: Observer) -> None:
+        """Register a post-call observer (runs only for calls that were forwarded)."""
+        self._observers.append(observer)
+
     @property
     def tool_names(self) -> list[str]:
         return sorted(t.name for t in self._tools)
@@ -199,6 +207,8 @@ class GuardMCP:
                 return _error(BLOCKED_PREFIX + reason)
             assert self._upstream is not None
             result = self._inline_snapshots(await self._upstream.call_tool(name, args))
+            for observer in self._observers:
+                await observer(name, args, result)
             entry["is_error"] = bool(result.is_error)
             entry["result_chars"] = sum(len(getattr(c, "text", "") or "") for c in result.content)
             return result
@@ -230,17 +240,37 @@ class GuardMCP:
         return result
 
 
+def _profile_resume() -> str | None:
+    import json
+
+    try:
+        rel = json.loads((_REPO_ROOT / "user_profile.json").read_text()).get("resume_path")
+    except (OSError, ValueError):
+        return None
+    return str((_REPO_ROOT / rel).resolve()) if rel else None
+
+
 async def _main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="python -m offsite.guard_mcp")
     ap.add_argument("--url", required=True, help="page to open first")
     ap.add_argument("--port", type=int, default=8812)
     ap.add_argument("--headless", action="store_true")
     ap.add_argument("--profile-dir", default=None)
+    ap.add_argument("--resume", default=None,
+                    help="the only file uploads may use (default: user_profile.json resume_path)")
+    ap.add_argument("--no-guards", action="store_true",
+                    help="OA4 pass-through only: skip the OA5 submit / Enter / upload guards")
     args = ap.parse_args(argv)
 
     kw = {"headless": args.headless}
     browser = OffsiteBrowser(args.profile_dir, **kw) if args.profile_dir else OffsiteBrowser(**kw)
     async with browser, GuardMCP(browser, port=args.port) as guard:
+        if not args.no_guards:
+            from offsite.guards import SubmitGuard  # guards imports this module
+
+            resume = args.resume or _profile_resume()
+            await SubmitGuard(browser, resume_path=resume).install(guard)
+            print(f"guards    : ON (page locked; uploads limited to {resume})")
         await browser.open(args.url)
         print(f"guard-mcp : {guard.url}   (streamable HTTP)")
         print(f"tools     : {', '.join(guard.tool_names)}")

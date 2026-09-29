@@ -177,37 +177,44 @@ pytest tests/offsite/test_guard_allowlist.py
 
 **Depends on** OA4.
 
-**Build.**
-- **Click guard**: refuse `browser_click` when the `element` description or the
-  target's accessible name (resolved via our own `connect_over_cdp` handle)
-  matches `/\b(submit|apply|send application|finish|complete application)\b/i`
-  and not `/\b(next|continue|save)\b/i`.
-- **In-page lock**: init script added to the context (all frames, survives
-  navigation). While `window.__oaLocked` is true it blocks, in capture phase,
-  `submit` events, clicks on submit-like buttons (same regex on text /
-  `aria-label` / `value`), and `Enter` keydown in `<input>` (implicit
-  submission — `multipage.html` really submits on Enter). Load it with
-  Playwright MCP's `--init-script` and/or a CDP `add_init_script`.
-- **Enter guard (MCP level)**: refuse `browser_press_key` with `Enter` and
-  `browser_type` with `submit: true`.
-  `guard.lock()` / `guard.unlock()` flip it on every page/frame.
-- **Upload guard**: `browser_file_upload` only accepts `profile.resume_path`;
-  refused when the last clicked element's description / nearest label
-  mentions "cover letter".
-- Refusals come back as tool errors: `"BLOCKED by guard: <reason>"`.
+**Build.** `offsite/guards.py` (`SubmitGuard`) + `offsite/page_lock.js`. Two layers:
+- **MCP layer** (`add_check` / `add_observer` on guard-mcp), clear
+  `BLOCKED by guard: …` errors for the model:
+  - `browser_click` whose description, target string, or the ref's accessible
+    name from the latest snapshot has final-submit wording (`submit`,
+    `send application`, `complete application`, `apply now` — submit wording
+    wins over "save"/"next", so "Save and submit" is blocked; bare "Apply" is
+    left to the page layer because it opens forms on listing pages);
+  - `browser_press_key` Enter, `browser_type` with `submit: true`;
+  - `browser_file_upload` of anything but the resume, or of the resume right
+    after clicking a cover-letter field (`paths: []` to cancel is allowed).
+- **In-page lock** (context init script → every page, frame, new tab and
+  navigation, including ones the model opens). While locked it swallows, in
+  capture phase, pointer/mouse/click on submit controls (and a bare "Apply"
+  that is a form's submit button), Enter in text inputs (not comboboxes),
+  `submit` events, and `form.submit()` / `requestSubmit()`, and shows a
+  `role=status` toast the model sees in its next snapshot.
+- Locked by default. `sg.unlock()` (OA11 review) survives same-tab navigation
+  via `sessionStorage` until `sg.lock()`.
+- `python -m offsite.guard_mcp` installs the guards by default (`--no-guards`
+  for the OA4 pass-through); uploads limited to `user_profile.json` `resume_path`.
+- Residual risk (documented in the module): a site whose non-submit-looking
+  button sends the application via `fetch` is caught by neither layer — the
+  human review and OA13 QA watch for it.
 
-**Acceptance.** With the lock on, **no sequence of allowlisted tool calls can
-make `/__submissions` increase** on any fixture. After `unlock()`, a human
-click submits normally.
+**Acceptance.** With the lock on, **no allowlisted tool call, direct click,
+Enter, or `form.submit()` makes `/__submissions` increase** on any fixture.
+After `unlock()`, a human click submits normally. (Verified by mutation: with
+the lock disabled, 6 of the live tests fail.)
 
 **How to test.**
 ```bash
 pytest tests/offsite/test_guards.py
-#  scripted MCP client against each fixture: click "Submit Application",
-#  press Enter in a text input, click the submit button by ref, upload resume
-#  into the cover-letter input → all refused, /__submissions stays 0;
-#  guard.unlock() + real click → 1
-# Manual: Inspector (OA4 steps) → try browser_click on "Submit Application" → BLOCKED
+python -m tests.fixtures.offsite.serve &
+python -m offsite.guard_mcp --url http://127.0.0.1:8811/multipage.html
+#  in the opened browser, fill the form by hand and click Submit Application
+#  → red "BLOCKED by guard" toast, nothing submitted (curl …/__submissions → 0)
+#  Inspector: browser_click on "Next" works; browser_press_key Enter → BLOCKED
 ```
 
 ### OA6 — Control tools + call accounting
@@ -343,7 +350,7 @@ python -m offsite.run_agent --model auto --force-fallback-after 8 \
 **Depends on** OA1, OA10.
 
 **Build.** `offsite/session.py`: `run_offsite_job(job_row, browser, guard, conn)`:
-- `store.start_attempt`, `guard.lock()`, open `application_url`.
+- `store.start_attempt`, `submit_guard.lock()`, open `application_url`.
 - `outcome == human` → terminal: `"⏸ <reason> on <host> — do it in the browser, then press Enter"`;
   for login/register, prompt for the account email (optional, Enter to skip);
   record `account_email` / `account_host` (**never a password**); resume.
@@ -353,7 +360,7 @@ python -m offsite.run_agent --model auto --force-fallback-after 8 \
   Review the page in the browser. Submit it yourself if it looks right.
   [s] I submitted  [e] fix a field  [r] not interested  [b] blocked  [l] later
   ```
-  `guard.unlock()` before the prompt. `e` asks "which field / what change",
+  `submit_guard.unlock()` before the prompt. `e` asks "which field / what change",
   re-locks, re-runs the controller with a fix note, reviews again.
 - Writes per the table in design §3 (`jobs.applied`, `applied_at`,
   `offsite_applications`), scraping confirmation text on `s`.

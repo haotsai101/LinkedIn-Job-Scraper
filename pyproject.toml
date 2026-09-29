@@ -46,6 +46,7 @@ testpaths = ["tests"]
 # setuptools auto-discovery can't handle that, so state it explicitly.
 [tool.setuptools]
 packages = ["scripts", "offsite"]
+package-data = { offsite = ["*.js"] }
 py-modules = [
     "config",
     "common",
