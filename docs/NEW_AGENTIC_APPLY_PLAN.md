@@ -103,7 +103,7 @@ login.
 | Guard | Mechanism |
 |---|---|
 | **No agent submit** | Two layers. (1) guard-mcp refuses `browser_click` whose target description / resolved accessible name matches `submit`, `apply`, `send application`, `finish`, `complete application` (Next / Continue / Save & continue allowed). (2) An in-page **lock** (init script injected over CDP into every frame) blocks, in capture phase, `submit` events, clicks on submit-like buttons, and `Enter` keydown in `<input>` while the agent runs. The orchestrator unlocks the page only when the review step starts, so the human's click works. |
-| **No code execution** | `browser_evaluate`, `browser_run_code`, `browser_install` and any other code-exec tool are not re-exposed (programmatic `form.submit()` would bypass the event lock). |
+| **No code execution / file drops** | Only an allowlist of Playwright MCP tools is re-exposed (`offsite/guard_mcp.py:ALLOWED_TOOLS`). `browser_evaluate`, `browser_run_code_unsafe` (programmatic `form.submit()` would bypass the event lock), `browser_drop` (would bypass the upload guard), `browser_close` and the rest are hidden and refused. |
 | **Resume never goes into a cover-letter field** | `browser_file_upload` only accepts `profile.resume_path`; refused when the most recent click/label context mentions "cover letter". |
 | **Cover-letter text fields stay empty** | Prompt rule + `report_ready` validation flags any answer whose label mentions "cover letter". |
 | **Budget / loops** | Counted per model per application in guard-mcp (§5). |
