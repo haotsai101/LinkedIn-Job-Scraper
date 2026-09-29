@@ -5,7 +5,7 @@ description: "Run the autonomous LinkedIn job application agent. Supports all ap
 
 # /apply-jobs
 
-Runs `apply_jobs.py` — the AI-powered job application agent. Reads enriched jobs (`scraped=1, applied IS NULL`), classifies relevance via LLM, and automates form-filling via Playwright for EasyApply and offsite career pages. All output is logged to `logs/apply_jobs.log`.
+Runs `apply_jobs.py` — the AI-powered job application agent. Reads enriched jobs (`scraped=1, applied IS NULL`), classifies relevance via LLM, and automates form-filling via Playwright for LinkedIn EasyApply. Offsite (external career-site) applications are not automated — those jobs are left pending. All output is logged to `logs/apply_jobs.log`.
 
 ## Usage
 
@@ -31,7 +31,7 @@ Runs `apply_jobs.py` — the AI-powered job application agent. Reads enriched jo
 | `--stats` | Print counts and exit immediately |
 | `--reset-failed` | Mark all applied=-2 jobs back to NULL (pending) and exit |
 | `--setup` | Re-run the interactive profile questionnaire |
-| `--type TYPE` | Comma-separated filter: SimpleOnsiteApply, ComplexOnsiteApply, OffsiteApply |
+| `--type TYPE` | Comma-separated filter: SimpleOnsiteApply, ComplexOnsiteApply |
 | `--verbose` | Print full LLM prompts/responses; save per-step screenshots |
 
 ---
@@ -78,7 +78,7 @@ print(f'Pending: {pending} | Applied: {applied} | Skipped: {skipped} | Failed: {
 
 Use AskUserQuestion:
 
-**Question:** "OffsiteApply jobs navigate directly to the company ATS (no LinkedIn click needed). EasyApply jobs still require a LinkedIn sign-in. Ready to start?"
+**Question:** "This will sign into LinkedIn and run EasyApply. Ready to start?"
 **Options:**
 - "Yes, start it"
 - "Cancel"
