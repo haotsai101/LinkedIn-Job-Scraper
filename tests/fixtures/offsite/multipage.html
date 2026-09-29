@@ -1,0 +1,143 @@
+<!doctype html>
+<!-- OA3 synthetic multi-page application. Posts only to the fixture server's /__submitted. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Acme Robotics — Apply: Senior Software Engineer</title>
+<style>
+  body { font: 15px/1.5 system-ui, sans-serif; max-width: 720px; margin: 2rem auto; padding: 0 1rem; }
+  fieldset { border: 1px solid #ccc; border-radius: 8px; padding: 1rem 1.25rem; }
+  .field { margin: .9rem 0; }
+  label { display: block; font-weight: 600; }
+  .req::after { content: " *"; color: #c00; }
+  input[type=text], input[type=email], input[type=tel], select, textarea { width: 100%; padding: .4rem; box-sizing: border-box; }
+  .error { color: #c00; font-size: .9em; }
+  .actions { margin-top: 1.25rem; display: flex; gap: .75rem; }
+  .step-indicator { color: #666; }
+</style>
+</head>
+<body>
+<h1>Senior Software Engineer</h1>
+<p class="step-indicator">Step <span id="step-no">1</span> of 3</p>
+<div id="error-summary" class="error" role="alert"></div>
+
+<form id="application" action="/__submitted" method="post" enctype="multipart/form-data" novalidate>
+
+  <fieldset data-step="1">
+    <legend>Contact information</legend>
+    <div class="field"><label class="req" for="first_name">First name</label>
+      <input type="text" id="first_name" name="first_name" required></div>
+    <div class="field"><label class="req" for="last_name">Last name</label>
+      <input type="text" id="last_name" name="last_name" required></div>
+    <div class="field"><label class="req" for="email">Email</label>
+      <input type="email" id="email" name="email" required></div>
+    <div class="field"><label for="phone">Phone</label>
+      <input type="tel" id="phone" name="phone"></div>
+    <div class="field"><label class="req" for="country">Country</label>
+      <select id="country" name="country" required>
+        <option value="">Select…</option>
+        <option>United States</option><option>Canada</option><option>Other</option>
+      </select></div>
+    <div class="field"><label class="req" for="resume">Resume / CV</label>
+      <input type="file" id="resume" name="resume" accept=".pdf,.doc,.docx" required></div>
+  </fieldset>
+
+  <fieldset data-step="2" hidden>
+    <legend>Questions</legend>
+    <div class="field"><label class="req" for="years_python">How many years of professional Python experience do you have?</label>
+      <input type="text" id="years_python" name="years_python" inputmode="numeric" required></div>
+    <div class="field" role="radiogroup" aria-labelledby="auth_label">
+      <span id="auth_label" class="req"><b>Are you legally authorized to work in the United States?</b></span>
+      <label><input type="radio" name="work_authorized" value="yes" required> Yes</label>
+      <label><input type="radio" name="work_authorized" value="no"> No</label></div>
+    <div class="field" role="radiogroup" aria-labelledby="spons_label">
+      <span id="spons_label" class="req"><b>Will you now or in the future require visa sponsorship?</b></span>
+      <label><input type="radio" name="sponsorship" value="yes" required> Yes</label>
+      <label><input type="radio" name="sponsorship" value="no"> No</label></div>
+    <div class="field"><label for="salary">Desired annual salary (USD)</label>
+      <input type="text" id="salary" name="salary"></div>
+    <div class="field"><label for="why">Why do you want to work at Acme Robotics?</label>
+      <textarea id="why" name="why" rows="4"></textarea></div>
+    <div class="field"><label for="cover_letter_file">Cover letter (optional)</label>
+      <input type="file" id="cover_letter_file" name="cover_letter_file" accept=".pdf,.doc,.docx"></div>
+    <div class="field"><label for="cover_letter_text">Or paste a cover letter</label>
+      <textarea id="cover_letter_text" name="cover_letter_text" rows="4"></textarea></div>
+  </fieldset>
+
+  <fieldset data-step="3" hidden>
+    <legend>Voluntary self-identification &amp; review</legend>
+    <div class="field"><label for="gender">Gender</label>
+      <select id="gender" name="gender">
+        <option value="">Select…</option><option>Male</option><option>Female</option>
+        <option>Non-binary</option><option>Decline to self-identify</option>
+      </select></div>
+    <div class="field"><label for="veteran">Veteran status</label>
+      <select id="veteran" name="veteran">
+        <option value="">Select…</option><option>I am not a protected veteran</option>
+        <option>I identify as one or more protected veteran classifications</option>
+        <option>I do not wish to answer</option>
+      </select></div>
+    <div class="field"><label><input type="checkbox" id="certify" name="certify" required>
+      <span class="req">I certify that the information in this application is accurate.</span></label></div>
+  </fieldset>
+
+  <div class="actions">
+    <button type="button" id="back" hidden>Back</button>
+    <button type="button" id="next">Next</button>
+    <button type="submit" id="submit" hidden>Submit Application</button>
+  </div>
+</form>
+
+<script>
+  // Our own fixture script (not recorded): step navigation + required-field validation.
+  const steps = [...document.querySelectorAll('fieldset[data-step]')];
+  let cur = 0;
+  const $ = id => document.getElementById(id);
+  function show(i) {
+    steps.forEach((s, j) => { s.hidden = j !== i; });
+    cur = i;
+    $('step-no').textContent = i + 1;
+    $('back').hidden = i === 0;
+    $('next').hidden = i === steps.length - 1;
+    $('submit').hidden = i !== steps.length - 1;
+    $('error-summary').textContent = '';
+  }
+  function validate(step) {
+    step.querySelectorAll('.error.inline').forEach(e => e.remove());
+    const missing = [];
+    const radios = new Set();
+    step.querySelectorAll('[required]').forEach(el => {
+      if (el.type === 'radio') { radios.add(el.name); return; }
+      const empty = el.type === 'checkbox' ? !el.checked : !el.value.trim();
+      if (empty) {
+        missing.push(el.id);
+        const e = document.createElement('div');
+        e.className = 'error inline'; e.textContent = 'This field is required.';
+        el.closest('.field').appendChild(e);
+      }
+    });
+    radios.forEach(name => {
+      if (!step.querySelector(`input[name="${name}"]:checked`)) {
+        missing.push(name);
+        const e = document.createElement('div');
+        e.className = 'error inline'; e.textContent = 'Please choose an option.';
+        step.querySelector(`input[name="${name}"]`).closest('.field').appendChild(e);
+      }
+    });
+    const yp = step.querySelector('#years_python');
+    if (yp && yp.value.trim() && !/^\d+(\.\d+)?$/.test(yp.value.trim())) {
+      missing.push('years_python');
+      const e = document.createElement('div');
+      e.className = 'error inline'; e.textContent = 'Enter a number.';
+      yp.closest('.field').appendChild(e);
+    }
+    $('error-summary').textContent = missing.length ? `Please fix ${missing.length} field(s).` : '';
+    return missing.length === 0;
+  }
+  $('next').addEventListener('click', () => { if (validate(steps[cur])) show(cur + 1); });
+  $('back').addEventListener('click', () => show(cur - 1));
+  $('application').addEventListener('submit', ev => { if (!validate(steps[cur])) ev.preventDefault(); });
+  show(0);
+</script>
+</body>
+</html>
