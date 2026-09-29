@@ -16,8 +16,9 @@ this MCP server — never to Playwright directly. It:
   (never the repo) and guard-mcp replaces each link with the YAML itself, so
   the model sees the page after every action (validation errors included);
 * runs **pre-call checks** and **post-call observers** (OA5 guards, OA6
-  accounting plug in via ``add_check`` / ``add_observer``) and logs every
-  call to ``llm_debug.jsonl``;
+  accounting plug in via ``add_check`` / ``add_observer``), serves **local
+  tools** (OA6 ``report_ready`` / ``request_human`` via ``add_local_tool``) and
+  logs every call to ``llm_debug.jsonl``;
 * serves streamable HTTP on 127.0.0.1 **inside the orchestrator's process**, so
   guard state is plain Python.
 
@@ -83,6 +84,8 @@ _SNAPSHOT_LINK = re.compile(r"- \[Snapshot\]\((/[^)\n]+\.yml)\)")
 Check = Callable[[str, dict[str, Any]], Awaitable[str | None]]
 # An observer sees every forwarded call and its (snapshot-inlined) result.
 Observer = Callable[[str, dict[str, Any], types.CallToolResult], Awaitable[None]]
+# A local tool is served by guard-mcp itself (OA6 control tools), never forwarded.
+LocalHandler = Callable[[dict[str, Any]], Awaitable[types.CallToolResult]]
 
 
 def _error(text: str) -> types.CallToolResult:
@@ -109,6 +112,7 @@ class GuardMCP:
         self._extra_args = playwright_mcp_args or []
         self._checks: list[Check] = []
         self._observers: list[Observer] = []
+        self._local: dict[str, tuple[types.Tool, LocalHandler]] = {}
         self._stack = contextlib.AsyncExitStack()
         self._upstream: Client | None = None
         self._tools: list[types.Tool] = []
@@ -169,9 +173,18 @@ class GuardMCP:
         raise RuntimeError(f"guard-mcp did not start on port {self.port}")
 
     # ── extension points (OA5 / OA6) ──────────────────────────────────────────
-    def add_check(self, check: Check) -> None:
-        """Register a pre-call check; the first non-None reason refuses the call."""
-        self._checks.append(check)
+    def add_check(self, check: Check, *, first: bool = False) -> None:
+        """Register a pre-call check; the first non-None reason refuses the call.
+        ``first=True`` runs it before the others (OA6 accounting must see calls
+        that a later guard refuses)."""
+        if first:
+            self._checks.insert(0, check)
+        else:
+            self._checks.append(check)
+
+    def add_local_tool(self, tool: types.Tool, handler: LocalHandler) -> None:
+        """Serve ``tool`` from guard-mcp itself (listed alongside the allowlist)."""
+        self._local[tool.name] = (tool, handler)
 
     def add_observer(self, observer: Observer) -> None:
         """Register a post-call observer (runs only for calls that were forwarded)."""
@@ -179,11 +192,11 @@ class GuardMCP:
 
     @property
     def tool_names(self) -> list[str]:
-        return sorted(t.name for t in self._tools)
+        return sorted([t.name for t in self._tools] + list(self._local))
 
     # ── MCP handlers ──────────────────────────────────────────────────────────
     async def _on_list_tools(self, ctx, params) -> types.ListToolsResult:
-        return types.ListToolsResult(tools=self._tools)
+        return types.ListToolsResult(tools=self._tools + [t for t, _ in self._local.values()])
 
     async def _on_call_tool(self, ctx, params: types.CallToolRequestParams) -> types.CallToolResult:
         return await self.call(params.name, dict(params.arguments or {}))
@@ -194,7 +207,7 @@ class GuardMCP:
         t0 = time.monotonic()
         entry: dict[str, Any] = {"source": "guard_mcp", "tool": name, "args": _log_args(args)}
         try:
-            if name not in ALLOWED_TOOLS:
+            if name not in ALLOWED_TOOLS and name not in self._local:
                 reason = f"tool {name!r} is not available"
             else:
                 reason = None
@@ -205,6 +218,11 @@ class GuardMCP:
             if reason:
                 entry["blocked"] = reason
                 return _error(BLOCKED_PREFIX + reason)
+            if name in self._local:
+                result = await self._local[name][1](args)
+                entry["is_error"] = bool(result.is_error)
+                entry["local"] = True
+                return result
             assert self._upstream is not None
             result = self._inline_snapshots(await self._upstream.call_tool(name, args))
             for observer in self._observers:
@@ -265,8 +283,12 @@ async def _main(argv: list[str]) -> int:
     kw = {"headless": args.headless}
     browser = OffsiteBrowser(args.profile_dir, **kw) if args.profile_dir else OffsiteBrowser(**kw)
     async with browser, GuardMCP(browser, port=args.port) as guard:
+        from offsite.control import RunControl  # control/guards import this module
+
+        control = RunControl()
+        control.install(guard)
         if not args.no_guards:
-            from offsite.guards import SubmitGuard  # guards imports this module
+            from offsite.guards import SubmitGuard
 
             resume = args.resume or _profile_resume()
             await SubmitGuard(browser, resume_path=resume).install(guard)
@@ -277,6 +299,13 @@ async def _main(argv: list[str]) -> int:
         print("Inspector : npx @modelcontextprotocol/inspector  → Transport 'Streamable HTTP', "
               "URL above")
         await asyncio.get_running_loop().run_in_executor(None, input, "Press Enter to stop. ")
+        print(f"outcome   : {control.outcome} ({control.calls} calls"
+              + (f", {control.stop_reason}" if control.stop_reason else "") + ")")
+        if control.outcome == "human":
+            print(f"human     : {control.human_reason} — {control.human_detail}")
+        for a in control.answers:
+            flag = "⚠" if a.sensitive or a.confidence < 0.7 else " "
+            print(f"  {flag} {a.field_label}: {a.answer!r} ({a.source}, {a.confidence:.2f})")
     return 0
 
 
