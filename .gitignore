@@ -56,3 +56,6 @@ media/
 
 # OA2: persistent Chromium profile for the offsite agent (ATS logins live here)
 .offsite_browser_profile/
+
+# OA3: offline fixture forms are source, not generated output
+!tests/fixtures/offsite/*.html
