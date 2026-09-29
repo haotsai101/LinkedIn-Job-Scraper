@@ -53,3 +53,6 @@ media/
 # Claude Code local settings (may contain machine-specific paths)
 .claude/settings.local.json
 .claude/agent-memory/
+
+# OA2: persistent Chromium profile for the offsite agent (ATS logins live here)
+.offsite_browser_profile/
