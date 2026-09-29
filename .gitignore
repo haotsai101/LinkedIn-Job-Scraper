@@ -59,3 +59,6 @@ media/
 
 # OA3: offline fixture forms are source, not generated output
 !tests/fixtures/offsite/*.html
+
+# Playwright MCP default output dir (guard-mcp redirects it to a temp dir)
+.playwright-mcp/

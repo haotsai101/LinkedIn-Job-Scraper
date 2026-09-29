@@ -29,6 +29,7 @@ OA3 ─┴─ OA4 ─┬─ OA5 ─┐              │
                              └─ OA9 ─┴─ OA10 ─┘
 ```
 
+**OA = OffsiteApply** (the ticket prefix; the old optimization tickets were T1–T54).
 New code lives in an `offsite/` package; tests in `tests/offsite/`.
 
 ---
@@ -143,13 +144,18 @@ open http://127.0.0.1:8811/ashby.html         # real Marqeta Ashby form, offline
   `--cdp-endpoint <OffsiteBrowser.cdp_endpoint>`.
 - Serves streamable HTTP on `127.0.0.1:<port>` (Python `mcp` package), in the
   orchestrator's process (`async with GuardMCP(browser) as guard: guard.url`).
-- Re-exposes only an allowlist: `browser_navigate`, `browser_navigate_back`,
-  `browser_snapshot`, `browser_click`, `browser_type`, `browser_fill_form`,
-  `browser_select_option`, `browser_press_key`, `browser_file_upload`,
-  `browser_wait_for`, `browser_hover`, `browser_handle_dialog`,
-  `browser_tabs`, `browser_take_screenshot`. Everything else (notably
-  `browser_evaluate`, `browser_run_code`, `browser_install`,
-  `browser_close`) is not listed and refused if called.
+- Re-exposes only an allowlist (`ALLOWED_TOOLS`): `browser_navigate`,
+  `browser_navigate_back`, `browser_snapshot`, `browser_find`, `browser_click`,
+  `browser_type`, `browser_fill_form`, `browser_select_option`,
+  `browser_press_key`, `browser_file_upload`, `browser_wait_for`,
+  `browser_hover`, `browser_handle_dialog`, `browser_tabs`,
+  `browser_take_screenshot`. Everything else — notably `browser_evaluate`,
+  `browser_run_code_unsafe`, `browser_drop` (drops files, would bypass the
+  upload guard), `browser_close`, `browser_resize` — is hidden and refused.
+- Playwright MCP 0.0.83 answers actions with a *link* to a snapshot file;
+  guard-mcp points its output at a private temp dir (never the repo) and
+  inlines the YAML, so the model sees the page after every action.
+- Pre-call check hook (`add_check`) for OA5/OA6.
 - Every call is logged (tool, args, result size, ms) to `llm_debug.jsonl`.
 - CLI: `python -m offsite.guard_mcp --url <fixture url>` starts browser +
   guard and prints the MCP URL.
@@ -161,8 +167,9 @@ click work against the shared browser.
 ```bash
 python -m tests.fixtures.offsite.serve &
 python -m offsite.guard_mcp --url http://127.0.0.1:8811/multipage.html
-npx @modelcontextprotocol/inspector   # connect to the printed URL (streamable HTTP)
-#  → tools list = allowlist only; browser_snapshot returns the form; browser_evaluate absent
+npx @modelcontextprotocol/inspector   # Transport "Streamable HTTP", URL http://127.0.0.1:8812/mcp
+#  → 15 tools; browser_snapshot returns the form; browser_click on "Next" answers
+#    with an inline snapshot showing "Please fix …"; browser_evaluate absent
 pytest tests/offsite/test_guard_allowlist.py
 ```
 
@@ -178,7 +185,11 @@ pytest tests/offsite/test_guard_allowlist.py
 - **In-page lock**: init script added to the context (all frames, survives
   navigation). While `window.__oaLocked` is true it blocks, in capture phase,
   `submit` events, clicks on submit-like buttons (same regex on text /
-  `aria-label` / `value`), and `Enter` keydown in `<input>`.
+  `aria-label` / `value`), and `Enter` keydown in `<input>` (implicit
+  submission — `multipage.html` really submits on Enter). Load it with
+  Playwright MCP's `--init-script` and/or a CDP `add_init_script`.
+- **Enter guard (MCP level)**: refuse `browser_press_key` with `Enter` and
+  `browser_type` with `submit: true`.
   `guard.lock()` / `guard.unlock()` flip it on every page/frame.
 - **Upload guard**: `browser_file_upload` only accepts `profile.resume_path`;
   refused when the last clicked element's description / nearest label

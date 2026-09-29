@@ -24,6 +24,8 @@ dependencies = [
     "openai>=1.0.0",  # legacy OpenAI-backed `apply_jobs.py --setup` profile interview only (T54 removed the NIM classifier + browser-use paths that used to be the other reason)
     "tenacity>=8,<10",  # retry/backoff around the Voyager API calls in scripts/fetch.py (T17)
     "claude-agent-sdk>=0.2.140,<0.3",  # Easy Apply classifier + browser agent (subscription auth, no API key) — T14/T14b. Pinned <0.3: relies on ClaudeAgentOptions.output_format + one-shot query() session isolation.
+    "mcp>=2.1,<3",  # offsite guard-mcp (OA4): client to Playwright MCP + streamable-HTTP server for the model SDKs. v2 API (Client, lowlevel Server(on_*=...)).
+    "uvicorn>=0.30",  # serves guard-mcp's streamable-HTTP app in-process (OA4)
 ]
 
 # `ruff` is pinned to a single minor so `ruff check` findings stay stable across
