@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # One command for the full local check: bootstrap .venv/ (first run only),
 # then run ruff + pytest. Extra args are forwarded to pytest, e.g.
-#   ./scripts/check.sh -k offsite -x
+#   ./scripts/check.sh -k crash_recovery -x
 #
 # Exit status: 0 when pytest passed AND ruff either passed or only reported lint
-# findings (rc 1) — the repo carries a deliberate ~509-finding baseline, so a
-# clean ruff exit is not expected. A ruff crash (rc >= 2) or any pytest failure
-# exits 1.
+# findings (rc 1) — the repo carries a deliberate lint-debt baseline (~150
+# findings as of T54's OffsiteApplyFlow teardown, down from ~509 — the removed
+# files carried a large share of it), so a clean ruff exit is not expected. A
+# ruff crash (rc >= 2) or any pytest failure exits 1.
 set -euo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -26,7 +27,7 @@ echo "==> pytest"
 pytest_rc=0
 "$VENV_DIR/bin/python" -m pytest "$REPO_ROOT/tests" "$@" || pytest_rc=$?
 
-echo "==> summary: ruff exit ${ruff_rc} (baseline ~509 findings expected), pytest exit ${pytest_rc}"
+echo "==> summary: ruff exit ${ruff_rc} (baseline ~150 findings expected), pytest exit ${pytest_rc}"
 
 # succeed when pytest passed AND ruff either passed or only reported lint
 # findings (rc 1), not a crash (rc 2+)

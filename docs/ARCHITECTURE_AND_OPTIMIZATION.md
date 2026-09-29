@@ -2,6 +2,14 @@
 
 _Generated 2026-08-28. Sections 1–2 are the as-is review; sections 3+ are the decided plan (design settled via a grilling pass on 2026-08-28). No PII or credentials were sent to any external service during this review._
 
+> **2026-09-29 update:** `OffsiteApplyFlow` — every offsite-apply engine this
+> document discusses building or tuning (the step-loop engine, the NIM
+> classifier route, the browser-use spike outcome) — was removed from the
+> codebase in full per direct user instruction, to be redesigned from scratch.
+> `apply_jobs.py` now skips `OffsiteApply` jobs without touching their DB
+> state; see `CLAUDE.md`. Everything below is left as the historical record of
+> the T1–T49 planning pass and no longer describes live code for that flow.
+
 ---
 
 ## 1. Current structure

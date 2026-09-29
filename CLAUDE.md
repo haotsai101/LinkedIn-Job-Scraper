@@ -95,13 +95,11 @@ All pipeline logic is wrapped as Dagster ops/jobs/schedules in `scripts/dagster_
 ### Autonomous apply agent (`apply_jobs.py`, `linkedin_apply.py`)
 
 Reads jobs where `scraped=1 AND applied IS NULL` (filtered to remote/Utah). For each job:
-1. **LLM classifier** (`JobAgent`) decides relevance. Defaults to the Claude Agent SDK for every job (T38); the free NVIDIA NIM route is opt-in for OffsiteApply jobs via `CLASSIFIER_ROUTE=nim` (it returns an empty body on job descriptions over ~4–5K chars, so it's off by default).
-2. **Playwright browser** logs into LinkedIn and runs one of two flows:
-   - `EasyApplyFlow` — LinkedIn's native in-modal multi-step form (`SimpleOnsiteApply`, `ComplexOnsiteApply`)
-   - `OffsiteApplyFlow` — external company career site. A single step-loop engine (`_llm_guided_apply`): snapshot page → detect terminal state → ask the LLM for one action → execute → repeat. Decomposed into seams — `_page_snapshot`, `_decide_action`, `_classify_domain` / `_detect_expired` / `_detect_terminal_state`, `_handle_auth`, `_execute_action` (the scroll/upload/fill/select/click dispatch; per-step mutable state rides in `_StepState`). Can auto-create accounts (saved to `created_accounts.json`). (The older `ScriptApplyEngine` "LLM writes a full Playwright script" path was retired in T16b.)
+1. **LLM classifier** (`JobAgent`) decides relevance via the Claude Agent SDK — for every `application_type` (T38).
+2. **Playwright browser** logs into LinkedIn and runs `EasyApplyFlow` — LinkedIn's native in-modal multi-step form (`SimpleOnsiteApply`, `ComplexOnsiteApply`).
 3. `jobs.applied` is set to: `1`=applied, `-1`=skipped/irrelevant, `-2`=auto-failed, `-3`=blocked (un-automatable ATS / login wall — needs a human, not in the `--reset-failed` retry pool).
 
-Classification and form-filling both run on the Claude Agent SDK by default (subscription auth, no per-token cost). The opt-in NIM classifier route reads `CLASSIFIER_ROUTE` / `CLASSIFIER_MODEL` / `CLASSIFIER_API` / `CLASSIFIER_BASE_URL` (see `config.py` `get_classifier_route` / `get_llm_config`, and `.env.template`). Any OpenAI-compatible API works on that route (NVIDIA NIM, OpenRouter, etc.).
+**`OffsiteApply` (external company career sites) automation was removed in full** and is pending a from-scratch redesign — the `OffsiteApplyFlow` engine, the opt-in NVIDIA NIM classifier route (`CLASSIFIER_ROUTE=nim`), `nim_client.py`, and the career-site account-registration plumbing (`EmailInbox`, `created_accounts.json` writer) are all gone. `run_session` now passes `application_type == "OffsiteApply"` jobs over with a `"[Offsite apply not yet implemented — skipping]"` message and leaves `jobs.applied` as `NULL` for them — no classification, no DB mutation, so nothing needs `--reset-failed` once a new engine lands. Classification and Easy Apply form-filling both run on the Claude Agent SDK (subscription auth, no per-token cost) via `config.py` `get_llm_config("guided_apply")`.
 
 ### SQLite database (`linkedin_jobs.db`)
 

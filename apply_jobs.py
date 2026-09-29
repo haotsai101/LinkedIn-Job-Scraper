@@ -8,14 +8,16 @@ human intervention (--auto mode). A session summary is written to
 application_log.json and emailed via Gmail when the run finishes.
 
 LLM configuration lives in config.py (get_llm_config). Roles:
-    classifier    - job relevance scoring; OffsiteApply -> NVIDIA NIM
-                    (CLASSIFIER_* env), Easy Apply -> Claude Agent SDK.
-    guided_apply  - the browser agent (OffsiteApplyFlow / EasyApplyFlow) via
-                    the Claude Agent SDK. Subscription auth: no API key,
-                    requires a `claude` CLI login. (T14b)
+    classifier    - job relevance scoring; Claude Agent SDK for every job.
+    guided_apply  - the browser agent (EasyApplyFlow) via the Claude Agent
+                    SDK. Subscription auth: no API key, requires a `claude`
+                    CLI login. (T14b)
+
+OffsiteApply (external company career sites) automation was removed in full
+and is pending a from-scratch redesign — jobs with that application_type are
+skipped without touching their DB state (see run_session).
 
 Environment variables (put in a .env file or export before running):
-    CLASSIFIER_API / CLASSIFIER_BASE_URL / CLASSIFIER_MODEL - NIM classifier
     GMAIL_USER          - Gmail address to send summary emails from/to
     GMAIL_APP_PASSWORD  - 16-char Google App Password (needs 2FA enabled)
     MAX_AUTO_APPLY      - Default daily cap (default: 10)
@@ -37,16 +39,10 @@ Usage:
 import argparse
 import asyncio
 import csv
-import email
-import email.message
-import imaplib
 import json
 import os
-import re
-import secrets
 import smtplib
 import sqlite3
-import string
 import sys
 import time
 from datetime import datetime, timezone
@@ -55,20 +51,18 @@ from email.mime.text import MIMEText
 from pathlib import Path
 from urllib.parse import urlparse
 
-try:  # `openai` is opt-in since T38 (NIM classifier route). Only the legacy
-    from openai import OpenAI  # `--setup` interview uses it — see nim_client.py.
+try:  # Only the legacy `--setup` profile-setup interview uses this client.
+    from openai import OpenAI
 except ImportError:  # pragma: no cover
     OpenAI = None  # type: ignore[assignment,misc]
 from playwright.async_api import async_playwright
 
 import config
 import llm
-import nim_client
 from common import prune_debug_screenshots, rotate_llm_log
 from common import write_llm_log as _write_llm_log
 from linkedin_apply import (
     EasyApplyFlow,
-    OffsiteApplyFlow,
     _coerce_numeric_answer,
     _get_profile_value,
     _is_browser_crash,
@@ -93,46 +87,6 @@ PROFILE_PATH = "user_profile.json"
 LOG_PATH     = "application_log.json"
 ACCOUNTS_PATH = "created_accounts.json"
 
-# T38: the relevance classifier defaults to the Claude Agent SDK for *every*
-# job. The free NIM route (``_classify_nim`` → ``nim_client``) returns an
-# empty/whitespace body for job descriptions over ~4–5K chars, and real
-# postings are routinely 6–8K — so on the NIM route most OffsiteApply jobs fail
-# to classify, three in a row abort the session, and the T27 circuit breaker
-# only catches timeouts, not parse failures. NIM stays in the tree as an opt-in
-# route: set ``CLASSIFIER_ROUTE=nim`` in ``.env`` to re-enable it (see
-# ``config.get_classifier_route``). Resolved once at import.
-_NIM_CLASSIFIER_ENABLED = config.get_classifier_route() == "nim"
-
-# Domains we never open a browser tab for: pure aggregators, contractor-only
-# platforms, assessment mills, and known scam/broker sites. Checked against a
-# job's ``posting_domain`` / ``application_url`` BEFORE the relevance classifier
-# runs (T29) so a spam listing never costs an LLM call.
-#
-# NOTE (T28): Greenhouse domains (job-boards.greenhouse.io / boards.greenhouse.io
-# / grnh.se) are deliberately NOT here. grnh.se is only a link shortener and the
-# *.greenhouse.io boards host real per-company application forms; blanket-blocking
-# them discarded legitimate direct-employer jobs. OffsiteApplyFlow already has
-# Greenhouse iframe-embed handling plus pre-loop / mid-loop / per-step reCAPTCHA
-# detectors that return "skipped" at runtime, so a genuinely CAPTCHA-walled
-# Greenhouse form is still skipped cleanly — as a runtime outcome, not a blind
-# pre-filter.
-_OFFSITE_SPAM = (
-    # Pure spam / aggregator job boards
-    "jobright.ai", "sundayy.com", "scale.jobs", "dice.com",
-    "mercor.com", "remotehunter.com", "haystack.cv", "talentally.com",
-    "micro1.ai", "tenex.ai", "bestjobtool.com", "fetchjobs.co",
-    "torentify.com",  # aggregator; Apply Now -> jooble.org -> talent.com / bot wall (T46)
-    "alignerr.com", "app.dataannotation.tech",
-    "theladders.com", "hiresome.ai",
-    # Assessment / crossover platforms — not real direct-hire jobs
-    "ed.crossover.com", "crossover.com",
-    # Recruiter broker / broken stub sites
-    "peakperformers.org", "work.mercor.com", "rex.zone",
-    "motionrecruitment.com", "hirecrap.com",
-    "codevertexinnovations.com",                # Scam site
-)
-
-
 def _host_of(raw: str) -> str:
     """Bare lowercase hostname from a domain string or a full URL. ``""`` if empty.
 
@@ -154,27 +108,14 @@ def _host_matches(host: str, patterns) -> bool:
     )
 
 
-def _match_spam_domain(*candidates: str) -> str | None:
-    """Return the first host among *candidates* that matches ``_OFFSITE_SPAM``.
-
-    Accepts bare domains (``posting_domain``) or full URLs (``application_url``);
-    returns ``None`` when nothing matches.
-    """
-    for raw in candidates:
-        host = _host_of(raw)
-        if _host_matches(host, _OFFSITE_SPAM):
-            return host
-    return None
-
-
 def _match_blocked_domain(blocked_domains, *candidates: str) -> str | None:
     """Return the first host among *candidates* that matches an ``ats_domain``
     block pattern in *blocked_domains* (seed constant + operator-added
     ``blocked_entities`` rows — see ``load_session_blocked_domains``).
 
-    Same host-suffix matching as ``_match_spam_domain`` (never a bare substring
-    ``in`` test). Accepts bare domains (``posting_domain``) or full URLs
-    (``application_url``). ``None`` when nothing matches.
+    Host-suffix matching (never a bare substring ``in`` test). Accepts bare
+    domains (``posting_domain``) or full URLs (``application_url``). ``None``
+    when nothing matches.
     """
     for raw in candidates:
         host = _host_of(raw)
@@ -310,13 +251,9 @@ def load_env():
 
     # No LLM_* / LLM_URL hard requirement any more (T14b). Each LLM role resolves
     # its own config:
-    #   * classifier   — Claude Agent SDK subscription auth by default for every
-    #                    application_type (T38). OffsiteApply jobs route to
-    #                    nim_client (config.get_llm_config("classifier"), honours
-    #                    CLASSIFIER_* + legacy aliases) only when
-    #                    CLASSIFIER_ROUTE=nim.
-    #   * browser agent (OffsiteApplyFlow / EasyApplyFlow) → Claude Agent SDK
-    #                    subscription auth (config "guided_apply").
+    #   * classifier   — Claude Agent SDK subscription auth for every job.
+    #   * browser agent (EasyApplyFlow) → Claude Agent SDK subscription auth
+    #                    (config "guided_apply").
     # LLM_API / LLM_URL / LLM_MODEL are now optional — read here only for the
     # legacy OpenAI-backed profile-setup interview (build_profile_interactively),
     # which degrades to raw answers when they are unset.
@@ -526,155 +463,14 @@ def send_session_email(gmail_user: str, app_password: str, report: dict):
         print(f"  [!] Failed to send email: {exc}")
 
 
-# ── Gmail IMAP inbox reader ────────────────────────────────────────────────────
-
-class EmailInbox:
-    """Reads Gmail via IMAP to retrieve verification links and codes sent to the applicant email."""
-
-    def __init__(self, user: str, password: str):
-        self.user = user
-        self.password = password
-
-    def _connect(self):
-        M = imaplib.IMAP4_SSL("imap.gmail.com")
-        M.login(self.user, self.password)
-        M.select("INBOX")
-        return M
-
-    @staticmethod
-    def _root_domain(netloc: str) -> str:
-        """Extract registrable domain: jobs.company.com → company.com."""
-        host = netloc.split(":")[0]  # drop port if present
-        parts = host.split(".")
-        return ".".join(parts[-2:]) if len(parts) >= 2 else host
-
-    @staticmethod
-    def _body(msg) -> str:
-        body = ""
-        if msg.is_multipart():
-            for part in msg.walk():
-                ct = part.get_content_type()
-                if ct == "text/plain":
-                    body += part.get_payload(decode=True).decode(errors="replace")
-                elif ct == "text/html" and not body:
-                    body += part.get_payload(decode=True).decode(errors="replace")
-        else:
-            body = msg.get_payload(decode=True).decode(errors="replace")
-        return body
-
-    def _fetch_first_unseen(self, root_domain: str, timeout: int = 90) -> "str | None":
-        """Hold one IMAP connection open and poll until an unseen email from root_domain arrives."""
-        deadline = time.time() + timeout
-        M = None
-        try:
-            M = self._connect()
-        except Exception as exc:
-            print(f"  [Inbox] IMAP connect error: {exc}")
-            return None
-        try:
-            first_error = True
-            while time.time() < deadline:
-                try:
-                    M.check()
-                except Exception:
-                    try:
-                        M.logout()
-                    except Exception:
-                        pass
-                    try:
-                        M = self._connect()
-                    except Exception as exc:
-                        print(f"  [Inbox] IMAP reconnect error: {exc}")
-                        return None
-                try:
-                    _, data = M.search(None, f'(UNSEEN FROM "{root_domain}")')
-                    for num in (data[0].split() or []):
-                        _, msg_data = M.fetch(num, "(RFC822)")
-                        msg = email.message_from_bytes(msg_data[0][1])
-                        body = self._body(msg)
-                        M.store(num, "+FLAGS", "\\Seen")
-                        return body
-                except Exception as exc:
-                    if first_error:
-                        print(f"  [Inbox] IMAP search error: {exc}")
-                        first_error = False
-                time.sleep(5)
-        finally:
-            try:
-                M.logout()
-            except Exception:
-                pass
-        return None
-
-    def fetch_verification(self, from_domain: str, timeout: int = 90,
-                           keywords: tuple = ("verify", "confirm", "activate")) -> "tuple[str|None, str|None]":
-        """Fetch one unseen email from from_domain; return (code, link) — whichever is present."""
-        root = self._root_domain(from_domain)
-        body = self._fetch_first_unseen(root, timeout)
-        if not body:
-            return None, None
-        codes = re.findall(r'\b(\d{4,8})\b', body)
-        urls = [
-            u.rstrip(".,;:!?)")
-            for u in re.findall(r'https?://[^\s<>"\']+', body)
-            if any(k in u.lower() for k in keywords)
-        ]
-        return (codes[0] if codes else None), (urls[0] if urls else None)
-
-    def wait_for_link(self, from_domain: str, timeout: int = 90,
-                      keywords: tuple = ("verify", "confirm", "activate")) -> "str | None":
-        """Poll INBOX for an unseen email from from_domain; return first URL containing a keyword."""
-        _, link = self.fetch_verification(from_domain, timeout, keywords)
-        return link
-
-    def wait_for_code(self, from_domain: str, timeout: int = 90) -> "str | None":
-        """Poll INBOX for an unseen email from from_domain; return first 4-8 digit code found."""
-        code, _ = self.fetch_verification(from_domain, timeout)
-        return code
-
-
 # ── Career-site account management ─────────────────────────────────────────────
-
-def _generate_password(length: int = 16) -> str:
-    alphabet = string.ascii_letters + string.digits + "!@#$%^&*"
-    pwd = [
-        secrets.choice(string.ascii_uppercase),
-        secrets.choice(string.ascii_lowercase),
-        secrets.choice(string.digits),
-        secrets.choice("!@#$%^&*"),
-    ]
-    pwd += [secrets.choice(alphabet) for _ in range(length - 4)]
-    secrets.SystemRandom().shuffle(pwd)
-    return "".join(pwd)
-
-
-def save_account_to_file(record: dict):
-    from urllib.parse import urlparse as _up
-    path = Path(ACCOUNTS_PATH)
-    if path.exists():
-        try:
-            data = json.loads(path.read_text())
-        except Exception:
-            data = {"accounts": []}
-    else:
-        data = {"accounts": []}
-
-    new_domain = _up(record.get("website_url", "")).netloc
-    updated = False
-    if new_domain:
-        for i, existing in enumerate(data["accounts"]):
-            existing_domain = _up(existing.get("website_url", "")).netloc
-            if (existing_domain == new_domain
-                    or new_domain.endswith("." + existing_domain)
-                    or existing_domain.endswith("." + new_domain)):
-                data["accounts"][i] = record  # replace with newest
-                updated = True
-                break
-    if not updated:
-        data["accounts"].append(record)
-
-    path.write_text(json.dumps(data, indent=2))
-
+# (The Gmail IMAP inbox reader that used to live here — EmailInbox — read
+# verification links/codes during OffsiteApplyFlow's career-site account
+# registration. It had no other caller, so it went with that flow.)
+# The writer side (account creation during an offsite application) went away
+# with OffsiteApplyFlow. ``search_accounts`` stays — a read-only lookup over
+# whatever created_accounts.json already has from before the teardown, still
+# wired to ``--accounts QUERY``.
 
 def search_accounts(query: str) -> list[dict]:
     path = Path(ACCOUNTS_PATH)
@@ -693,32 +489,26 @@ def search_accounts(query: str) -> list[dict]:
 class JobAgent:
     """Job-relevance classifier.
 
-    Routing (``application_type`` is a known DB column, so it is decided before
-    any LLM call):
+    * citizenship / clearance keyword in the description → immediate skip, no
+      LLM call.
+    * everything else → Claude Agent SDK (``llm.query_json``, one isolated
+      one-shot session per job, subscription auth). Reliable on the 6–8K-char
+      descriptions real postings carry, and rides the Claude subscription (no
+      per-token cost). Used for every ``application_type`` (T38).
 
-    * citizenship / clearance keyword in the description  → immediate skip,
-      no LLM call on either backend.
-    * everything else, by default                         → Claude Agent SDK
-      (``llm.query_json``, one isolated one-shot session per job, subscription
-      auth). Reliable on the 6–8K-char descriptions real postings carry, and
-      rides the Claude subscription (no per-token cost). This is the default
-      for *all* ``application_type`` values (T38).
-    * ``application_type == "OffsiteApply"`` **and** ``CLASSIFIER_ROUTE=nim``
-      (opt-in, ``_NIM_CLASSIFIER_ENABLED``)              → NIM (OpenAI-compatible,
-      ``config.get_llm_config("classifier")`` → meta/llama-3.2-11b-vision-instruct
-      @ NVIDIA NIM). Free. ``run_session`` may override this to the Agent SDK for
-      the rest of a session once the NIM route trips its circuit breaker
-      (see :func:`classify_with_circuit_breaker`).
-
-    Both LLM paths ask for structured JSON output but still salvage a stray code
-    fence / prose wrapper before giving up. Each LLM call is retried once on a
+    Asks for structured JSON output but still salvages a stray code fence /
+    prose wrapper before giving up. Each LLM call is retried once on a
     transient failure (:meth:`_run_with_retry`); a hard failure propagates to
     ``run_session``, which leaves the job pending and only aborts the batch
     after several classifications fail in a row.
+
+    (T38 dropped the opt-in NVIDIA NIM classifier route that used to handle
+    OffsiteApply jobs here — it went away with OffsiteApplyFlow itself; see
+    ``run_session``, which now skips OffsiteApply jobs before they ever reach
+    ``classify``.)
     """
 
-    # Cheap Claude model for the Agent-SDK classifier path (the default for
-    # every job; OffsiteApply too unless CLASSIFIER_ROUTE=nim).
+    # Cheap Claude model for the Agent-SDK classifier path (every job).
     _AGENT_MODEL = "claude-haiku-4-5"
 
     _SYSTEM = """You are a job application assistant helping the user review LinkedIn job listings.
@@ -729,8 +519,7 @@ User profile:
 Classify whether a job is relevant (software engineering, AI/ML, data engineering/science/analytics).
 Be accurate and concise. Never fabricate information not in the user's profile."""
 
-    # JSON Schema shared by both routes (Agent SDK native structured output +
-    # the prompt hint the NIM json_object mode is steered with).
+    # JSON Schema for the Agent SDK's native structured output.
     _CLASSIFY_SCHEMA = {
         "type": "object",
         "properties": {
@@ -780,21 +569,15 @@ Be accurate and concise. Never fabricate information not in the user's profile."
 
     def __init__(self, profile: dict):
         self._system = self._SYSTEM.format(profile=json.dumps(profile, indent=2))
-        self._nim_client = None
-        self._nim_model = ""
 
     async def classify(
         self, title: str, description: str, application_type: str | None,
-        *, prefer_agent_sdk: bool = False,
     ) -> tuple[bool, str, bool]:
         """Returns (relevant, reason, citizenship_required).
 
-        ``prefer_agent_sdk`` forces the Claude Agent SDK route even for
-        ``OffsiteApply`` jobs — used by ``run_session`` after the NIM classifier
-        route trips its circuit breaker. It is a no-op unless the opt-in NIM
-        route is enabled (``_NIM_CLASSIFIER_ENABLED``); by default every job
-        goes to the Agent SDK anyway. The citizenship keyword fast-path still
-        runs first regardless.
+        ``application_type`` is accepted (and logged nowhere yet) for callers
+        and a possible future routing decision, but every job currently goes
+        to the Claude Agent SDK once the citizenship keyword fast-path clears.
         """
         desc = description or ""
 
@@ -807,12 +590,6 @@ Be accurate and concise. Never fabricate information not in the user's profile."
                           {"relevant": False, "reason": reason, "citizenship_required": True})
                 return False, reason, True
 
-        if (
-            _NIM_CLASSIFIER_ENABLED
-            and application_type == "OffsiteApply"
-            and not prefer_agent_sdk
-        ):
-            return await self._classify_nim(title, desc)
         return await self._classify_agent(title, desc)
 
     async def _run_with_retry(self, factory):
@@ -821,39 +598,18 @@ Be accurate and concise. Never fabricate information not in the user's profile."
 
         A ``TimeoutError`` is **not** retried: a route that already blew a 40s
         deadline almost never answers inside a second one, and retrying it just
-        doubles the wall-clock before ``run_session`` can abort a degraded
-        session. It propagates immediately so the caller (the circuit breaker)
-        can fall back to the other route.
-
-        ``NimConfigError`` is deterministic (missing key), so it too propagates
-        immediately without a retry.
+        doubles the wall-clock before ``run_session``'s classify-fail-streak
+        counter can abort a degraded session. It propagates immediately.
         """
         for attempt in range(1, self._CALL_ATTEMPTS + 1):
             try:
                 return await asyncio.wait_for(factory(), self._ATTEMPT_TIMEOUT_S)
-            except nim_client.NimConfigError:
-                raise
             except Exception as exc:
                 if attempt >= self._CALL_ATTEMPTS or isinstance(exc, TimeoutError):
                     raise
                 print(f"\n  [classifier] attempt {attempt} failed ({exc}) — retrying…",
                       flush=True)
                 await asyncio.sleep(self._RETRY_DELAY_S)
-
-    async def _classify_nim(self, title: str, desc: str) -> tuple[bool, str, bool]:
-        if self._nim_client is None:
-            # Raises NimConfigError if no classifier key is resolvable — surfaced
-            # to run_session, which leaves the job pending.
-            self._nim_client, self._nim_model = nim_client.resolve_classifier()
-        t0 = time.monotonic()
-        data = await self._run_with_retry(
-            lambda: asyncio.to_thread(
-                nim_client.classify_via_nim,
-                self._nim_client, self._nim_model, title, desc,
-            )
-        )
-        return self._finalize(title, "nim", self._nim_model,
-                              int((time.monotonic() - t0) * 1000), data)
 
     async def _classify_agent(self, title: str, desc: str) -> tuple[bool, str, bool]:
         prompt = self._AGENT_PROMPT.format(title=title, description=desc[:3000])
@@ -870,11 +626,7 @@ Be accurate and concise. Never fabricate information not in the user's profile."
                               int((time.monotonic() - t0) * 1000), data)
 
     def _finalize(self, title, route, model, duration_ms, data) -> tuple[bool, str, bool]:
-        """Coerce a raw classifier JSON object into the return tuple + log it.
-
-        Shared by both routes so the citizenship override and telemetry shape
-        stay identical.
-        """
+        """Coerce a raw classifier JSON object into the return tuple + log it."""
         relevant = bool(data.get("relevant"))
         reason = str(data.get("reason", ""))
         citizenship_required = bool(data.get("citizenship_required", False))
@@ -905,93 +657,6 @@ Be accurate and concise. Never fabricate information not in the user's profile."
         if raw is not None:
             entry["raw_response"] = raw
         _write_llm_log(entry)
-
-
-# ── Classifier circuit breaker ─────────────────────────────────────────────────
-
-# Only relevant on the opt-in NIM classifier route (``CLASSIFIER_ROUTE=nim`` /
-# ``_NIM_CLASSIFIER_ENABLED``). With the default Agent SDK route,
-# ``classify_with_circuit_breaker`` short-circuits before any of this runs.
-#
-# Consecutive NIM-route classify timeouts within one session before every
-# remaining OffsiteApply job is routed through the Agent SDK instead.
-_MAX_NIM_TIMEOUT_STREAK = 2
-_NIM_DEGRADED_MSG = (
-    "NIM classifier route degraded — falling back to Agent SDK for OffsiteApply"
-)
-
-
-def _new_classifier_breaker() -> dict:
-    """Fresh, session-scoped circuit-breaker state. One per ``run_session``."""
-    return {"nim_timeout_streak": 0, "nim_route_degraded": False}
-
-
-async def classify_with_circuit_breaker(
-    agent: "JobAgent", breaker: dict,
-    title: str, description: str, application_type: str | None,
-) -> tuple[bool, str, bool]:
-    """Classify one job, applying the per-session NIM-route circuit breaker.
-
-    ``breaker`` is the mutable dict from :func:`_new_classifier_breaker`; this
-    function updates it in place.
-
-    Behaviour:
-      * Non-OffsiteApply jobs are unaffected — straight to ``agent.classify``
-        (which uses the Agent SDK for them anyway).
-      * OffsiteApply job, route healthy: try NIM. On ``TimeoutError``,
-        bump the streak, classify *this* job via the Agent SDK instead, and — at
-        ``_MAX_NIM_TIMEOUT_STREAK`` consecutive timeouts — flip the route to
-        "degraded" and log it once.
-      * OffsiteApply job, route degraded: straight to the Agent SDK, no wasted
-        NIM attempt.
-
-    A NIM timeout that the Agent SDK then classifies successfully does NOT raise
-    — so the caller does not count it as a classifier failure. Only a genuine
-    failure (Agent SDK also fails, or a non-timeout error) propagates.
-
-    When the NIM route is not enabled (``_NIM_CLASSIFIER_ENABLED`` is false —
-    the default, ``CLASSIFIER_ROUTE`` unset), this is a thin pass-through to
-    ``agent.classify``: every job goes straight to the Agent SDK and the
-    breaker state is never touched (``agent.classify`` ignores the OffsiteApply
-    branch in that mode, so ``prefer_agent_sdk`` is moot).
-    """
-    if not _NIM_CLASSIFIER_ENABLED:
-        return await agent.classify(title, description, application_type)
-
-    is_offsite = (application_type or "") == "OffsiteApply"
-
-    if not is_offsite or breaker["nim_route_degraded"]:
-        return await agent.classify(
-            title, description, application_type, prefer_agent_sdk=is_offsite,
-        )
-
-    try:
-        result = await agent.classify(title, description, application_type)
-    except TimeoutError:
-        breaker["nim_timeout_streak"] += 1
-        streak = breaker["nim_timeout_streak"]
-        just_degraded = (
-            streak >= _MAX_NIM_TIMEOUT_STREAK and not breaker["nim_route_degraded"]
-        )
-        if just_degraded:
-            breaker["nim_route_degraded"] = True
-            _write_llm_log({
-                "ts": datetime.now(timezone.utc).isoformat(),
-                "type": "classifier_route_degraded",
-                "note": _NIM_DEGRADED_MSG,
-                "nim_timeout_streak": streak,
-            })
-        print(
-            f"\n  [!] NIM classifier timed out ({streak}/{_MAX_NIM_TIMEOUT_STREAK}) "
-            f"— classifying this job via the Agent SDK instead."
-            + (f"\n  [!] {_NIM_DEGRADED_MSG}" if just_degraded else "")
-        )
-        return await agent.classify(
-            title, description, application_type, prefer_agent_sdk=True,
-        )
-    else:
-        breaker["nim_timeout_streak"] = 0
-        return result
 
 
 # ── Database helpers ────────────────────────────────────────────────────────────
@@ -1360,23 +1025,19 @@ async def run_session(
     gmail_pass: str = "",
     verbose: bool = False,
 ):
-    # JobAgent owns its own classifier backends: NIM for OffsiteApply, a fresh
-    # one-shot Claude Agent SDK session per job for Easy Apply. Nothing to close.
+    # JobAgent classifies via a fresh one-shot Claude Agent SDK session per
+    # job. Nothing to close.
     agent = JobAgent(profile)
     # Consecutive classification failures — a transient blip leaves one job
     # pending and moves on; a run of them means something systemic, so bail.
     classify_fail_streak = 0
     _MAX_CLASSIFY_FAIL_STREAK = 3
-    # NIM-route circuit breaker — session-scoped, resets each run_session.
-    classifier_breaker = _new_classifier_breaker()
 
     # ATS-domain blocklist for the per-job application-URL check below. Loaded
     # once per session from the ``blocked_entities`` table (seed + operator
     # additions), unioned with the seed constant so a not-yet-migrated DB still
     # blocks the seed set (T22).
     session_blocked_domains = load_session_blocked_domains(cursor)
-
-    inbox = EmailInbox(gmail_user, gmail_pass) if gmail_user and gmail_pass else None
 
     started_at   = datetime.now(timezone.utc).isoformat()
     session_date = datetime.now().strftime("%Y-%m-%d")
@@ -1403,13 +1064,27 @@ async def run_session(
     })
     all_unanswered_fields: list[str] = []
 
-    # Skip LinkedIn login when every job in the queue is OffsiteApply —
-    # those jobs navigate directly to the company ATS via application_url.
-    _all_offsite = all(row[7] == "OffsiteApply" for row in jobs)
-    if _all_offsite:
-        print("\nOpening browser (OffsiteApply only — skipping LinkedIn login)…")
-    else:
-        print("\nOpening browser and signing into LinkedIn…")
+    # OffsiteApply automation was removed in full (pending a from-scratch
+    # redesign, T54) — if every pending job in this batch is OffsiteApply,
+    # every one of them will immediately loop-skip below without ever
+    # touching a page, so there is nothing a browser session could do. Skip
+    # opening one entirely rather than launching Chromium, logging into
+    # LinkedIn, and idling through a batch of no-ops.
+    if jobs and all((row[7] or "") == "OffsiteApply" for row in jobs):
+        print(f"\nAll {total} pending job(s) are OffsiteApply — automation for "
+              f"that application_type was removed and is pending a "
+              f"from-scratch redesign. Nothing to do this session "
+              f"(jobs.applied left untouched).")
+        _write_llm_log({
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "type": "session_end",
+            "note": "all-offsite batch, no browser session opened",
+            "total_jobs": total,
+        })
+        conn.close()
+        return
+
+    print("\nOpening browser and signing into LinkedIn…")
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=False)
@@ -1418,15 +1093,12 @@ async def run_session(
         )
         page    = await context.new_page()
 
-        if not _all_offsite:
-            try:
-                await login_linkedin_playwright(page)
-                print("  Session ready.\n")
-            except Exception as _login_err:
-                await browser.close()
-                raise
-        else:
+        try:
+            await login_linkedin_playwright(page)
             print("  Session ready.\n")
+        except Exception as _login_err:
+            await browser.close()
+            raise
 
         if not _check_recent_session_health():
             print("\n  [!] Warning: the last 3 sessions all had >80% error rates.")
@@ -1441,6 +1113,16 @@ async def run_session(
                 print(f"  [{idx}/{total}]  {title or 'Unknown'}  |  {company_name or 'Unknown company'}")
                 print(f"  Location : {location or 'N/A'}   Level: {exp_level or 'N/A'}")
 
+                # OffsiteApply automation (OffsiteApplyFlow) was removed in full
+                # and is pending a from-scratch redesign — pass these jobs over
+                # entirely, before any other check that would write to the DB
+                # (the staff/principal title skip below, classification, etc.).
+                # No classification, no mark_job: jobs.applied stays NULL so
+                # nothing here needs --reset-failed once the new engine lands.
+                if (application_type or "") == "OffsiteApply":
+                    print("  [Offsite apply not yet implemented — skipping]")
+                    continue
+
                 _title_lower = (title or "").lower()
                 if ("staff" in _title_lower or "principal" in _title_lower) and "engineer" in _title_lower:
                     mark_job(conn, cursor, job_id, -1)
@@ -1448,36 +1130,15 @@ async def run_session(
                     print("  Auto-skipped — staff/principal engineer position.")
                     continue
 
-                # Spam / aggregator domains are skipped BEFORE the classifier
-                # runs (T29) — a spam listing must never cost an LLM call.
-                if (application_type or "") == "OffsiteApply":
-                    _spam_host = _match_spam_domain(posting_domain, application_url)
-                    if _spam_host:
-                        print(f"  [skip] Spam/aggregator domain ({_spam_host}) — "
-                              f"skipped before classification.")
-                        mark_job(conn, cursor, job_id, -1)
-                        skipped_count += 1
-                        continue
-
                 print("  Classifying…", end="", flush=True)
                 try:
-                    relevant, reason, citizenship_required = await classify_with_circuit_breaker(
-                        agent, classifier_breaker,
+                    relevant, reason, citizenship_required = await agent.classify(
                         title or "", description or "", application_type,
                     )
                     classify_fail_streak = 0
-                except nim_client.NimConfigError as exc:
-                    # Missing / bad CLASSIFIER_API — deterministic, won't fix
-                    # itself, and interleaved EasyApply successes would keep
-                    # resetting the streak while every OffsiteApply job is
-                    # silently skipped. Abort now.
-                    print(f"\n  [!] NIM classifier misconfigured ({exc}) — stopping session.")
-                    break
                 except Exception as exc:
-                    # Both classifier routes failed for this job (the circuit
-                    # breaker already tried the Agent SDK fallback on a NIM
-                    # timeout). Leave the job pending — do NOT mark_job, do NOT
-                    # count it as skipped.
+                    # Leave the job pending — do NOT mark_job, do NOT count it
+                    # as skipped.
                     classify_fail_streak += 1
                     what = ("timed out" if isinstance(exc, TimeoutError)
                             else f"failed ({exc})")
@@ -1561,45 +1222,24 @@ async def run_session(
                             return "applied"
                     return ready_to_submit
 
-                async def _fill_focused_cb(_page=page):
-                    await _llm_fill_focused(_page, profile)
-
                 callbacks = {
                     "ready_to_submit":  _make_ready_to_submit(outcome, title or "Unknown", page),
-                    "fill_focused":     _fill_focused_cb,
-                    "save_account":     save_account_to_file,
                     "get_credentials":  _get_login_credentials,
                 }
 
-                # ── Choose apply flow ──────────────────────────────────────────
+                # ── Apply flow ───────────────────────────────────────────────────
+                # Always EasyApplyFlow — OffsiteApply jobs never reach this point
+                # (skipped earlier in the loop).
                 print("  Applying via Playwright…")
 
-                if (application_type or "") == "OffsiteApply":
-                    # Spam/aggregator domains were already filtered before the
-                    # classifier call (see _match_spam_domain above).
-                    flow = OffsiteApplyFlow(
-                        page=page,
-                        context=context,
-                        profile=profile,
-                        auto_mode=auto_mode,
-                        callbacks=callbacks,
-                        generated_password=_generate_password(),
-                        company_name=company_name or "",
-                        job_title=title or "",
-                        job_description=description or "",
-                        verbose=verbose,
-                        inbox=inbox,
-                        application_url=application_url or "",
-                    )
-                else:
-                    flow = EasyApplyFlow(
-                        page=page,
-                        profile=profile,
-                        auto_mode=auto_mode,
-                        callbacks=callbacks,
-                        verbose=verbose,
-                    )
-                    flow._verbose_company = company_name or "unknown"
+                flow = EasyApplyFlow(
+                    page=page,
+                    profile=profile,
+                    auto_mode=auto_mode,
+                    callbacks=callbacks,
+                    verbose=verbose,
+                )
+                flow._verbose_company = company_name or "unknown"
 
                 # T36: set when a Chromium tab/renderer crash is seen for this job
                 # — either caught inside the flow (flow._browser_crashed) or
@@ -1620,37 +1260,6 @@ async def run_session(
                         print(f"\n  [!] Error during apply: {exc}")
                     status = "failed"
                 browser_crashed |= getattr(flow, "_browser_crashed", False)
-
-                # Easy Apply job switched to external apply — retry with OffsiteApplyFlow
-                if status == "external_apply" and not isinstance(flow, OffsiteApplyFlow):
-                    print("  [~] Job switched from Easy Apply to external — retrying with OffsiteApplyFlow…")
-                    flow = OffsiteApplyFlow(
-                        page=page,
-                        context=context,
-                        profile=profile,
-                        auto_mode=auto_mode,
-                        callbacks=callbacks,
-                        generated_password=_generate_password(),
-                        company_name=company_name or "",
-                        job_title=title or "",
-                        job_description=description or "",
-                        verbose=verbose,
-                        inbox=inbox,
-                        application_url=application_url or "",
-                    )
-                    try:
-                        status = await asyncio.wait_for(flow.run(url), timeout=600)
-                    except asyncio.TimeoutError:
-                        print(f"\n  [!] Timed out after 600s")
-                        status = "failed"
-                    except Exception as exc:
-                        if _is_browser_crash(exc):
-                            print(f"\n  [!] Browser tab crashed mid-apply — will retry ({exc})")
-                            browser_crashed = True
-                        else:
-                            print(f"\n  [!] Error during offsite apply: {exc}")
-                        status = "failed"
-                    browser_crashed |= getattr(flow, "_browser_crashed", False)
 
                 # Collect unanswered fields for profile improvement
                 for f in getattr(flow, "unanswered_fields", []):
@@ -1686,6 +1295,16 @@ async def run_session(
                     skipped_count += 1
                     print("  [~] No Easy Apply button — job uses external apply, skipped.")
 
+                elif status == "external_apply":
+                    # LinkedIn's Apply button on this SimpleOnsiteApply /
+                    # ComplexOnsiteApply job redirects off-site. OffsiteApplyFlow
+                    # (which used to pick this up and keep going) was removed —
+                    # same outcome as "no_easy_apply" until it's redesigned.
+                    mark_job(conn, cursor, job_id, -1)
+                    skipped_count += 1
+                    print("  [~] Redirects to an external site — offsite apply "
+                          "not yet implemented, skipped.")
+
                 elif status == "no_apply_button":
                     mark_job(conn, cursor, job_id, -1)
                     skipped_count += 1
@@ -1714,7 +1333,7 @@ async def run_session(
                         while True:
                             try:
                                 fail_choice = input(
-                                    "  [r] = retry (agent fills form)   [f] = fill focused field   "
+                                    "  [f] = fill focused field   "
                                     "[m] = I applied manually   [s] = skip   [ENTER] = auto-fail\n"
                                     "  > "
                                 ).strip().lower()
@@ -1732,43 +1351,6 @@ async def run_session(
                                         continue
                                 await _llm_fill_focused(_active_pg, profile)
                                 continue
-                            if fail_choice == "r" and isinstance(flow, OffsiteApplyFlow):
-                                try:
-                                    input("  Navigate to the application form in the browser, then press ENTER…")
-                                except (EOFError, KeyboardInterrupt):
-                                    pass
-                                try:
-                                    status = await asyncio.wait_for(flow.assist_from_page(), timeout=600)
-                                except asyncio.TimeoutError:
-                                    status = "failed"
-                                except Exception as _retry_exc:
-                                    print(f"  [!] Retry error: {_retry_exc}")
-                                    status = "failed"
-                                if status == "applied":
-                                    mark_job(conn, cursor, job_id, 1)
-                                    applied_count += 1
-                                    applications.append({
-                                        "job_id":     job_id,
-                                        "title":      title or "",
-                                        "company":    company_name or "",
-                                        "url":        url,
-                                        "applied_at": datetime.now(timezone.utc).isoformat(),
-                                    })
-                                    print("  [+] Applied!")
-                                    break
-                                elif status in ("skipped", "expired", "no_apply_button"):
-                                    mark_job(conn, cursor, job_id, -1)
-                                    skipped_count += 1
-                                    print("  [-] Skipped.")
-                                    break
-                                elif status == "blocked":
-                                    mark_job(conn, cursor, job_id, -3)
-                                    blocked_count += 1
-                                    print("  [~] Blocked — needs a manual apply, will not auto-retry.")
-                                    break
-                                else:
-                                    print("  [!] Retry also failed — choose again.")
-                                    continue
                             elif fail_choice == "m":
                                 mark_job(conn, cursor, job_id, 1)
                                 applied_count += 1
@@ -1807,7 +1389,11 @@ async def run_session(
                 try:
                     context, page = await _recover_browser_if_crashed(
                         browser, context, page,
-                        need_login=not _all_offsite,
+                        # This point is only reached when the batch has at
+                        # least one non-OffsiteApply job (an all-offsite batch
+                        # returns before a browser is even opened — see above)
+                        # — a rebuilt page always needs a fresh LinkedIn login.
+                        need_login=True,
                         suspect=browser_crashed,
                     )
                 except Exception as _rec_exc:
