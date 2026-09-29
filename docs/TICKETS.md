@@ -109,14 +109,23 @@ submit to.
 - `python -m tests.fixtures.offsite.serve [--port 8811]` — static server that
   also exposes `GET /__submissions` (count of hits on `/__submitted`).
 
-**Acceptance.** All three fixtures render; manually clicking submit on each
-increments `/__submissions` (proves the counter works for later tickets).
+**Acceptance.** All three fixtures render with no request leaving 127.0.0.1;
+clicking submit on each increments `/__submissions` (proves the counter works
+for later tickets). `multipage.html` also submits on **Enter** in a text field
+(implicit submission) — the hazard OA5's Enter guard must block.
+
+Re-record or add a form: `python -m tests.fixtures.offsite.record <url> <name> [--click Apply]`.
+Recorded forms are static (scripts stripped), so custom React dropdowns don't
+open — fine for guard tests; runner tests should prefer `multipage.html`.
 
 **How to test.**
 ```bash
-python -m tests.fixtures.offsite.serve
-open http://127.0.0.1:8811/multipage.html   # click through, submit
-curl http://127.0.0.1:8811/__submissions     # → 1
+pytest tests/offsite/test_fixtures.py
+python -m tests.fixtures.offsite.serve        # prints the three fixture URLs
+open http://127.0.0.1:8811/multipage.html     # try Next on empty fields, fill, submit
+curl http://127.0.0.1:8811/__submissions      # → {"count": 1, "last": {"fields": [...]}}
+open http://127.0.0.1:8811/greenhouse.html    # real Wikimedia Greenhouse form, offline
+open http://127.0.0.1:8811/ashby.html         # real Marqeta Ashby form, offline
 ```
 
 ---
