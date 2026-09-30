@@ -156,6 +156,7 @@ class RunControl:
     def install(self, guard: GuardMCP) -> None:
         guard.add_check(self.check, first=True)      # counts calls later guards refuse
         guard.add_observer(self.observe)
+        guard.add_cancel_listener(self.on_cancel)
         guard.add_local_tool(REPORT_READY, self._report_ready)
         guard.add_local_tool(REQUEST_HUMAN, self._request_human)
         if self.sponsorship_skip:
@@ -189,6 +190,14 @@ class RunControl:
             self._stop("budget", f"{self.budget} tool calls used on this application")
             return self._stop_text()
         return None
+
+    def on_cancel(self, name: str, args: dict[str, Any]) -> None:
+        """A call the client cancelled never ran to completion — retrying it is not
+        a loop."""
+        if name in _READ_ONLY:
+            self._last_read, self._read_repeats = None, 0
+        else:
+            self._last_action = None
 
     def _ended_by(self) -> str:
         return _ENDED_BY.get(self.outcome or "", "a control tool")

@@ -1,7 +1,8 @@
 """Run one model on one application page, supervised (OA8 / OA9 manual check).
 
-    python -m offsite.run_agent --model nim --url <application url> [--job-id N]
-    python -m offsite.run_agent --model nim --url http://127.0.0.1:8811/multipage.html
+    python -m offsite.run_agent --url <application url> [--job-id N]      # NIM → Claude
+    python -m offsite.run_agent --model claude --url http://127.0.0.1:8811/multipage.html
+    python -m offsite.run_agent --force-fallback-after 8 --url …/multipage.html
 
 Starts the shared browser + guard-mcp with every guard (RunControl budget/loop,
 SubmitGuard lock / Enter / uploads), opens the URL, runs the model with the
@@ -19,6 +20,7 @@ import sys
 
 from offsite.browser import OffsiteBrowser
 from offsite.control import BUDGET, RunControl
+from offsite.controller import FillController, FillResult
 from offsite.guard_mcp import GuardMCP
 from offsite.guards import SubmitGuard
 from offsite.prompts import (
@@ -27,14 +29,18 @@ from offsite.prompts import (
     load_job,
     load_profile,
     needs_sponsorship,
-    start_message,
-    system_prompt,
 )
 from offsite.runners import RunResult
 
+ORDERS = {"nim": ("nim",), "claude": ("claude",), "auto": ("nim", "claude")}
+
 
 async def run_one(model: str, url: str, *, job: JobInfo, profile: dict, headless: bool,
-                  budget: int, wait: bool, profile_dir: str | None) -> tuple[RunResult, RunControl]:
+                  budget: int, wait: bool, profile_dir: str | None,
+                  force_fallback_after: int | None = None) -> tuple[RunResult, RunControl]:
+    """Fill ``url`` with ``model`` (``nim`` / ``claude`` / ``auto`` = NIM → Claude
+    fallback). Returns the last run and the RunControl; ``run_one.last_fill``
+    holds the FillResult."""
     kw = {"headless": headless}
     browser = OffsiteBrowser(profile_dir, **kw) if profile_dir else OffsiteBrowser(**kw)
     async with browser, GuardMCP(browser) as guard:
@@ -42,48 +48,51 @@ async def run_one(model: str, url: str, *, job: JobInfo, profile: dict, headless
         control.install(guard)
         await SubmitGuard(browser, resume_path=profile.get("resume_path")).install(guard)
         await browser.open(url)
-        control.reset(model=model)
-        system, task = system_prompt(profile, job), start_message(job)
-        print(f"[run_agent] {model} on {job.host or url} — budget {budget}, guard {guard.url}")
-        if model == "nim":
-            from offsite.runners import nim
-            res = await nim.run(system, task, guard.url, stop_when=lambda: bool(control.outcome))
-        elif model == "claude":
-            from offsite.runners import claude  # OA9
-            res = await claude.run(system, task, guard.url,
-                                   stop_when=lambda: bool(control.outcome))
-        else:
-            raise SystemExit(f"unknown model {model!r}")
-        _report(res, control)
+        order = ORDERS[model]
+        print(f"[run_agent] {' → '.join(order)} on {job.host or url} — budget {budget}"
+              + (f" (first run cut to {force_fallback_after})" if force_fallback_after else "")
+              + f", guard {guard.url}")
+        ctl = FillController(profile=profile, job=job, guard_url=guard.url, control=control,
+                             order=order, force_fallback_after=force_fallback_after)
+        fill = await ctl.fill()
+        while fill.outcome == "human" and wait:
+            _report(fill)
+            await asyncio.get_running_loop().run_in_executor(
+                None, input, f"⏸ {fill.human_reason}: do it in the browser, then press Enter. ")
+            fill = await ctl.resume(fill.human_reason or "stuck", fill.human_detail or "")
+        _report(fill)
+        run_one.last_fill = fill
         if wait:
             await asyncio.get_running_loop().run_in_executor(
                 None, input, "Browser left open for you to inspect — press Enter to close. ")
-        return res, control
+        return fill.runs[-1], control
 
 
-def _report(res: RunResult, control: RunControl) -> None:
-    print(f"run      : {res.status}"
-          + (f" — {res.error}" if res.error else "")
-          + f" ({res.model}, {res.turns} turns, {res.seconds}s)")
-    print(f"outcome  : {control.outcome} ({control.calls} tool calls"
-          + (f", {control.stop_reason}" if control.stop_reason else "") + ")")
-    if control.outcome == "human":
-        print(f"human    : {control.human_reason} — {control.human_detail}")
-    if control.outcome == "skip":
-        print(f"skipped  : {control.skip_reason} — “{control.skip_evidence}”")
-    for w in control.warnings:
+def _report(fill: FillResult) -> None:
+    for r in fill.runs:
+        print(f"run      : {r.model}: {r.status}" + (f" — {r.error}" if r.error else "")
+              + f" ({r.turns} turns, {r.seconds}s)")
+    print(f"outcome  : {fill.outcome} (model {fill.model_used}, {fill.tool_calls} tool calls)")
+    if fill.fallback_reason:
+        print(f"fallback : {fill.fallback_reason}")
+    if fill.outcome == "human":
+        print(f"human    : {fill.human_reason} — {fill.human_detail}")
+    if fill.outcome == "skip":
+        print(f"skipped  : {fill.skip_reason} — “{fill.skip_evidence}”")
+    for w in fill.warnings:
         print(f"warning  : {w}")
-    for a in control.answers:
+    for a in fill.answers:
         flag = "⚠" if a.sensitive or a.confidence < 0.7 else " "
         print(f"  {flag} {a.field_label[:60]}: {a.answer[:80]!r} ({a.source}, {a.confidence:.2f})")
-    if res.final_text:
-        print(f"final    : {res.final_text[:300]}")
 
 
 def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="python -m offsite.run_agent", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--model", choices=["nim", "claude"], required=True)
+    ap.add_argument("--model", choices=sorted(ORDERS), default="auto",
+                    help="auto = NIM, falling back to Claude in place (default)")
+    ap.add_argument("--force-fallback-after", type=int, default=None, metavar="N",
+                    help="testing: end the first model's run after N tool calls")
     ap.add_argument("--url", required=True)
     ap.add_argument("--job-id", type=int)
     ap.add_argument("--db", default=str(DEFAULT_DB))
@@ -104,7 +113,8 @@ def main(argv: list[str]) -> int:
                       "Placeholder job for a fixture run.", "Remote")
     res, control = asyncio.run(run_one(
         args.model, args.url, job=job, profile=profile, headless=args.headless,
-        budget=args.budget, wait=not args.no_wait, profile_dir=args.profile_dir))
+        budget=args.budget, wait=not args.no_wait, profile_dir=args.profile_dir,
+        force_fallback_after=args.force_fallback_after))
     return 0 if control.outcome == "ready" else 1
 
 
