@@ -17,7 +17,7 @@ from scripts.migrations import runner
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _MIGRATION_003 = _REPO_ROOT / "scripts" / "migrations" / "003_offsite_applications.py"
 
-_SCAM_HOSTS = {"alignerr.com", "micro1.ai", "mercor.com", "jobright.ai", "dice.com"}
+_SCAM_HOSTS = {"alignerr.com", "micro1.ai", "mercor.com", "jobright.ai", "dice.com", "yara.so"}
 _ENTERPRISE_ATS = {"myworkdayjobs.com", "icims.com", "successfactors.com", "oraclecloud.com",
                    "taleo.net", "greenhouse.io", "ashbyhq.com"}
 

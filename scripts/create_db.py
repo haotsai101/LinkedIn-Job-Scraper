@@ -39,6 +39,7 @@ BLOCKED_ENTITIES_SEED = [
     ("ats_domain", "sundayy.com", "paid job-application service"),
     ("ats_domain", "tenex.ai", "gig / AI-training marketplace"),
     ("ats_domain", "sourcehire.app", "job aggregator, not an employer ATS"),
+    ("ats_domain", "yara.so", "job aggregator reposting other companies' jobs (owner request)"),
 ]
 
 # ── offsite_applications: one row per OffsiteApply agent attempt (OA1) ────────
