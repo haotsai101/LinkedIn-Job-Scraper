@@ -142,3 +142,57 @@ def test_newlines_only_go_into_textareas(live_guard):
     assert lg.run(page.input_value("#why")) == "Line one.\nLine two."
     # the newline in the <input> was not typed as Enter: still on step 2, nothing submitted
     assert "Step 2 of 3" in lg.run(page.inner_text(".step-indicator"))
+
+
+def test_parallel_typing_calls_are_serialized(real_pacing):
+    """A model may send two browser_type calls at once; both must land intact."""
+    import asyncio
+
+    lg = real_pacing
+    lg.open("multipage.html")
+    page = lg.browser.page
+
+    async def go(c):
+        snap = _t(await c.call_tool("browser_snapshot", {}))
+        first = _ref(snap, "textbox", "First name *")
+        last = _ref(snap, "textbox", "Last name *")
+        return await asyncio.gather(
+            c.call_tool("browser_type", {"element": "first", "target": first, "text": "Augusta"}),
+            c.call_tool("browser_type", {"element": "last", "target": last, "text": "Lovelace"}))
+
+    r1, r2 = mcp(lg, go)
+    assert not r1.is_error and not r2.is_error
+    assert lg.run(page.input_value("#first_name")) == "Augusta"
+    assert lg.run(page.input_value("#last_name")) == "Lovelace"
+
+
+def test_cancelled_call_is_logged_and_reported(real_pacing, monkeypatch):
+    import asyncio
+
+    from offsite import guard_mcp
+
+    lg = real_pacing
+    lg.open("multipage.html")
+    logged, cancelled = [], []
+    monkeypatch.setattr(guard_mcp, "write_llm_log", logged.append)
+    lg.guard.add_cancel_listener(lambda name, args: cancelled.append(name))
+    snap = _t(lg.run(lg.guard.call("browser_snapshot", {})))
+    target = _ref(snap, "textbox", "Email *")
+
+    async def go():
+        task = asyncio.create_task(lg.guard.call(
+            "browser_type", {"element": "Email", "target": target, "text": "x" * 40}))
+        await asyncio.sleep(1.0)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            return True
+        return False
+
+    try:
+        assert lg.run(go()) is True
+    finally:
+        lg.guard._cancel_listeners.clear()
+    assert cancelled == ["browser_type"]
+    assert logged[-1]["tool"] == "browser_type" and logged[-1].get("cancelled") is True

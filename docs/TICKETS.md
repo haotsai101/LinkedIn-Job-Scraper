@@ -439,26 +439,55 @@ pytest tests/offsite/test_control.py tests/offsite/test_prompts.py tests/offsite
 
 **Depends on** OA8, OA9.
 
-**Build.** `offsite/controller.py`: `fill_application(job, browser, guard) ->
-FillResult(outcome, answers, model_used, fallback_reason, tool_calls)`:
-- NIM first; on `error | loop | budget | none` → `control.reset(model="claude")`,
-  build the handoff note, run Claude **on the same page**.
-- On `human` → return to the caller (OA11 pauses, then calls
-  `resume(job, human_action)` which re-runs the *same* model with a note).
-- Claude also fails → `outcome="needs_human"`.
+**Build.** `offsite/controller.py` — `FillController(profile, job, guard_url,
+control, order=("nim", "claude"), force_fallback_after=None)`:
+- `fill()` → `FillResult(outcome, model_used, fallback_reason, tool_calls,
+  answers, warnings, human_*, skip_*, runs)`; `outcome` ∈
+  `ready | human | skip | needs_human`.
+- A run ending in a control outcome (`ready`, `skip`, `human`) ends the chain.
+  **Every other ending falls back in place** to the next model with a
+  `handoff_note`: runner error (NIM timeout after 3 retries, HTTP / 429,
+  invalid tool calls, turn limit, run cap, even a missing key), `loop`,
+  `budget`, or ending the turn without a control tool. The last model failing
+  → `needs_human`.
+- `human` is a pause: `resume(human_reason, detail)` re-runs the model that
+  asked (then the rest of the chain) with a `resume_note`; the human's actions
+  are passed on in later handoff notes. `fix(instruction)` reruns the chain
+  from the first model (OA11 `[e]`).
 - `skip` (OA9b) is terminal like `ready`: no fallback.
-- CLI flag for testing: `--force-fallback-after N` (RunControl budget = N for
-  the NIM run).
+- `force_fallback_after=N` cuts only the very first run's budget (testing).
+- Per-run log lines (`fill_controller`) in `llm_debug.jsonl`.
+- CLI: `python -m offsite.run_agent --url … [--model auto|nim|claude]
+  [--force-fallback-after N]` (default `auto` = NIM → Claude); pauses on
+  `human` and resumes after Enter.
+
+**Found and fixed while verifying:**
+- **guard-mcp serializes browser actions.** Claude sent two `browser_type`
+  calls in parallel; with human-paced typing they fought over keyboard focus
+  and one was cancelled. (Mutation-checked: without the lock, parallel typing
+  leaves a field empty.)
+- A **cancelled** call is logged (`"cancelled": true`) and doesn't count
+  towards loop detection (an honest retry isn't a loop).
 
 **Acceptance.** Fallback continues in place (fields NIM filled are still filled
 and not re-typed); `model_used` = `nim→claude`.
 
+**Result (2026-09-29).**
+- Forced handover (first run cut to 8 calls, page-level keystroke counts):
+  ready; run 2 filled only the 5 remaining fields, **retyped none of the 9**
+  run 1 had filled; 0 submissions.
+- Real NIM → Claude on `multipage.html`: NIM's first request timed out after 3
+  retries (364 s) → Claude finished: ready, `model_used = nim→claude`.
+- Note for OA13: after a handover the second model reported 10 of 16 answers
+  (the page is complete; the answer record isn't).
+
 **How to test.**
 ```bash
 pytest tests/offsite/test_controller.py      # fake runners: every trigger → correct next step
-python -m offsite.run_agent --model auto --force-fallback-after 8 \
-    --url http://127.0.0.1:8811/multipage.html
-#  watch NIM fill a few fields, Claude finish the rest; outcome=ready, model_used=nim→claude
+python -m tests.fixtures.offsite.serve &
+python -m offsite.run_agent --force-fallback-after 8 --url http://127.0.0.1:8811/multipage.html
+#  → "outcome : ready (model nim→claude, …)", "fallback : nim: budget — 8 tool calls used"
+OFFSITE_LIVE=1 pytest tests/offsite/test_controller.py -k live   # real NIM → Claude, ~5 min
 ```
 
 ---

@@ -314,6 +314,9 @@ class _FakeGuard:
     def add_local_tool(self, tool, handler):
         self.local[tool.name] = handler
 
+    def add_cancel_listener(self, *a):
+        pass
+
 
 def test_skip_tool_only_offered_when_applicant_needs_sponsorship():
     g = _FakeGuard()
@@ -350,3 +353,13 @@ def test_skip_application_refused_when_not_offered():
     r = run(rc._skip_application({"reason": "sponsorship_not_offered",
                                   "evidence": "We are unable to sponsor visas."}))
     assert r.is_error and rc.outcome is None
+
+
+def test_retry_after_a_cancelled_call_is_not_a_loop():
+    rc = RunControl()
+    args = {"element": "salary", "target": "e46", "text": "100000"}
+    assert run(rc.check("browser_type", args)) is None
+    rc.on_cancel("browser_type", args)            # the client gave up on it mid-way
+    assert run(rc.check("browser_type", args)) is None
+    assert rc.outcome is None
+    assert run(rc.check("browser_type", args)).startswith(STOP_PREFIX)   # a real repeat

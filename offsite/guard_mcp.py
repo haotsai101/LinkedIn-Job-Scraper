@@ -108,6 +108,8 @@ Check = Callable[[str, dict[str, Any]], Awaitable[str | None]]
 Observer = Callable[[str, dict[str, Any], types.CallToolResult], Awaitable[None]]
 # Told about every refusal (tool, args, reason) — OA5 mirrors them onto the page.
 RefusalListener = Callable[[str, dict[str, Any], str], Awaitable[None]]
+# Told when a call was cancelled by the client before it finished (tool, args).
+CancelListener = Callable[[str, dict[str, Any]], None]
 # A local tool is served by guard-mcp itself (OA6 control tools), never forwarded.
 LocalHandler = Callable[[dict[str, Any]], Awaitable[types.CallToolResult]]
 
@@ -142,6 +144,10 @@ class GuardMCP:
         self._observers: list[Observer] = []
         self._local: dict[str, tuple[types.Tool, LocalHandler]] = {}
         self._refusal_listeners: list[RefusalListener] = []
+        self._cancel_listeners: list[CancelListener] = []
+        # One browser, one action at a time: a model may send tool calls in parallel,
+        # and two human-paced typing calls would fight over keyboard focus.
+        self._browser_lock = asyncio.Lock()
         self._stack = contextlib.AsyncExitStack()
         self._upstream: Client | None = None
         self._tools: list[types.Tool] = []
@@ -215,6 +221,10 @@ class GuardMCP:
         """Called after a call is refused (errors in the listener are ignored)."""
         self._refusal_listeners.append(listener)
 
+    def add_cancel_listener(self, listener: CancelListener) -> None:
+        """Called when the client cancels a call before it finished."""
+        self._cancel_listeners.append(listener)
+
     def add_local_tool(self, tool: types.Tool, handler: LocalHandler) -> None:
         """Serve ``tool`` from guard-mcp itself (listed alongside the allowlist)."""
         self._local[tool.name] = (tool, handler)
@@ -261,12 +271,19 @@ class GuardMCP:
                 entry["is_error"] = bool(result.is_error)
                 entry["local"] = True
                 return result
-            result = await self._forward(name, args)
+            async with self._browser_lock:
+                result = await self._forward(name, args)
             for observer in self._observers:
                 await observer(name, args, result)
             entry["is_error"] = bool(result.is_error)
             entry["result_chars"] = sum(len(getattr(c, "text", "") or "") for c in result.content)
             return result
+        except asyncio.CancelledError:
+            entry["cancelled"] = True           # the client gave up on this call
+            for listener in self._cancel_listeners:
+                with contextlib.suppress(Exception):
+                    listener(name, args)
+            raise
         except Exception as e:  # upstream crash → a tool error the model can see
             entry["exception"] = f"{type(e).__name__}: {e}"
             return _error(f"tool {name} failed: {type(e).__name__}: {e}")
