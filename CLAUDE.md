@@ -27,6 +27,7 @@ python apply_jobs.py --reset-failed               # Reset applied=-2 jobs back t
 python apply_jobs.py --verbose                    # Save debug screenshots on failures
 python apply_jobs.py --limit 5                    # Process at most 5 jobs this session
 python apply_jobs.py --type SimpleOnsiteApply,ComplexOnsiteApply  # EasyApply only
+python apply_jobs.py --type OffsiteApply --limit 5  # supervised offsite agent: you review + submit each form
 
 # Export to CSV
 python to_csv.py --folder <dest> --database linkedin_jobs.db
@@ -83,7 +84,7 @@ Reads jobs where `scraped=1 AND applied IS NULL` (filtered to remote/Utah). For 
 2. **Playwright browser** logs into LinkedIn and runs `EasyApplyFlow` — LinkedIn's native in-modal multi-step form (`SimpleOnsiteApply`, `ComplexOnsiteApply`).
 3. `jobs.applied` is set to: `1`=applied, `-1`=skipped/irrelevant, `-2`=auto-failed, `-3`=blocked (un-automatable ATS / login wall — needs a human, not in the `--reset-failed` retry pool).
 
-**`OffsiteApply` (external company career sites) automation was removed in full** and is being rebuilt per `docs/NEW_AGENTIC_APPLY_PLAN.md` (Playwright MCP behind a submit-blocking guard, NIM → Claude fallback, human clicks submit; tickets OA1–OA14 in `docs/TICKETS.md`) — the `OffsiteApplyFlow` engine, the opt-in NVIDIA NIM classifier route (`CLASSIFIER_ROUTE=nim`), `nim_client.py`, and the career-site account-registration plumbing (`EmailInbox`, `created_accounts.json` writer) are all gone. `run_session` now passes `application_type == "OffsiteApply"` jobs over with a `"[Offsite apply not yet implemented — skipping]"` message and leaves `jobs.applied` as `NULL` for them — no classification, no DB mutation, so nothing needs `--reset-failed` once a new engine lands. Classification and Easy Apply form-filling both run on the Claude Agent SDK (subscription auth, no per-token cost) via `config.py` `get_llm_config("guided_apply")`.
+**`OffsiteApply` (external company career sites) — supervised offsite agent** (`offsite/`, design `docs/NEW_AGENTIC_APPLY_PLAN.md`, tickets OA1–OA14 in `docs/TICKETS.md`). Only with `--type OffsiteApply` (default runs pass these jobs over, `jobs.applied` stays `NULL`). After the usual title / classifier / blocklist checks, `run_session` hands each job to `offsite.batch.OffsiteBatch` → `offsite.session.run_offsite_job`: a headed Chromium with a persistent profile (`.offsite_browser_profile/`, ATS logins survive), driven through **guard-mcp** (`offsite/guard_mcp.py`: allowlisted Playwright MCP tools, human-paced typing, in-page submit lock + MCP-level submit/Enter/upload guards — the agent can never submit), by NIM `deepseek-v4.1-flash` (OpenAI Agents SDK) with in-place fallback to the Claude Agent SDK (`offsite/controller.py`). The human handles login/registration/CAPTCHA pauses (email recorded, never a password), then reviews the filled page, submits it themselves and answers `[s] submitted [e] fix [r] not interested [b] blocked [l] later`. Jobs whose form/posting says sponsorship is not offered are skipped (`-1`). Per-attempt detail goes to the `offsite_applications` table (`--stats` shows counts). Classification and Easy Apply form-filling run on the Claude Agent SDK (subscription auth, no per-token cost) via `config.py` `get_llm_config("guided_apply")`.
 
 ### SQLite database (`linkedin_jobs.db`)
 

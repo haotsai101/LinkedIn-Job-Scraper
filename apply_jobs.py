@@ -866,6 +866,15 @@ def print_stats(cursor):
         f"\nStats — Pending: {pending or 0}  Applied: {applied or 0}  "
         f"Skipped: {skipped or 0}  Auto-failed: {failed or 0}  Blocked: {blocked or 0}"
     )
+    # OA12: offsite agent attempts, latest per job (table added by migration 003).
+    try:
+        from offsite.store import status_counts
+        counts = status_counts(cursor.connection)
+    except sqlite3.Error:
+        counts = {}
+    if counts:
+        print("Offsite attempts — " + "  ".join(
+            f"{k.replace('_', ' ').title()}: {v}" for k, v in sorted(counts.items())))
 
 
 # ── Browser & LinkedIn login ────────────────────────────────────────────────────
@@ -1024,7 +1033,12 @@ async def run_session(
     gmail_user: str = "",
     gmail_pass: str = "",
     verbose: bool = False,
+    offsite: bool = False,
 ):
+    """``offsite=True`` (``--type`` includes ``OffsiteApply``) routes OffsiteApply
+    jobs through the supervised offsite agent (``offsite.batch``, OA12) after the
+    usual title / classifier / blocklist checks; otherwise they are passed over
+    untouched, as before."""
     # JobAgent classifies via a fresh one-shot Claude Agent SDK session per
     # job. Nothing to close.
     agent = JobAgent(profile)
@@ -1070,7 +1084,7 @@ async def run_session(
     # touching a page, so there is nothing a browser session could do. Skip
     # opening one entirely rather than launching Chromium, logging into
     # LinkedIn, and idling through a batch of no-ops.
-    if jobs and all((row[7] or "") == "OffsiteApply" for row in jobs):
+    if not offsite and jobs and all((row[7] or "") == "OffsiteApply" for row in jobs):
         print(f"\nAll {total} pending job(s) are OffsiteApply — automation for "
               f"that application_type was removed and is pending a "
               f"from-scratch redesign. Nothing to do this session "
@@ -1084,21 +1098,35 @@ async def run_session(
         conn.close()
         return
 
-    print("\nOpening browser and signing into LinkedIn…")
+    # The LinkedIn browser + login is only for EasyApply jobs; an all-offsite
+    # batch (offsite=True) never opens it. Offsite jobs get their own browser
+    # (persistent profile, guard-mcp) from OffsiteBatch, lazily on first use.
+    need_linkedin = any((row[7] or "") != "OffsiteApply" for row in jobs)
+    offsite_batch = None
+    if offsite:
+        from offsite.batch import OffsiteBatch
+        offsite_batch = OffsiteBatch(profile)
+
+    if need_linkedin:
+        print("\nOpening browser and signing into LinkedIn…")
+    else:
+        print("\nOffsite-only batch — no LinkedIn browser needed.")
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=False)
-        context = await browser.new_context(
-            permissions=[],  # deny browser notification/location prompts
-        )
-        page    = await context.new_page()
+        browser = context = page = None
+        if need_linkedin:
+            browser = await p.chromium.launch(headless=False)
+            context = await browser.new_context(
+                permissions=[],  # deny browser notification/location prompts
+            )
+            page    = await context.new_page()
 
-        try:
-            await login_linkedin_playwright(page)
-            print("  Session ready.\n")
-        except Exception as _login_err:
-            await browser.close()
-            raise
+            try:
+                await login_linkedin_playwright(page)
+                print("  Session ready.\n")
+            except Exception as _login_err:
+                await browser.close()
+                raise
 
         if not _check_recent_session_health():
             print("\n  [!] Warning: the last 3 sessions all had >80% error rates.")
@@ -1119,8 +1147,9 @@ async def run_session(
                 # (the staff/principal title skip below, classification, etc.).
                 # No classification, no mark_job: jobs.applied stays NULL so
                 # nothing here needs --reset-failed once the new engine lands.
-                if (application_type or "") == "OffsiteApply":
-                    print("  [Offsite apply not yet implemented — skipping]")
+                is_offsite = (application_type or "") == "OffsiteApply"
+                if is_offsite and not offsite:
+                    print("  [Offsite job — run with --type OffsiteApply to apply — skipping]")
                     continue
 
                 _title_lower = (title or "").lower()
@@ -1187,6 +1216,38 @@ async def run_session(
                     blocked_count += 1
                     print(f"  [~] Application domain blocked ({_blocked_host}) — "
                           f"not attempting (needs a human).")
+                    continue
+
+                # ── OffsiteApply: supervised offsite agent (OA12) ──────────────
+                if is_offsite:
+                    if not application_url:
+                        mark_job(conn, cursor, job_id, -3)
+                        blocked_count += 1
+                        print("  [~] No application URL on record — needs a human.")
+                        continue
+                    from offsite.prompts import JobInfo as _OffsiteJob
+                    out = await offsite_batch.run_job(conn, _OffsiteJob(
+                        job_id, title or "", company_name or "", application_url,
+                        description or "", location or ""))
+                    if out.key == "s":
+                        applied_count += 1
+                        applications.append({
+                            "job_id":     job_id,
+                            "title":      title or "",
+                            "company":    company_name or "",
+                            "url":        application_url,
+                            "applied_at": datetime.now(timezone.utc).isoformat(),
+                            "offsite":    True,
+                            "model":      out.fill.model_used if out.fill else None,
+                        })
+                    elif out.key in ("skip", "r"):
+                        skipped_count += 1
+                    elif out.key == "b":
+                        blocked_count += 1
+                    elif out.key == "l":
+                        deferred_count += 1
+                    else:  # "failed"
+                        error_count += 1
                     continue
 
                 # ── Build callbacks ────────────────────────────────────────────
@@ -1417,9 +1478,12 @@ async def run_session(
                 await asyncio.sleep(2)
 
         finally:
+            if offsite_batch is not None:
+                await offsite_batch.close()
             conn.close()
-            await browser.close()
-            print("  Browser closed.")
+            if browser is not None:
+                await browser.close()
+                print("  Browser closed.")
 
     # ── Session wrap-up ────────────────────────────────────────────────────────
     completed_at = datetime.now(timezone.utc).isoformat()
@@ -1540,6 +1604,12 @@ def main():
         return
 
     max_apply = args.max_apply if args.max_apply is not None else max_auto_env
+    # OA12: OffsiteApply jobs are only attempted when asked for by --type, and are
+    # always supervised (the human reviews and submits) — --auto doesn't change that.
+    offsite = "offsiteapply" in (args.type or "").lower()
+    if offsite:
+        print("OffsiteApply: supervised — you review each filled form and submit it "
+              "yourself (--auto does not apply to offsite jobs).")
 
     print(f"\nFound {total} unreviewed job(s).")
     if args.auto:
@@ -1555,6 +1625,7 @@ def main():
             gmail_user=gmail_user,
             gmail_pass=gmail_pass,
             verbose=args.verbose,
+            offsite=offsite,
         )
     )
 
