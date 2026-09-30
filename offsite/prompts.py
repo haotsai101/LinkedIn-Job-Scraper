@@ -94,6 +94,14 @@ def load_job(conn: sqlite3.Connection, job_id: int) -> JobInfo:
     return JobInfo(*row)
 
 
+def needs_sponsorship(profile: dict[str, Any]) -> bool:
+    """``need_sponsorship`` is yes / true in the profile."""
+    v = profile.get("need_sponsorship")
+    if isinstance(v, bool):
+        return v
+    return str(v or "").strip().lower() in ("yes", "y", "true", "1")
+
+
 # ── system prompt ──────────────────────────────────────────────────────────────
 
 _INSTRUCTIONS = """\
@@ -168,14 +176,29 @@ One entry per form field you filled or deliberately left empty:
 """
 
 
+_SPONSORSHIP_SKIP = """
+## Sponsorship not offered → skip (this applicant needs sponsorship)
+If the application form or the job posting explicitly states that visa
+sponsorship is not available / not offered / not allowed for this role (e.g.
+"we are unable to sponsor", "sponsorship is not allowed for this role",
+"candidates must not require sponsorship now or in the future"), STOP: call
+skip_application with reason "sponsorship_not_offered" and the exact sentence
+as evidence, and do nothing else — do not fill, confirm or acknowledge it.
+A question such as "Will you now or in the future require sponsorship?" is
+NOT such a statement: answer it from need_sponsorship and continue.
+"""
+
+
 def system_prompt(profile: dict[str, Any], job: JobInfo) -> str:
     """Instructions + redacted profile + job. Deterministic for a given input."""
+    skip_rule = _SPONSORSHIP_SKIP if needs_sponsorship(profile) else ""
     profile = redact(profile)
     desc = (job.description or "").strip()
     if len(desc) > MAX_DESCRIPTION_CHARS:
         desc = desc[:MAX_DESCRIPTION_CHARS] + "\n[… description truncated …]"
     return (
         _INSTRUCTIONS
+        + skip_rule
         + "\n## Applicant profile (JSON)\n"
         + json.dumps(profile, indent=2, ensure_ascii=False)
         + f"\n\nResume file to upload: {profile.get('resume_path') or '(none — skip uploads)'}\n"

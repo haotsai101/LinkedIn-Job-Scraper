@@ -297,3 +297,56 @@ def test_live_request_human(lg):
 
     r = mcp(lg, go)
     assert not r.is_error and lg.rc.outcome == "human" and lg.rc.human_reason == "captcha"
+
+
+# ── skip_application (sponsorship not offered) ────────────────────────────────
+
+class _FakeGuard:
+    def __init__(self):
+        self.local = {}
+
+    def add_check(self, *a, **k):
+        pass
+
+    def add_observer(self, *a):
+        pass
+
+    def add_local_tool(self, tool, handler):
+        self.local[tool.name] = handler
+
+
+def test_skip_tool_only_offered_when_applicant_needs_sponsorship():
+    g = _FakeGuard()
+    RunControl(sponsorship_skip=False).install(g)
+    assert "skip_application" not in g.local
+    g = _FakeGuard()
+    RunControl(sponsorship_skip=True).install(g)
+    assert {"report_ready", "request_human", "skip_application"} == set(g.local)
+
+
+def test_skip_application_ends_the_run():
+    rc = RunControl(sponsorship_skip=True)
+    ev = "Please note that sponsorship is not allowed for this role."
+    r = run(rc._skip_application({"reason": "sponsorship_not_offered", "evidence": ev}))
+    assert not r.is_error and rc.outcome == "skip"
+    assert (rc.skip_reason, rc.skip_evidence) == ("sponsorship_not_offered", ev)
+    assert run(rc.check("browser_click", {"target": "e1"})).startswith(STOP_PREFIX)
+    assert "already called skip_application" in run(rc.check("report_ready", {}))
+
+
+@pytest.mark.parametrize("args", [
+    {"reason": "not_a_fit", "evidence": "The salary is too low for this candidate."},
+    {"reason": "sponsorship_not_offered", "evidence": "no"},
+    {"reason": "sponsorship_not_offered"},
+])
+def test_skip_application_rejects_bad_calls(args):
+    rc = RunControl(sponsorship_skip=True)
+    r = run(rc._skip_application(args))
+    assert r.is_error and rc.outcome is None
+
+
+def test_skip_application_refused_when_not_offered():
+    rc = RunControl(sponsorship_skip=False)
+    r = run(rc._skip_application({"reason": "sponsorship_not_offered",
+                                  "evidence": "We are unable to sponsor visas."}))
+    assert r.is_error and rc.outcome is None

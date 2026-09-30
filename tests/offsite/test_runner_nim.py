@@ -106,6 +106,20 @@ def run(**kw):
     return asyncio.run(nim.run("SYSTEM", "TASK", "http://127.0.0.1:1/mcp", cfg=CFG, **kw))
 
 
+def test_nim_requests_retry_three_times_on_timeout(stub, monkeypatch):
+    seen = {}
+    real = nim.openai.AsyncOpenAI
+
+    def capture(**kw):
+        seen.update(kw)
+        return real(**kw)
+
+    monkeypatch.setattr(nim.openai, "AsyncOpenAI", capture)
+    run()
+    assert nim.REQUEST_RETRIES == 3 and seen["max_retries"] == 3
+    assert seen["timeout"] == nim.REQUEST_TIMEOUT
+
+
 def test_finished(stub):
     r = run()
     assert r.status == "finished" and r.final_text == "done"

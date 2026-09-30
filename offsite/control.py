@@ -6,6 +6,10 @@ answer to "how did the model's run end?" — ``outcome``:
 * ``"ready"``  — the model called ``report_ready(answers)`` with valid answers;
 * ``"human"``  — it called ``request_human(reason, detail)`` (login, register,
   captcha, stuck);
+* ``"skip"``   — it called ``skip_application(reason, evidence)``: the form or
+  posting says visa sponsorship is not offered and the applicant needs it
+  (only allowed when ``sponsorship_skip=True``, i.e. the profile needs
+  sponsorship). Terminal: no fallback, no human review — the job is skipped;
 * ``"loop"``   — the same action with the same arguments hit an unchanged page
   twice in a row — read-only calls in between (snapshot, wait, …) don't break
   the streak, and the guard banner is not part of "the page"; read-only tools
@@ -37,8 +41,10 @@ from offsite.schemas import GeneratedAnswer
 BUDGET = 40
 STOP_PREFIX = "STOP: "
 HUMAN_REASONS = ("login", "register", "captcha", "stuck")
+SKIP_REASONS = ("sponsorship_not_offered",)
 
-Outcome = Literal["ready", "human", "loop", "budget"]
+Outcome = Literal["ready", "human", "skip", "loop", "budget"]
+_ENDED_BY = {"ready": "report_ready", "human": "request_human", "skip": "skip_application"}
 
 # Tools that don't change the page: a repeat is less suspicious (waiting,
 # re-reading), so they need one more identical call before it counts as a loop.
@@ -87,6 +93,28 @@ REQUEST_HUMAN = types.Tool(
 )
 
 
+SKIP_APPLICATION = types.Tool(
+    name="skip_application",
+    description=(
+        "Call this ONLY when the application form or the job posting explicitly says visa "
+        "sponsorship is not available / not offered / not allowed for this role (e.g. "
+        "'we are unable to sponsor', 'sponsorship is not allowed for this role') — the "
+        "applicant needs sponsorship, so the application is skipped. A question like 'Will "
+        "you require sponsorship?' is NOT such a statement. Quote the exact sentence in "
+        "`evidence`. After this call, stop; do not fill anything else."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "reason": {"type": "string", "enum": list(SKIP_REASONS)},
+            "evidence": {"type": "string", "minLength": 10},
+        },
+        "required": ["reason", "evidence"],
+        "additionalProperties": False,
+    },
+)
+
+
 def _text_result(text: str, *, error: bool = False) -> types.CallToolResult:
     return types.CallToolResult(content=[types.TextContent(type="text", text=text)],
                                 is_error=error)
@@ -95,8 +123,10 @@ def _text_result(text: str, *, error: bool = False) -> types.CallToolResult:
 class RunControl:
     """Per-application run state on guard-mcp: control tools + budget + loop detection."""
 
-    def __init__(self, *, budget: int = BUDGET) -> None:
+    def __init__(self, *, budget: int = BUDGET, sponsorship_skip: bool = False) -> None:
         self.budget = budget
+        # skip_application is only offered when the applicant needs sponsorship
+        self.sponsorship_skip = sponsorship_skip
         self.model: str | None = None
         self.reset()
 
@@ -111,6 +141,8 @@ class RunControl:
         self.warnings: list[str] = []
         self.human_reason: str | None = None
         self.human_detail: str | None = None
+        self.skip_reason: str | None = None
+        self.skip_evidence: str | None = None
         self._last_action: str | None = None   # last state-changing call (+ page)
         self._last_read: str | None = None     # last read-only call (+ page)
         self._read_repeats = 0
@@ -126,11 +158,13 @@ class RunControl:
         guard.add_observer(self.observe)
         guard.add_local_tool(REPORT_READY, self._report_ready)
         guard.add_local_tool(REQUEST_HUMAN, self._request_human)
+        if self.sponsorship_skip:
+            guard.add_local_tool(SKIP_APPLICATION, self._skip_application)
 
     # ── accounting (pre-call) ─────────────────────────────────────────────────
     async def check(self, name: str, args: dict[str, Any]) -> str | None:
-        if name in (REPORT_READY.name, REQUEST_HUMAN.name):
-            if self.outcome in ("ready", "human"):
+        if name in (REPORT_READY.name, REQUEST_HUMAN.name, SKIP_APPLICATION.name):
+            if self.outcome in _ENDED_BY:
                 return f"you already called {self._ended_by()} — end your turn now"
             return None
         if self.outcome is not None:
@@ -157,11 +191,11 @@ class RunControl:
         return None
 
     def _ended_by(self) -> str:
-        return "report_ready" if self.outcome == "ready" else "request_human"
+        return _ENDED_BY.get(self.outcome or "", "a control tool")
 
     def _stop_text(self) -> str:
         # returned as a guard refusal: "BLOCKED by guard: STOP: …"
-        if self.outcome in ("ready", "human"):
+        if self.outcome in _ENDED_BY:
             return f"{STOP_PREFIX}you already called {self._ended_by()} — end your turn now"
         return (f"{STOP_PREFIX}{self.stop_reason}. End your turn now; if the form is complete, "
                 "call report_ready first.")
@@ -210,3 +244,18 @@ class RunControl:
         self.human_reason, self.human_detail = reason, detail
         self.outcome, self.stop_reason = "human", None
         return _text_result("The human has been asked. Stop now — you will be resumed.")
+
+    async def _skip_application(self, args: dict[str, Any]) -> types.CallToolResult:
+        reason, evidence = args.get("reason"), str(args.get("evidence") or "").strip()
+        if not self.sponsorship_skip:
+            return _text_result("skip_application is not available for this applicant — "
+                                "continue the application", error=True)
+        if reason not in SKIP_REASONS or len(evidence) < 10:
+            return _text_result(
+                f"skip_application rejected — reason must be one of {list(SKIP_REASONS)} and "
+                "evidence must quote the sentence that says sponsorship is not offered",
+                error=True)
+        self.skip_reason, self.skip_evidence = reason, evidence[:500]
+        self.outcome, self.stop_reason = "skip", None
+        return _text_result("Application skipped (sponsorship not offered). Stop now — do not "
+                            "fill or click anything else.")

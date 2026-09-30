@@ -26,6 +26,7 @@ from offsite.prompts import (
     JobInfo,
     load_job,
     load_profile,
+    needs_sponsorship,
     start_message,
     system_prompt,
 )
@@ -37,7 +38,7 @@ async def run_one(model: str, url: str, *, job: JobInfo, profile: dict, headless
     kw = {"headless": headless}
     browser = OffsiteBrowser(profile_dir, **kw) if profile_dir else OffsiteBrowser(**kw)
     async with browser, GuardMCP(browser) as guard:
-        control = RunControl(budget=budget)
+        control = RunControl(budget=budget, sponsorship_skip=needs_sponsorship(profile))
         control.install(guard)
         await SubmitGuard(browser, resume_path=profile.get("resume_path")).install(guard)
         await browser.open(url)
@@ -68,6 +69,8 @@ def _report(res: RunResult, control: RunControl) -> None:
           + (f", {control.stop_reason}" if control.stop_reason else "") + ")")
     if control.outcome == "human":
         print(f"human    : {control.human_reason} — {control.human_detail}")
+    if control.outcome == "skip":
+        print(f"skipped  : {control.skip_reason} — “{control.skip_evidence}”")
     for w in control.warnings:
         print(f"warning  : {w}")
     for a in control.answers:

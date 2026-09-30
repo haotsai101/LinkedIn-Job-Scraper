@@ -82,6 +82,24 @@ ALLOWED_TOOLS: frozenset[str] = frozenset({
 
 BLOCKED_PREFIX = "BLOCKED by guard: "
 
+# Models sometimes copy a ref with its snapshot wrapper: "[ref=e9]" / "ref=e9" → "e9".
+_WRAPPED_REF = re.compile(r"^\s*\[?\s*ref\s*=\s*([a-z0-9]+)\s*\]?\s*$")
+
+
+def normalize_targets(args: dict[str, Any]) -> dict[str, Any]:
+    """Unwrap ``[ref=e9]``-style targets (top level and ``fields[*].target``)."""
+    def fix(v):
+        m = _WRAPPED_REF.match(v) if isinstance(v, str) else None
+        return m.group(1) if m else v
+    out = dict(args)
+    if "target" in out:
+        out["target"] = fix(out["target"])
+    if isinstance(out.get("fields"), list):
+        out["fields"] = [{**f, "target": fix(f.get("target"))} if isinstance(f, dict)
+                         and "target" in f else f for f in out["fields"]]
+    return out
+
+
 _SNAPSHOT_LINK = re.compile(r"- \[Snapshot\]\((/[^)\n]+\.yml)\)")
 
 # A pre-call check returns None to allow the call, or a one-line reason to refuse it.
@@ -219,6 +237,7 @@ class GuardMCP:
     async def call(self, name: str, args: dict[str, Any]) -> types.CallToolResult:
         """Guarded call — what the MCP handler runs. Also usable in-process."""
         self.calls += 1
+        args = normalize_targets(args)
         t0 = time.monotonic()
         entry: dict[str, Any] = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
                                  "source": "guard_mcp", "tool": name, "args": _log_args(args)}

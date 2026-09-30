@@ -11,6 +11,8 @@ to the existing ``LLM_API`` when ``LLM_URL`` points at NIM.
   a navigation, and guard-mcp types a long answer at ~0.2 s per character).
 * The run stops as soon as ``RunControl.outcome`` is set (``stop_when``), so a
   stubborn model doesn't burn turns on ``STOP`` replies.
+* Each NIM request is retried up to **3** times on a timeout (also on 429 /
+  5xx / connection errors) before the run fails.
 * Errors map to ``RunResult(status="error", error=…)``: timeout, HTTP error,
   429, turn limit, and invalid tool calls / output after **one retry** (the
   retry continues on the same page — the page is the state).
@@ -43,7 +45,11 @@ from offsite.runners import RunResult
 DEFAULT_MODEL = "deepseek-ai/deepseek-v4.1-flash"
 DEFAULT_BASE_URL = "https://integrate.api.nvidia.com/v1"
 MAX_TURNS = 60          # > RunControl.BUDGET (40): the guard's budget ends runs first
-REQUEST_TIMEOUT = 90    # seconds per NIM completion request (x2 with the one retry)
+REQUEST_TIMEOUT = 90    # seconds per NIM completion request attempt
+# Owner decision: a timed-out NIM request is retried up to 3 times before the run
+# fails (→ Claude fallback). The OpenAI client applies the same count to 429 / 5xx /
+# connection errors. Worst case per model turn: 4 × 90 s.
+REQUEST_RETRIES = 3
 RUN_TIMEOUT = 30 * 60   # whole run (human-paced typing makes long forms take 10+ min)
 
 set_tracing_disabled(True)
@@ -141,7 +147,7 @@ async def run(
     t0 = time.monotonic()
     hooks = _Hooks(stop_when, cfg.model)
     client = openai.AsyncOpenAI(base_url=cfg.base_url, api_key=cfg.api_key,
-                                timeout=REQUEST_TIMEOUT, max_retries=1)
+                                timeout=REQUEST_TIMEOUT, max_retries=REQUEST_RETRIES)
     model = OpenAIChatCompletionsModel(model=cfg.model, openai_client=client)
     label = f"nim:{cfg.model}"
 

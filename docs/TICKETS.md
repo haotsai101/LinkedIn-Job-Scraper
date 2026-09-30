@@ -371,19 +371,68 @@ OFFSITE_LIVE=1 pytest tests/offsite/test_runner_nim.py -k live   # real NIM, ~2�
 
 **Depends on** OA7. Parallel with OA8.
 
-**Build.** `offsite/runners/claude.py`:
-- `claude_agent_sdk` with `mcp_servers={"guard": {"type": "http", "url": ...}}`,
-  `allowed_tools=["mcp__guard__*"]`, all built-in tools disallowed; model from
-  `config.get_llm_config`.
-- Same `run(prompt) -> RunResult` contract as OA8.
+**Build.** `offsite/runners/claude.py` — same `run(system, task, guard_url,
+stop_when=…) -> RunResult` contract as OA8:
+- `claude_agent_sdk.query` with `mcp_servers={"guard": {"type": "http", …}}`.
+- **Locked to guard-mcp**: `tools=[]` (no built-ins) + `disallowed_tools`
+  (Bash, Read, Write, Edit, WebFetch, WebSearch, Task, …) +
+  `strict_mcp_config=True` (none of the user's MCP servers) +
+  `setting_sources=[]` (no settings / CLAUDE.md) + `permission_mode="dontAsk"`
+  with `allowed_tools=["mcp__guard"]`.
+- `MCP_TOOL_TIMEOUT` 300 s (human-paced typing); stops as soon as
+  `RunControl.outcome` is set; error results (turn limit, 429, execution
+  errors), stream exceptions and the 30 min run cap → `status="error"`.
+- Model: `guided_apply` (`claude-sonnet-5`), `OFFSITE_CLAUDE_MODEL` overrides.
+- Every run logs `non_guard_tools` to `llm_debug.jsonl` (`claude_runner`) —
+  must always be `[]`.
+- guard-mcp now unwraps `[ref=e9]` / `ref=e9` targets (Claude sometimes copies
+  the snapshot wrapper; the rejected click then tripped the loop detector).
 
 **Acceptance.** Same as OA8, with `--model claude`; the SDK cannot use Bash /
 Read / Write / WebFetch (verified in the tool-use log).
 
+**Result (2026-09-29).** `multipage.html`: ready, 15 calls, 1.8 min.
+`greenhouse.html`: ready, 31 calls, 2.6 min, 32 answers. `ashby.html`: ready,
+40 calls, 4.3 min, 20 answers (resume reported unfilled — the recording's
+upload widget is dead). `non_guard_tools` = [] in every run; 0 submissions.
+Claude finishes the recorded forms NIM stalled on, 3–5× faster.
+
 **How to test.**
 ```bash
+python -m tests.fixtures.offsite.serve &
 python -m offsite.run_agent --model claude --url http://127.0.0.1:8811/multipage.html
-pytest tests/offsite/test_runner_claude.py
+python -m offsite.run_agent --model claude --url http://127.0.0.1:8811/greenhouse.html
+pytest tests/offsite/test_runner_claude.py                          # stubbed
+OFFSITE_LIVE=1 pytest tests/offsite/test_runner_claude.py -k live   # real, ~2 min
+grep claude_runner llm_debug.jsonl | tail -3                        # non_guard_tools: []
+```
+
+### OA9b — Skip when sponsorship is not offered; NIM retries ✅ (owner decisions 2026-09-29)
+
+**Build.**
+- `RunControl(sponsorship_skip=needs_sponsorship(profile))` adds a
+  `skip_application(reason="sponsorship_not_offered", evidence)` control tool
+  (only for an applicant who needs sponsorship; the one reason is the only one
+  accepted). Outcome `skip` is terminal: no fallback, no human review → OA11
+  records `jobs.applied = -1`, status `SKIPPED`, with the quoted evidence.
+- `system_prompt` adds the rule (only when the profile needs sponsorship): an
+  explicit "sponsorship is not available / offered / allowed" on the form or
+  posting → `skip_application`; a "Will you require sponsorship?" question is
+  not such a statement.
+- NIM runner: each request retried up to **3** times on a timeout
+  (`REQUEST_RETRIES`; the OpenAI client applies it to 429 / 5xx too). Worst
+  case per turn 4 × 90 s.
+
+**Result (live, Claude).** `greenhouse.html` ("Please note that sponsorship
+is not allowed for this role.") → `skip` in 1 tool call / 7 s, evidence
+quoted. `multipage.html` / `ashby.html` (sponsorship *question* only) → not
+skipped. 0 submissions.
+
+**How to test.**
+```bash
+python -m offsite.run_agent --model claude --url http://127.0.0.1:8811/greenhouse.html
+#  → "outcome : skip", "skipped : sponsorship_not_offered — “Please note that sponsorship …”"
+pytest tests/offsite/test_control.py tests/offsite/test_prompts.py tests/offsite/test_runner_nim.py
 ```
 
 ### OA10 — Fallback controller
@@ -397,6 +446,7 @@ FillResult(outcome, answers, model_used, fallback_reason, tool_calls)`:
 - On `human` → return to the caller (OA11 pauses, then calls
   `resume(job, human_action)` which re-runs the *same* model with a note).
 - Claude also fails → `outcome="needs_human"`.
+- `skip` (OA9b) is terminal like `ready`: no fallback.
 - CLI flag for testing: `--force-fallback-after N` (RunControl budget = N for
   the NIM run).
 
@@ -434,6 +484,8 @@ python -m offsite.run_agent --model auto --force-fallback-after 8 \
   re-locks, re-runs the controller with a fix note, reviews again.
 - Writes per the table in design §3 (`jobs.applied`, `applied_at`,
   `offsite_applications`), scraping confirmation text on `s`.
+- `outcome == skip` (OA9b) → no review: `jobs.applied = -1`, attempt
+  `SKIPPED` with `error` = the quoted evidence; print one line and move on.
 - CLI: `python -m offsite.session --url <url>` (no DB job) and
   `--job-id N` (real job; DB writes on a copy unless `--db`).
 

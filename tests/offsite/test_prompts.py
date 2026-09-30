@@ -162,3 +162,19 @@ def test_cli_prints_both_parts(tmp_path, capsys):
                          "--kind", "handoff"]) == 0
     out = capsys.readouterr().out
     assert "SYSTEM PROMPT" in out and "TASK MESSAGE (handoff)" in out and "hunter2" not in out
+
+
+@pytest.mark.parametrize("value,expected", [
+    ("yes", True), ("Yes", True), (True, True), ("y", True),
+    ("no", False), (False, False), ("", False), (None, False)])
+def test_needs_sponsorship(value, expected):
+    from offsite.prompts import needs_sponsorship
+    assert needs_sponsorship({"need_sponsorship": value}) is expected
+
+
+def test_sponsorship_skip_rule_only_when_applicant_needs_it():
+    yes = " ".join(system_prompt(PROFILE, JOB).split())
+    assert "call skip_application" in yes and "sponsorship_not_offered" in yes
+    assert "is NOT such a statement" in yes
+    no = system_prompt({**PROFILE, "need_sponsorship": "no"}, JOB)
+    assert "skip_application" not in no
