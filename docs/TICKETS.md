@@ -371,19 +371,40 @@ OFFSITE_LIVE=1 pytest tests/offsite/test_runner_nim.py -k live   # real NIM, ~2�
 
 **Depends on** OA7. Parallel with OA8.
 
-**Build.** `offsite/runners/claude.py`:
-- `claude_agent_sdk` with `mcp_servers={"guard": {"type": "http", "url": ...}}`,
-  `allowed_tools=["mcp__guard__*"]`, all built-in tools disallowed; model from
-  `config.get_llm_config`.
-- Same `run(prompt) -> RunResult` contract as OA8.
+**Build.** `offsite/runners/claude.py` — same `run(system, task, guard_url,
+stop_when=…) -> RunResult` contract as OA8:
+- `claude_agent_sdk.query` with `mcp_servers={"guard": {"type": "http", …}}`.
+- **Locked to guard-mcp**: `tools=[]` (no built-ins) + `disallowed_tools`
+  (Bash, Read, Write, Edit, WebFetch, WebSearch, Task, …) +
+  `strict_mcp_config=True` (none of the user's MCP servers) +
+  `setting_sources=[]` (no settings / CLAUDE.md) + `permission_mode="dontAsk"`
+  with `allowed_tools=["mcp__guard"]`.
+- `MCP_TOOL_TIMEOUT` 300 s (human-paced typing); stops as soon as
+  `RunControl.outcome` is set; error results (turn limit, 429, execution
+  errors), stream exceptions and the 30 min run cap → `status="error"`.
+- Model: `guided_apply` (`claude-sonnet-5`), `OFFSITE_CLAUDE_MODEL` overrides.
+- Every run logs `non_guard_tools` to `llm_debug.jsonl` (`claude_runner`) —
+  must always be `[]`.
+- guard-mcp now unwraps `[ref=e9]` / `ref=e9` targets (Claude sometimes copies
+  the snapshot wrapper; the rejected click then tripped the loop detector).
 
 **Acceptance.** Same as OA8, with `--model claude`; the SDK cannot use Bash /
 Read / Write / WebFetch (verified in the tool-use log).
 
+**Result (2026-09-29).** `multipage.html`: ready, 15 calls, 1.8 min.
+`greenhouse.html`: ready, 31 calls, 2.6 min, 32 answers. `ashby.html`: ready,
+40 calls, 4.3 min, 20 answers (resume reported unfilled — the recording's
+upload widget is dead). `non_guard_tools` = [] in every run; 0 submissions.
+Claude finishes the recorded forms NIM stalled on, 3–5× faster.
+
 **How to test.**
 ```bash
+python -m tests.fixtures.offsite.serve &
 python -m offsite.run_agent --model claude --url http://127.0.0.1:8811/multipage.html
-pytest tests/offsite/test_runner_claude.py
+python -m offsite.run_agent --model claude --url http://127.0.0.1:8811/greenhouse.html
+pytest tests/offsite/test_runner_claude.py                          # stubbed
+OFFSITE_LIVE=1 pytest tests/offsite/test_runner_claude.py -k live   # real, ~2 min
+grep claude_runner llm_debug.jsonl | tail -3                        # non_guard_tools: []
 ```
 
 ### OA10 — Fallback controller

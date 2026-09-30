@@ -123,3 +123,30 @@ def test_every_call_is_logged(live_guard, monkeypatch):
     assert logged[0]["source"] == "guard_mcp" and not logged[0]["is_error"]
     assert logged[0]["result_chars"] > 0
     assert "not available" in logged[1]["blocked"]
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ({"target": "[ref=e9]"}, {"target": "e9"}),
+    ({"target": "ref=f1e26"}, {"target": "f1e26"}),
+    ({"target": " [ ref = e3 ] "}, {"target": "e3"}),
+    ({"target": "e9"}, {"target": "e9"}),
+    ({"target": "#submit"}, {"target": "#submit"}),
+    ({"target": "getByRole('button', { name: 'Next' })"},
+     {"target": "getByRole('button', { name: 'Next' })"}),
+    ({"fields": [{"target": "[ref=e1]", "name": "a"}, {"name": "b"}]},
+     {"fields": [{"target": "e1", "name": "a"}, {"name": "b"}]}),
+])
+def test_wrapped_refs_are_unwrapped(raw, expected):
+    assert guard_mcp.normalize_targets(raw) == expected
+
+
+def test_wrapped_ref_works_over_http(live_guard):
+    live_guard.open("multipage.html")
+
+    async def go(c):
+        snap = _text(await c.call_tool("browser_snapshot", {}))
+        ref = _ref(snap, "button", "Next")
+        return await c.call_tool("browser_click", {"element": "Next", "target": f"[ref={ref}]"})
+
+    r = live_guard.run(_remote(live_guard, go))
+    assert not r.is_error and "Please fix" in _text(r)
