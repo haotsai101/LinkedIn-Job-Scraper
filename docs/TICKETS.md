@@ -498,37 +498,44 @@ OFFSITE_LIVE=1 pytest tests/offsite/test_controller.py -k live   # real NIM → 
 
 **Depends on** OA1, OA10.
 
-**Build.** `offsite/session.py`: `run_offsite_job(job_row, browser, guard, conn)`:
-- `store.start_attempt`, `submit_guard.lock()`, open `application_url`.
-- `outcome == human` → terminal: `"⏸ <reason> on <host> — do it in the browser, then press Enter"`;
-  for login/register, prompt for the account email (optional, Enter to skip);
-  record `account_email` / `account_host` (**never a password**); resume.
-- `outcome == ready` or `needs_human` → review:
-  ```
-  ⚠ Check: sponsorship (profile: Yes/OPT) · salary · 1 low-confidence field: "Why Teradata?"
-  Review the page in the browser. Submit it yourself if it looks right.
-  [s] I submitted  [e] fix a field  [r] not interested  [b] blocked  [l] later
-  ```
-  `submit_guard.unlock()` before the prompt. `e` asks "which field / what change",
-  re-locks, re-runs the controller with a fix note, reviews again.
-- Writes per the table in design §3 (`jobs.applied`, `applied_at`,
-  `offsite_applications`), scraping confirmation text on `s`.
-- `outcome == skip` (OA9b) → no review: `jobs.applied = -1`, attempt
-  `SKIPPED` with `error` = the quoted evidence; print one line and move on.
-- CLI: `python -m offsite.session --url <url>` (no DB job) and
-  `--job-id N` (real job; DB writes on a copy unless `--db`).
+**Build.** `offsite/session.py` — `run_offsite_job(job, conn, browser,
+submit_guard, controller, ask, say)`:
+- `store.start_attempt`, `submit_guard.lock()`, open `application_url`,
+  `controller.fill()` (NIM → Claude, OA10).
+- `human` → terminal pause (`⏸ login on <host>: …`); for login/register it asks
+  for the account **email** (optional; recorded as `account_email` /
+  `account_host`, **never a password**); then `[Enter/c] continue` →
+  `controller.resume()`, or `[b]` / `[l]` / `[r]` to stop there.
+- `skip` (OA9b) → no review: `jobs.applied = -1`, attempt `SKIPPED`, `error` =
+  the quoted evidence.
+- `ready` / `needs_human` → review: `⚠ Check:` one line of sensitive /
+  low-confidence answers (+ warnings), `submit_guard.unlock()`, then
+  `[s] I submitted  [e] fix a field  [r] not interested  [b] blocked  [l] later`.
+  `e` asks "which field, what change", **re-locks**, `controller.fix()`,
+  reviews again. After any key the page is locked again.
+- `s` reads the page: no confirmation-looking text ("thank you", "received",
+  "submitted", …) → "Did you really submit it? [y/n]". Stores the first 500
+  chars as `confirmation`, `submitted_at`.
+- DB writes per design §3 (`jobs.applied` + `applied_at` like
+  `apply_jobs.mark_job`); any exception → `jobs.applied = -2`, `FAILED` with the
+  error — one job never takes the session down.
+- CLI: `python -m offsite.session --url <url>` (no DB) or `--job-id N`
+  (writes to a temp copy of the DB unless `--db PATH`), `--model auto|nim|claude`.
 
 **Acceptance.** Every key produces exactly the documented DB state; the page
 is unlocked only during review.
 
 **How to test.**
 ```bash
-pytest tests/offsite/test_session.py      # each key → DB state, lock/unlock order
+pytest tests/offsite/test_session.py      # every key → DB state, pauses, skip, lock order
+python -m tests.fixtures.offsite.serve &
 python -m offsite.session --url http://127.0.0.1:8811/multipage.html
-#  press s after clicking submit yourself → /__submissions == 1, attempt SUBMITTED
-cp linkedin_jobs.db /tmp/oa11.db
-python -m offsite.session --job-id 4463107277 --db /tmp/oa11.db   # the pending Greenhouse job
-#  press l → jobs.applied still NULL; offsite_applications row DEFERRED
+#  when asked, click Submit Application yourself, then press s
+#  → "Recorded as applied."; curl …/__submissions → 1
+python -m offsite.session --job-id 4463107277 --url http://127.0.0.1:8811/multipage.html
+#  press l → prints the temp DB path; jobs.applied stays NULL, attempt DEFERRED
+python -m offsite.session --model claude --url http://127.0.0.1:8811/greenhouse.html
+#  → "⏭ skipped — sponsorship_not_offered: …"
 ```
 
 ### OA12 — `apply_jobs.py --type OffsiteApply` routing
