@@ -407,6 +407,34 @@ OFFSITE_LIVE=1 pytest tests/offsite/test_runner_claude.py -k live   # real, ~2 m
 grep claude_runner llm_debug.jsonl | tail -3                        # non_guard_tools: []
 ```
 
+### OA9b — Skip when sponsorship is not offered; NIM retries ✅ (owner decisions 2026-09-29)
+
+**Build.**
+- `RunControl(sponsorship_skip=needs_sponsorship(profile))` adds a
+  `skip_application(reason="sponsorship_not_offered", evidence)` control tool
+  (only for an applicant who needs sponsorship; the one reason is the only one
+  accepted). Outcome `skip` is terminal: no fallback, no human review → OA11
+  records `jobs.applied = -1`, status `SKIPPED`, with the quoted evidence.
+- `system_prompt` adds the rule (only when the profile needs sponsorship): an
+  explicit "sponsorship is not available / offered / allowed" on the form or
+  posting → `skip_application`; a "Will you require sponsorship?" question is
+  not such a statement.
+- NIM runner: each request retried up to **3** times on a timeout
+  (`REQUEST_RETRIES`; the OpenAI client applies it to 429 / 5xx too). Worst
+  case per turn 4 × 90 s.
+
+**Result (live, Claude).** `greenhouse.html` ("Please note that sponsorship
+is not allowed for this role.") → `skip` in 1 tool call / 7 s, evidence
+quoted. `multipage.html` / `ashby.html` (sponsorship *question* only) → not
+skipped. 0 submissions.
+
+**How to test.**
+```bash
+python -m offsite.run_agent --model claude --url http://127.0.0.1:8811/greenhouse.html
+#  → "outcome : skip", "skipped : sponsorship_not_offered — “Please note that sponsorship …”"
+pytest tests/offsite/test_control.py tests/offsite/test_prompts.py tests/offsite/test_runner_nim.py
+```
+
 ### OA10 — Fallback controller
 
 **Depends on** OA8, OA9.
@@ -418,6 +446,7 @@ FillResult(outcome, answers, model_used, fallback_reason, tool_calls)`:
 - On `human` → return to the caller (OA11 pauses, then calls
   `resume(job, human_action)` which re-runs the *same* model with a note).
 - Claude also fails → `outcome="needs_human"`.
+- `skip` (OA9b) is terminal like `ready`: no fallback.
 - CLI flag for testing: `--force-fallback-after N` (RunControl budget = N for
   the NIM run).
 
@@ -455,6 +484,8 @@ python -m offsite.run_agent --model auto --force-fallback-after 8 \
   re-locks, re-runs the controller with a fix note, reviews again.
 - Writes per the table in design §3 (`jobs.applied`, `applied_at`,
   `offsite_applications`), scraping confirmation text on `s`.
+- `outcome == skip` (OA9b) → no review: `jobs.applied = -1`, attempt
+  `SKIPPED` with `error` = the quoted evidence; print one line and move on.
 - CLI: `python -m offsite.session --url <url>` (no DB job) and
   `--job-id N` (real job; DB writes on a copy unless `--db`).
 

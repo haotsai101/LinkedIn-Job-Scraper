@@ -20,8 +20,9 @@ REJECTED = "REJECTED"
 BLOCKED = "BLOCKED"
 DEFERRED = "DEFERRED"
 FAILED = "FAILED"
+SKIPPED = "SKIPPED"   # agent skipped it: the form/posting says sponsorship is not offered
 STATUSES = frozenset(
-    {PREPARING, READY_FOR_REVIEW, SUBMITTED, REJECTED, BLOCKED, DEFERRED, FAILED}
+    {PREPARING, READY_FOR_REVIEW, SUBMITTED, REJECTED, BLOCKED, DEFERRED, FAILED, SKIPPED}
 )
 
 # Columns update_attempt may set. id / job_id / created_at are fixed at insert.
