@@ -3,7 +3,8 @@
 Covers ``answer_store`` (normalization, record/lookup, write precedence,
 what is and isn't served), the ``linkedin_apply._resolve_field_value``
 lookup order (store -> profile rules -> LLM, LLM answer written back), and
-migration 004. No network, no browser, no real LLM — ``_ask_llm`` is faked.
+migration 004. No network, no browser, no real LLM — ``_ask_llm`` / ``llm.query_json``
+are faked.
 """
 from __future__ import annotations
 
@@ -156,7 +157,7 @@ def fake_llm(monkeypatch):
 
     async def _fake(model, profile, field):
         calls.append(field.get("label"))
-        return "Blue"
+        return linkedin_apply.FieldAnswer("Blue", True)
 
     monkeypatch.setattr(linkedin_apply, "_ask_llm", _fake)
     return calls
@@ -188,11 +189,28 @@ def test_manual_db_answer_overrides_profile_rule(store, fake_llm):
     assert _run(resolve(store, PROFILE, field, "m")) == ("override@example.com", "db")
 
 
-def test_job_specific_llm_answer_is_not_reused(store, fake_llm):
+def test_job_specific_question_is_vetoed_even_if_model_says_store(store, fake_llm):
+    # fake_llm answers store=True; the company-name backstop must still refuse.
     field = {"label": "Why do you want to work at Acme?", "kind": "textarea", "options": []}
     _run(linkedin_apply._resolve_field_value(store, PROFILE, field, "m", company="Acme"))
     _run(linkedin_apply._resolve_field_value(store, PROFILE, field, "m", company="Acme"))
-    assert len(fake_llm) == 2
+    assert len(fake_llm) == 2 and store.list_answers() == []
+
+
+def test_model_decides_not_to_store(store, monkeypatch):
+    calls = []
+
+    async def _no_store(model, profile, field):
+        calls.append(1)
+        return linkedin_apply.FieldAnswer("Neovim", False)
+
+    monkeypatch.setattr(linkedin_apply, "_ask_llm", _no_store)
+    field = {"label": "Which text editor do you prefer?", "kind": "text", "options": []}
+    resolve = linkedin_apply._resolve_field_value
+    assert _run(resolve(store, PROFILE, field, "m")) == ("Neovim", "llm")
+    assert _run(resolve(store, PROFILE, field, "m")) == ("Neovim", "llm")
+    assert len(calls) == 2           # asked again — never remembered
+    assert store.list_answers() == []  # and not stored at all
 
 
 def test_store_none_matches_pre_ea1_behaviour(fake_llm):
@@ -204,11 +222,60 @@ def test_store_none_matches_pre_ea1_behaviour(fake_llm):
 
 def test_no_answer_returns_none(store, monkeypatch):
     async def _empty(model, profile, field):
-        return None
+        return linkedin_apply._NO_ANSWER
     monkeypatch.setattr(linkedin_apply, "_ask_llm", _empty)
     field = {"label": "Zzz unknowable?", "kind": "text", "options": []}
     assert _run(linkedin_apply._resolve_field_value(store, PROFILE, field, "m")) == (None, None)
     assert store.list_answers() == []
+
+
+# ── _ask_llm: structured answer + the model's store decision ─────────────────
+
+def _fake_query_json(monkeypatch, payload=None, exc=None):
+    seen = {}
+
+    async def _q(prompt, schema, *, model, **kw):
+        seen["prompt"], seen["schema"] = prompt, schema
+        if exc:
+            raise exc
+        return payload
+
+    monkeypatch.setattr(linkedin_apply.llm, "query_json", _q)
+    monkeypatch.setattr(linkedin_apply, "_write_llm_log", lambda *a, **k: None)
+    return seen
+
+
+def test_ask_llm_returns_answer_and_store_flag(monkeypatch):
+    seen = _fake_query_json(monkeypatch, {"answer": "Yes", "store": True})
+    field = {"label": "Are you authorized to work in the US?", "kind": "radio",
+             "options": ["Yes", "No"]}
+    res = _run(linkedin_apply._ask_llm("m", PROFILE, field))
+    assert res == ("Yes", True)
+    assert set(seen["schema"]["required"]) == {"answer", "store"}
+    assert "\"store\"" in seen["prompt"]  # the model is told how to decide
+
+
+def test_ask_llm_store_must_be_literally_true(monkeypatch):
+    _fake_query_json(monkeypatch, {"answer": "Yes", "store": "yes"})
+    field = {"label": "Anything?", "kind": "text", "options": []}
+    assert _run(linkedin_apply._ask_llm("m", PROFILE, field)).store is False
+
+
+def test_ask_llm_still_coerces_numeric_answers(monkeypatch):
+    _fake_query_json(monkeypatch, {"answer": "About 6 years", "store": True})
+    field = {"label": "How many years of Rust experience do you have?", "kind": "text",
+             "options": []}
+    assert _run(linkedin_apply._ask_llm("m", PROFILE, field)).answer == "6"
+
+
+def test_ask_llm_empty_or_failed_gives_no_answer(monkeypatch):
+    field = {"label": "Anything?", "kind": "text", "options": []}
+    _fake_query_json(monkeypatch, {"answer": "  ", "store": True})
+    assert _run(linkedin_apply._ask_llm("m", PROFILE, field)) == (None, False)
+    _fake_query_json(monkeypatch, exc=RuntimeError("boom"))
+    assert _run(linkedin_apply._ask_llm("m", PROFILE, field)) == (None, False)
+    no_label = {"label": "", "kind": "text"}
+    assert _run(linkedin_apply._ask_llm("m", PROFILE, no_label)) == (None, False)
 
 
 # ── migration 004 ─────────────────────────────────────────────────────────────
@@ -235,3 +302,12 @@ def test_migration_004_creates_table_and_is_idempotent(tmp_path):
     conn.close()
     assert {"question_key", "kind_group", "options_key", "answer", "source",
             "job_specific", "uses"} <= cols
+
+
+# ── resume-picker radios are never treated as questions ───────────────────────
+
+def test_resume_picker_choice_is_detected():
+    assert linkedin_apply._is_resume_choice("Resume-Zhi-Hao-Tsai.pdf", [])
+    assert linkedin_apply._is_resume_choice("resume", ["CV_2026.docx", "old.pdf"])
+    assert not linkedin_apply._is_resume_choice("Are you authorized to work?", ["Yes", "No"])
+    assert not linkedin_apply._is_resume_choice("", None)
