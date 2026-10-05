@@ -59,6 +59,7 @@ from playwright.async_api import async_playwright
 
 import config
 import llm
+from answer_store import AnswerStore
 from common import prune_debug_screenshots, rotate_llm_log
 from common import write_llm_log as _write_llm_log
 from linkedin_apply import (
@@ -1028,6 +1029,7 @@ async def run_session(
     # JobAgent classifies via a fresh one-shot Claude Agent SDK session per
     # job. Nothing to close.
     agent = JobAgent(profile)
+    answer_store = AnswerStore(conn)  # EA1: known Easy Apply questions (form_answers)
     # Consecutive classification failures — a transient blip leaves one job
     # pending and moves on; a run of them means something systemic, so bail.
     classify_fail_streak = 0
@@ -1238,6 +1240,7 @@ async def run_session(
                     auto_mode=auto_mode,
                     callbacks=callbacks,
                     verbose=verbose,
+                    answer_store=answer_store,
                 )
                 flow._verbose_company = company_name or "unknown"
 
@@ -1463,6 +1466,8 @@ def main():
     parser.add_argument("--setup",     action="store_true",   help="Re-run profile setup interview.")
     parser.add_argument("--accounts",  metavar="QUERY",       help="Search saved career-site accounts and exit.")
     parser.add_argument("--type",         metavar="TYPE",   help="Filter by application_type (e.g. SimpleOnsiteApply,ComplexOnsiteApply).")
+    parser.add_argument("--answers",      action="store_true", help="List the stored Easy Apply question/answer pairs (form_answers) and exit.")
+    parser.add_argument("--forget-answer", type=int, metavar="ID", help="Delete one stored answer by id (see --answers) so it is re-asked next time, and exit.")
     parser.add_argument("--reset-failed", action="store_true", help="Reset all auto-failed jobs (applied=-2) back to pending (NULL) and exit.")
     parser.add_argument("--verbose",      action="store_true", help="Print full LLM prompt/response and save screenshots per step.")
     args = parser.parse_args()
@@ -1479,6 +1484,19 @@ def main():
 
     if args.stats:
         print_stats(cursor)
+        conn.close()
+        return
+
+    if args.answers or args.forget_answer is not None:
+        store = AnswerStore(conn)
+        if args.forget_answer is not None:
+            ok = store.forget(args.forget_answer)
+            print(f"Forgot answer #{args.forget_answer}." if ok else f"No stored answer #{args.forget_answer}.")
+        else:
+            rows = store.list_answers()
+            print(f"{len(rows)} stored answer(s)  [id | source | kind | job-specific | uses | question -> answer]")
+            for rid, src, kg, js, uses, q, ans in rows:
+                print(f"  #{rid:<4} {src:<7} {kg:<8} {'job' if js else '   '} x{uses:<3} {q[:70]!r} -> {ans[:50]!r}")
         conn.close()
         return
 

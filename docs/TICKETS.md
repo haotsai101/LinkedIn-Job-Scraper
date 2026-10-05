@@ -599,6 +599,34 @@ This decides the order of Phase 2 adapters.
 
 ---
 
+## Easy Apply track
+
+### EA1 — Easy Apply answer store (known questions in the DB)
+
+**Do.** Replace the stateless "profile rules, else one-shot LLM" fill with a
+persistent store (`answer_store.py`, table `form_answers`, migration 004).
+Lookup order in `EasyApplyFlow._fill_current_step` (via
+`linkedin_apply._resolve_field_value`): store (`manual`/`llm` rows) → profile
+rules → Agent SDK, whose answer is written back so a question is only ever asked
+once. Profile-rule answers are recorded but re-resolved each time (never stale
+after a profile edit). Job-specific questions ("Why do you want to work at X?")
+are saved but never reused. Admin: `apply_jobs.py --answers`,
+`--forget-answer ID`; edit an answer by hand with `source='manual'` to override
+everything.
+
+**How to test.**
+1. `./scripts/check.sh` is green.
+2. `python apply_jobs.py --answers` → `0 stored answer(s)` (table auto-created,
+   one DB backup written).
+3. `python apply_jobs.py --auto --type SimpleOnsiteApply,ComplexOnsiteApply --limit 3`
+   → new questions log `(llm)`; `--answers` now lists them.
+4. Re-run on similar jobs → the same questions log `(db)` and no LLM call is made
+   for them (check `llm_log` has no `field_fill` entry for those labels).
+5. `sqlite3 linkedin_jobs.db "update form_answers set answer='...', source='manual' where id=N"`
+   → next run uses your answer.
+
+---
+
 ## Phase 2 backlog (not started)
 
 - **P2-1** Greenhouse adapter: fields from

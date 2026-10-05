@@ -27,6 +27,7 @@ except ImportError:  # pragma: no cover
 
 import config
 import llm
+from answer_store import AnswerStore, is_job_specific
 # Shared stdlib-only helper (ticket T4). ``_write_llm_log`` keeps its old private
 # name as a thin alias so the ~6 internal call sites are untouched.
 from common import write_llm_log as _write_llm_log
@@ -1735,6 +1736,47 @@ async def _ask_llm(model: str, profile: dict, field: dict) -> str | None:
         return None
 
 
+async def _resolve_field_value(
+    store: AnswerStore | None, profile: dict, field: dict, model: str, company: str = "",
+) -> tuple[str | None, str | None]:
+    """Decide what to put in one form field. Returns ``(value, source)``.
+
+    EA1 lookup order: the answer store (``manual`` / ``llm`` rows) → the
+    deterministic profile rules → the Agent SDK. ``source`` is ``"db"``,
+    ``"profile"``, ``"llm"`` or ``None`` (no answer). Profile-rule answers are
+    recorded in the store but always re-resolved, never served from it; fresh
+    LLM answers are written back so the question is only ever asked once.
+    ``store=None`` reproduces the pre-EA1 behaviour exactly (no persistence).
+    """
+    label = field.get("label", "") or field.get("name", "") or field.get("id", "")
+    kind = field.get("kind", "text")
+    options = field.get("options", [])
+
+    if store is not None and label:
+        hit = store.lookup(label, kind, options)
+        if hit:
+            return hit, "db"
+
+    value = _get_profile_value(profile, field.get("label", ""), kind)
+    # A rule value that matches no available select option is discarded so the
+    # LLM can decide — prevents numeric years ("4") being used for Yes/No selects.
+    if value is not None and kind in ("select", "select-one", "select-multiple") and options:
+        if value.lower() not in [o.lower() for o in options]:
+            value = None
+    if value is not None:
+        if store is not None and label:
+            store.record(label, kind, options, value, "profile")
+        return value, "profile"
+
+    value = await _ask_llm(model, profile, field)
+    if value:
+        if store is not None and label:
+            store.record(label, kind, options, value, "llm",
+                         job_specific=is_job_specific(label, kind, company))
+        return value, "llm"
+    return None, None
+
+
 async def _fill_field(page: Page, field: dict, value: str):
     """Fill a single form field. Non-fatal on error."""
     kind = field.get("kind", "text")
@@ -2010,9 +2052,12 @@ class EasyApplyFlow:
         callbacks: dict,
         model: str = "",
         verbose: bool = False,
+        answer_store: AnswerStore | None = None,
     ):
         self.page = page
         self.profile = profile
+        # EA1: persistent Q&A store (None = pre-EA1 behaviour, nothing persisted).
+        self.answer_store = answer_store
         # Browser-agent LLM: the Claude Agent SDK on subscription auth (T14b).
         # Every LLM call here is a one-shot ``llm.query`` on this model.
         self.model = model or config.get_llm_config("guided_apply").model
@@ -2393,19 +2438,11 @@ class EasyApplyFlow:
                     pass  # fall through to re-fill
                 else:
                     continue
-            value = _get_profile_value(self.profile, label, kind)
-            # If _get_profile_value returned a value that doesn't match any available select option,
-            # discard it and let the LLM decide — prevents numeric years ("4") being used for Yes/No selects.
-            if value is not None and kind in ("select", "select-one", "select-multiple"):
-                field_opts = field.get("options", [])
-                if field_opts:
-                    opts_lower = [o.lower() for o in field_opts]
-                    if value.lower() not in opts_lower:
-                        value = None
-            if value is None:
-                value = await _ask_llm(self.model, self.profile, field)
+            value, source = await _resolve_field_value(
+                self.answer_store, self.profile, field, self.model,
+                company=self._verbose_company)
             if value:
-                print(f"  [EasyApply] Filling '{label}' = {str(value)[:40]!r}")
+                print(f"  [EasyApply] Filling '{label}' = {str(value)[:40]!r} ({source})")
                 confirmed = await _fill_field(self.page, field, value)
                 # For radio/checkbox, _fill_field returns a bool indicating whether the
                 # selection actually registered (LinkedIn's React form can silently drop
