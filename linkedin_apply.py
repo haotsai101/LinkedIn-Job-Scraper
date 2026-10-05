@@ -1633,6 +1633,27 @@ async def verify_submission(
     return False, "no confirmation signal found after submit"
 
 
+def _unwrap_nested_answer(text: str, store: bool) -> tuple[str, bool]:
+    """Undo a double-encoded model reply: ``answer`` itself holding the JSON object
+    ``{"answer": "...", "store": ...}`` (seen on long-form prompts). Without this the
+    raw JSON text would be typed into the form and stored. ``store`` can only be
+    narrowed by the inner object, never widened."""
+    for _ in range(2):
+        t = (text or "").strip()
+        if not (t.startswith("{") and t.endswith("}")):
+            break
+        try:
+            obj = json.loads(t)
+        except ValueError:
+            break
+        if not isinstance(obj, dict) or "answer" not in obj:
+            break
+        text = str(obj.get("answer") or "")
+        if isinstance(obj.get("store"), bool):
+            store = store and obj["store"]
+    return text, store
+
+
 _RESUME_FILE_RE = re.compile(r"\.(pdf|docx?|rtf|txt)\b", re.IGNORECASE)
 
 
@@ -1667,7 +1688,8 @@ _FIELD_ANSWER_SCHEMA = {
 # answer should be saved for reuse on future applications (EA1).
 _STORE_DECISION_RULES = (
     "\n\nReturn a JSON object with two keys. \"answer\": the answer value, following the "
-    "rules above (an empty string if there is nothing to enter). \"store\": true ONLY if "
+    "rules above (an empty string if there is nothing to enter) — plain text only, never "
+    "JSON and never a nested object. \"store\": true ONLY if "
     "the answer is a stable fact about the applicant that would be identical on any "
     "employer's application — work authorization or sponsorship, years of experience "
     "with a skill, education, location or relocation, salary expectations, "
@@ -1746,8 +1768,8 @@ async def _ask_llm(model: str, profile: dict, field: dict) -> FieldAnswer:
             llm.query_json(prompt, _FIELD_ANSWER_SCHEMA, model=model),
             timeout=_t,
         )
-        raw_answer = str(raw_data.get("answer", "") or "")
-        want_store = raw_data.get("store") is True
+        raw_answer, want_store = _unwrap_nested_answer(
+            str(raw_data.get("answer", "") or ""), raw_data.get("store") is True)
         answer = raw_answer.strip().strip('"').strip("'")
         # T31: a numeric / 1-N-scale free-text field must get a bare integer,
         # never the model's prose ("I'd rate my experience an 8 out of 10…").

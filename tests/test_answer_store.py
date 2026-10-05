@@ -311,3 +311,25 @@ def test_resume_picker_choice_is_detected():
     assert linkedin_apply._is_resume_choice("resume", ["CV_2026.docx", "old.pdf"])
     assert not linkedin_apply._is_resume_choice("Are you authorized to work?", ["Yes", "No"])
     assert not linkedin_apply._is_resume_choice("", None)
+
+
+# ── a double-encoded model reply must never reach the form or the store ───────
+
+def test_unwrap_nested_answer():
+    unwrap = linkedin_apply._unwrap_nested_answer
+    assert unwrap('{"answer": "Not applicable.", "store": true}', True) == ("Not applicable.", True)
+    # the inner verdict can only narrow the outer one
+    assert unwrap('{"answer": "x", "store": false}', True) == ("x", False)
+    assert unwrap('{"answer": "x", "store": true}', False) == ("x", False)
+    # plain text, ordinary braces and unrelated JSON are left alone
+    assert unwrap("Yes", True) == ("Yes", True)
+    assert unwrap("{not json}", True) == ("{not json}", True)
+    assert unwrap('{"foo": 1}', True) == ('{"foo": 1}', True)
+
+
+def test_ask_llm_unwraps_double_encoded_answer(monkeypatch):
+    _fake_query_json(monkeypatch, {
+        "answer": '{"answer": "Not applicable.", "store": true}', "store": True})
+    field = {"label": "If yes, please explain the circumstances:", "kind": "textarea",
+             "options": []}
+    assert _run(linkedin_apply._ask_llm("m", PROFILE, field)) == ("Not applicable.", True)
