@@ -72,6 +72,29 @@ OFFSITE_APPLICATIONS_INDEX_DDL = (
 )
 
 
+# ── form_answers: known Easy Apply questions + their answers (EA1) ────────────
+# See answer_store.py. One row per (normalized question, field-kind group, set of
+# options). ``source`` is profile | llm | manual (manual > llm > profile when
+# writing); only manual/llm rows are served from the table. Imported by
+# scripts/migrations/004_form_answers.py.
+FORM_ANSWERS_DDL = (
+    "CREATE TABLE IF NOT EXISTS form_answers ("
+    "id INTEGER PRIMARY KEY, "
+    "question_key TEXT NOT NULL, "
+    "label TEXT NOT NULL, "
+    "kind_group TEXT NOT NULL, "
+    "options_key TEXT NOT NULL DEFAULT '', "
+    "answer TEXT NOT NULL, "
+    "source TEXT NOT NULL, "
+    "job_specific INTEGER NOT NULL DEFAULT 0, "
+    "uses INTEGER NOT NULL DEFAULT 0, "
+    "created_at INTEGER NOT NULL, "
+    "updated_at INTEGER NOT NULL, "
+    "last_used_at INTEGER, "
+    "UNIQUE(question_key, kind_group, options_key))"
+)
+
+
 def seed_blocked_entities(conn, cursor):
     """Insert the fallback blocklist seed rows. Idempotent (INSERT OR IGNORE)."""
     cursor.executemany(
@@ -124,6 +147,7 @@ def create_tables(conn, cursor):
     cursor.execute(BLOCKED_ENTITIES_DDL)
     cursor.execute(OFFSITE_APPLICATIONS_DDL)
     cursor.execute(OFFSITE_APPLICATIONS_INDEX_DDL)
+    cursor.execute(FORM_ANSWERS_DDL)
 
     cursor.execute('''
       CREATE TABLE IF NOT EXISTS skills (

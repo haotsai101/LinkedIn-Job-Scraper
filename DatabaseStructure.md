@@ -59,6 +59,29 @@
 | follower_count | INTEGER |  |  |  |
 | time_recorded | INTEGER | yes |  |  |
 
+## form_answers
+
+Known Easy Apply questions and their answers (EA1, `answer_store.py`). One row per
+(normalized question, field-kind group, set of options). Only `manual` / `llm` rows
+are served; `profile` rows are a log of rule-answered questions.
+
+| Column | Type | Not Null | Default | PK |
+| --- | --- | --- | --- | --- |
+| id | INTEGER |  |  | 1 |
+| question_key | TEXT | yes |  |  |
+| label | TEXT | yes |  |  |
+| kind_group | TEXT | yes |  |  |
+| options_key | TEXT | yes | '' |  |
+| answer | TEXT | yes |  |  |
+| source | TEXT | yes |  |  |
+| job_specific | INTEGER | yes | 0 |  |
+| uses | INTEGER | yes | 0 |  |
+| created_at | INTEGER | yes |  |  |
+| updated_at | INTEGER | yes |  |  |
+| last_used_at | INTEGER |  |  |  |
+
+- `UNIQUE(question_key, kind_group, options_key)`
+
 ## industries
 
 | Column | Type | Not Null | Default | PK |

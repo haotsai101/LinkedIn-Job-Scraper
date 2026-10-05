@@ -36,7 +36,7 @@ from scripts.create_db import (  # noqa: E402
 )
 from scripts.migrations import runner  # noqa: E402
 
-_ALL_IDS = ["001_indexes", "002_schema", "003_offsite_applications"]
+_ALL_IDS = ["001_indexes", "002_schema", "003_offsite_applications", "004_form_answers"]
 
 
 def _bare_db(path: Path) -> None:
@@ -142,7 +142,7 @@ def test_partial_state_only_missing_migration_runs(tmp_path):
 
     applied = runner.run_pending_migrations(db)
 
-    assert applied == ["002_schema", "003_offsite_applications"]
+    assert applied == ["002_schema", "003_offsite_applications", "004_form_answers"]
     assert _recorded_ids(db) == _ALL_IDS
 
 

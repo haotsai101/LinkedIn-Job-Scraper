@@ -27,6 +27,7 @@ except ImportError:  # pragma: no cover
 
 import config
 import llm
+from answer_store import AnswerStore, is_job_specific
 # Shared stdlib-only helper (ticket T4). ``_write_llm_log`` keeps its old private
 # name as a thin alias so the ~6 internal call sites are untouched.
 from common import write_llm_log as _write_llm_log
@@ -1632,15 +1633,86 @@ async def verify_submission(
     return False, "no confirmation signal found after submit"
 
 
-async def _ask_llm(model: str, profile: dict, field: dict) -> str | None:
-    """Fill one form field via a one-shot ``llm.query`` call (self-contained
-    prompt — profile + field descriptor). ``model`` is the guided_apply model."""
+def _unwrap_nested_answer(text: str, store: bool) -> tuple[str, bool]:
+    """Undo a double-encoded model reply: ``answer`` itself holding the JSON object
+    ``{"answer": "...", "store": ...}`` (seen on long-form prompts). Without this the
+    raw JSON text would be typed into the form and stored. ``store`` can only be
+    narrowed by the inner object, never widened."""
+    for _ in range(2):
+        t = (text or "").strip()
+        if not (t.startswith("{") and t.endswith("}")):
+            break
+        try:
+            obj = json.loads(t)
+        except ValueError:
+            break
+        if not isinstance(obj, dict) or "answer" not in obj:
+            break
+        text = str(obj.get("answer") or "")
+        if isinstance(obj.get("store"), bool):
+            store = store and obj["store"]
+    return text, store
+
+
+_RESUME_FILE_RE = re.compile(r"\.(pdf|docx?|rtf|txt)\b", re.IGNORECASE)
+
+
+def _is_resume_choice(label: str, options) -> bool:
+    """A radio "group" that is really LinkedIn's resume picker (the choices are
+    uploaded file names). LinkedIn pre-selects the newest resume, so these must
+    never be put to the LLM or clicked by the field filler."""
+    return bool(_RESUME_FILE_RE.search(label or "")
+                or any(_RESUME_FILE_RE.search(str(o)) for o in (options or [])))
+
+
+class FieldAnswer(NamedTuple):
+    """An Agent SDK answer to one form field plus the model's own verdict on
+    whether it is worth remembering (EA1)."""
+    answer: str | None
+    store: bool = False
+
+
+_NO_ANSWER = FieldAnswer(None, False)
+
+_FIELD_ANSWER_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "answer": {"type": "string"},
+        "store": {"type": "boolean"},
+    },
+    "required": ["answer", "store"],
+    "additionalProperties": False,
+}
+
+# Appended to every field prompt: the model both answers and decides whether the
+# answer should be saved for reuse on future applications (EA1).
+_STORE_DECISION_RULES = (
+    "\n\nReturn a JSON object with two keys. \"answer\": the answer value, following the "
+    "rules above (an empty string if there is nothing to enter) — plain text only, never "
+    "JSON and never a nested object. \"store\": true ONLY if "
+    "the answer is a stable fact about the applicant that would be identical on any "
+    "employer's application — work authorization or sponsorship, years of experience "
+    "with a skill, education, location or relocation, salary expectations, "
+    "demographics, tool familiarity, yes/no screening questions about the applicant. "
+    "Set \"store\" to false when the answer depends on this particular company, role "
+    "or posting (why this company, how you heard about us, referral names, a start "
+    "date tied to this posting, company-specific knowledge, cover-letter-style prose), "
+    "or when you had to guess because the profile does not cover the question. "
+    "When in doubt, false."
+)
+
+
+async def _ask_llm(model: str, profile: dict, field: dict) -> FieldAnswer:
+    """Answer one form field via a one-shot, tool-less Agent SDK call
+    (self-contained prompt — profile + field descriptor). ``model`` is the
+    guided_apply model. The model also decides ``store`` — whether the answer is
+    a reusable fact worth saving (see ``_STORE_DECISION_RULES``)."""
     label = field.get("label", "")
     # Fall back to field name/id as label hint when label is missing
     if not label:
         label = field.get("name", "") or field.get("id", "")
     if not label:
-        return None
+        return _NO_ANSWER
     options = field.get("options", [])
     kind = field.get("kind", "text")
     # A numeric / 1-N-scale field (incl. long-labelled "Rate your experience
@@ -1670,7 +1742,8 @@ async def _ask_llm(model: str, profile: dict, field: dict) -> str | None:
             "If the question is about the company specifically, write a plausible, enthusiastic answer based on the applicant's goals. "
             "Never leave it blank — always produce a meaningful answer. "
             "CRITICAL: Never fabricate URLs, social media handles, usernames, or any specific data not stated in the profile. "
-            "Reply with ONLY the answer text, nothing else."
+            "Put ONLY the answer text in \"answer\"."
+            + _STORE_DECISION_RULES
         )
     else:
         prompt += (
@@ -1686,11 +1759,17 @@ async def _ask_llm(model: str, profile: dict, field: dict) -> str | None:
             "CRITICAL: Never fabricate URLs, social media handles, usernames, or specific data not in the profile. "
             "For URL/link fields (Twitter, Instagram, Facebook, personal blog, etc.) not explicitly in the profile, reply with an empty string. "
             "If the profile has no relevant info for a non-select/non-radio non-numeric field, reply with an empty string. "
-            "Reply with ONLY the answer value, nothing else."
+            "Put ONLY the answer value in \"answer\"."
+            + _STORE_DECISION_RULES
         )
     _t = 70 if is_long_form else 50
     try:
-        raw_answer = await llm.query(prompt, model=model, timeout=_t)
+        raw_data = await asyncio.wait_for(
+            llm.query_json(prompt, _FIELD_ANSWER_SCHEMA, model=model),
+            timeout=_t,
+        )
+        raw_answer, want_store = _unwrap_nested_answer(
+            str(raw_data.get("answer", "") or ""), raw_data.get("store") is True)
         answer = raw_answer.strip().strip('"').strip("'")
         # T31: a numeric / 1-N-scale free-text field must get a bare integer,
         # never the model's prose ("I'd rate my experience an 8 out of 10…").
@@ -1704,12 +1783,14 @@ async def _ask_llm(model: str, profile: dict, field: dict) -> str | None:
             "field_kind":   field.get("kind"),
             "options":      field.get("options", []),
             "prompt":       prompt,
-            "raw_response": raw_answer,
+            "raw_response": raw_data,
             "result":       answer,
+            "store":        want_store,
         })
         if not answer:
             print(f"  [LLM empty] Field '{label}' — LLM returned empty string, skipping.")
-        return answer if answer else None
+            return _NO_ANSWER
+        return FieldAnswer(answer, want_store)
     except asyncio.TimeoutError:
         _write_llm_log({
             "ts":           datetime.now(timezone.utc).isoformat(),
@@ -1722,7 +1803,7 @@ async def _ask_llm(model: str, profile: dict, field: dict) -> str | None:
             "timeout_s":    _t,
         })
         print(f"  [LLM timeout] Field '{label}' — no answer in {_t}s, skipping.")
-        return None
+        return _NO_ANSWER
     except Exception as _exc:
         print(f"  [LLM error] Field '{label}' — {type(_exc).__name__}: {_exc}")
         _write_llm_log({
@@ -1732,7 +1813,51 @@ async def _ask_llm(model: str, profile: dict, field: dict) -> str | None:
             "field_label": label,
             "error":     f"{type(_exc).__name__}: {_exc}",
         })
-        return None
+        return _NO_ANSWER
+
+
+async def _resolve_field_value(
+    store: AnswerStore | None, profile: dict, field: dict, model: str, company: str = "",
+) -> tuple[str | None, str | None]:
+    """Decide what to put in one form field. Returns ``(value, source)``.
+
+    EA1 lookup order: the answer store (``manual`` / ``llm`` rows) → the
+    deterministic profile rules → the Agent SDK. ``source`` is ``"db"``,
+    ``"profile"``, ``"llm"`` or ``None`` (no answer). Profile-rule answers are
+    recorded in the store but always re-resolved, never served from it; fresh
+    LLM answers are written back so the question is only ever asked once.
+    ``store=None`` reproduces the pre-EA1 behaviour exactly (no persistence).
+    """
+    label = field.get("label", "") or field.get("name", "") or field.get("id", "")
+    kind = field.get("kind", "text")
+    options = field.get("options", [])
+
+    if store is not None and label:
+        hit = store.lookup(label, kind, options)
+        if hit:
+            return hit, "db"
+
+    value = _get_profile_value(profile, field.get("label", ""), kind)
+    # A rule value that matches no available select option is discarded so the
+    # LLM can decide — prevents numeric years ("4") being used for Yes/No selects.
+    if value is not None and kind in ("select", "select-one", "select-multiple") and options:
+        if value.lower() not in [o.lower() for o in options]:
+            value = None
+    if value is not None:
+        if store is not None and label:
+            store.record(label, kind, options, value, "profile")
+        return value, "profile"
+
+    result = await _ask_llm(model, profile, field)
+    if result.answer:
+        # The model decides whether the answer is a reusable fact; a company/
+        # role-specific question is also vetoed by ``is_job_specific`` as a
+        # backstop. Answers it declines to store are simply not kept.
+        if (store is not None and label and result.store
+                and not is_job_specific(label, kind, company)):
+            store.record(label, kind, options, result.answer, "llm")
+        return result.answer, "llm"
+    return None, None
 
 
 async def _fill_field(page: Page, field: dict, value: str):
@@ -1901,13 +2026,38 @@ async def _fill_field(page: Page, field: dict, value: str):
                 # Resolve the matched radio to a single-element locator, matching the
                 # selector style already used in this function.
                 if matched < len(option_ids) and option_ids[matched]:
-                    radio_loc = page.locator(f'#{option_ids[matched]}')
+                    radio_loc = page.locator(f'#{_css_id(option_ids[matched])}')
                 elif name:
                     radio_loc = page.locator(
                         f'input[type="radio"][name="{name}"]'
                     ).nth(matched)
                 else:
                     return False
+                # LinkedIn's newer UI hides the native input (0x0, opacity 0); the
+                # clickable target is its <div role="radio"> wrapper, whose
+                # aria-checked reflects the state. Older markup: click the input.
+                wrapper = radio_loc.locator('xpath=ancestor::*[@role="radio"][1]')
+                use_wrapper = False
+                try:
+                    use_wrapper = (not await radio_loc.is_visible()
+                                   and await wrapper.count() > 0
+                                   and await wrapper.is_visible())
+                except Exception:
+                    use_wrapper = False
+
+                async def _radio_selected() -> bool:
+                    if use_wrapper:
+                        if (await wrapper.get_attribute("aria-checked")) == "true":
+                            return True
+                    return await radio_loc.is_checked()
+
+                if use_wrapper:
+                    await wrapper.click()
+                    await asyncio.sleep(0.35)  # wait for React reconciliation
+                    if not await _radio_selected():
+                        await wrapper.click(force=True)
+                        await asyncio.sleep(0.35)
+                    return await _radio_selected()
                 await radio_loc.click()
                 # Playwright's native .click() fires a DOM event that LinkedIn's React
                 # controlled components ignore (onChange never fires), so the selection
@@ -2010,9 +2160,12 @@ class EasyApplyFlow:
         callbacks: dict,
         model: str = "",
         verbose: bool = False,
+        answer_store: AnswerStore | None = None,
     ):
         self.page = page
         self.profile = profile
+        # EA1: persistent Q&A store (None = pre-EA1 behaviour, nothing persisted).
+        self.answer_store = answer_store
         # Browser-agent LLM: the Claude Agent SDK on subscription auth (T14b).
         # Every LLM call here is a one-shot ``llm.query`` on this model.
         self.model = model or config.get_llm_config("guided_apply").model
@@ -2393,19 +2546,11 @@ class EasyApplyFlow:
                     pass  # fall through to re-fill
                 else:
                     continue
-            value = _get_profile_value(self.profile, label, kind)
-            # If _get_profile_value returned a value that doesn't match any available select option,
-            # discard it and let the LLM decide — prevents numeric years ("4") being used for Yes/No selects.
-            if value is not None and kind in ("select", "select-one", "select-multiple"):
-                field_opts = field.get("options", [])
-                if field_opts:
-                    opts_lower = [o.lower() for o in field_opts]
-                    if value.lower() not in opts_lower:
-                        value = None
-            if value is None:
-                value = await _ask_llm(self.model, self.profile, field)
+            value, source = await _resolve_field_value(
+                self.answer_store, self.profile, field, self.model,
+                company=self._verbose_company)
             if value:
-                print(f"  [EasyApply] Filling '{label}' = {str(value)[:40]!r}")
+                print(f"  [EasyApply] Filling '{label}' = {str(value)[:40]!r} ({source})")
                 confirmed = await _fill_field(self.page, field, value)
                 # For radio/checkbox, _fill_field returns a bool indicating whether the
                 # selection actually registered (LinkedIn's React form can silently drop
@@ -2562,25 +2707,41 @@ class EasyApplyFlow:
             var root = el.getRootNode() || document;
             var grpName = el.name || '';
             if (!grpName) return null;
+            // LinkedIn's newer React UI hides the native <input> (0x0, opacity 0) behind a
+            // clickable <div role="radio" aria-label="<question>"> whose option text sits in
+            // a <p>, with an EMPTY <label for>. Older markup uses a plain fieldset + legend.
+            var wrapOf = function(r) { return r.closest('[role="radio"]'); };
             var fieldset = el.closest('fieldset') || el.closest('[role="group"]') || el.closest('[role="radiogroup"]');
-            var groupLabel = grpName;
+            var groupLabel = '';
             if (fieldset) {
                 var labelId = fieldset.getAttribute('aria-labelledby');
                 var labelEl = labelId ? root.getElementById(labelId) : null;
                 var legend = fieldset.querySelector('legend');
                 groupLabel = (labelEl && labelEl.textContent.trim())
-                           || (legend && legend.textContent.trim()) || grpName;
+                           || (legend && legend.textContent.trim()) || '';
             }
+            if (!groupLabel) {
+                var w0 = wrapOf(el);
+                groupLabel = (w0 && w0.getAttribute('aria-label')) || '';
+            }
+            if (!groupLabel && fieldset && fieldset.previousElementSibling) {
+                groupLabel = fieldset.previousElementSibling.textContent.trim();
+            }
+            if (!groupLabel) groupLabel = grpName;
             var radios = root.querySelectorAll('input[type="radio"][name="' + grpName + '"]');
-            var opts = [], optIds = [];
+            var opts = [], optIds = [], current = '';
             radios.forEach(function(r) {
                 var l = r.id ? root.querySelector('label[for="' + r.id + '"]') : null;
-                opts.push(l ? l.textContent.trim() : r.value);
+                var w = wrapOf(r);
+                var text = (l && l.textContent.trim()) || (w && w.textContent.trim()) || r.value;
+                opts.push(text);
                 optIds.push(r.id || '');
+                if (!current && (r.checked || (w && w.getAttribute('aria-checked') === 'true'))) {
+                    current = r.value || text;
+                }
             });
             return { kind: 'radio', label: groupLabel.trim(), name: grpName,
-                     options: opts, option_ids: optIds,
-                     current_value: el.checked ? el.value : '' };
+                     options: opts, option_ids: optIds, current_value: current };
         }"""
         radio_loc = modal.locator('input[type=radio]')
         nr = await radio_loc.count()
@@ -2588,13 +2749,26 @@ class EasyApplyFlow:
             el = radio_loc.nth(i)
             try:
                 if not await el.is_visible():
-                    continue
+                    # A hidden native input is fine when its clickable role=radio
+                    # wrapper is on screen (LinkedIn's newer screening-question UI).
+                    _wrap = el.locator('xpath=ancestor::*[@role="radio"][1]')
+                    if not (await _wrap.count() > 0 and await _wrap.is_visible()):
+                        if self.verbose:
+                            print(f"  [verbose] radio #{i} skipped: not visible "
+                                  f"(id={await el.get_attribute('id')!r} "
+                                  f"name={await el.get_attribute('name')!r})")
+                        continue
                 props = await el.evaluate(_RADIO_META)
                 if not props:
+                    if self.verbose:
+                        print(f"  [verbose] radio #{i} skipped: no name attribute "
+                              f"(id={await el.get_attribute('id')!r})")
                     continue
                 props["label"] = _norm_label(props.get("label", ""))
                 # Also normalize each radio option label
                 props["options"] = [_norm_label(o) for o in props.get("options", [])]
+                if _is_resume_choice(props["label"], props["options"]):
+                    continue  # resume picker — LinkedIn pre-selects the newest resume
                 grp_name = props.get("name", "")
                 if grp_name in seen_names:
                     continue

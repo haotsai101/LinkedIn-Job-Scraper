@@ -87,7 +87,7 @@ def test_migration_003_upgrades_pre_oa1_db_once(tmp_path):
     _pre_oa1_db(db)
 
     applied = runner.run_pending_migrations(db, logger=lambda *_: None)
-    assert applied == ["003_offsite_applications"]
+    assert applied == ["003_offsite_applications", "004_form_answers"]
     backups = sorted(tmp_path.glob("linkedin_jobs.db.bak-*"))
     assert len(backups) == 1
 
