@@ -607,10 +607,13 @@ This decides the order of Phase 2 adapters.
 persistent store (`answer_store.py`, table `form_answers`, migration 004).
 Lookup order in `EasyApplyFlow._fill_current_step` (via
 `linkedin_apply._resolve_field_value`): store (`manual`/`llm` rows) → profile
-rules → Agent SDK, whose answer is written back so a question is only ever asked
-once. Profile-rule answers are recorded but re-resolved each time (never stale
-after a profile edit). Job-specific questions ("Why do you want to work at X?")
-are saved but never reused. Admin: `apply_jobs.py --answers`,
+rules → Agent SDK. The SDK call returns the answer and a `store` verdict on
+whether it is a reusable fact about the applicant; only those are written back,
+so a question is only ever asked once. Profile-rule answers are recorded but
+re-resolved each time (never stale after a profile edit). Company/role-specific
+answers ("Why do you want to work at X?") are not stored at all. Also fixes forms
+that stalled because LinkedIn's newer UI hides the native radio input (collector
+now reads the `role="radio"` wrapper) and skips resume-picker radios. Admin: `apply_jobs.py --answers`,
 `--forget-answer ID`; edit an answer by hand with `source='manual'` to override
 everything.
 

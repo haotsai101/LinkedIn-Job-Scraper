@@ -12,16 +12,20 @@ Lookup order used by ``linkedin_apply.EasyApplyFlow`` (see
 1. **this store** — rows whose ``source`` is ``manual`` (hand-edited, always
    wins) or ``llm`` (answered once by the Agent SDK, reused forever);
 2. the deterministic profile rule table (``_get_profile_value``);
-3. the Agent SDK (``_ask_llm``) — its answer is written back here.
+3. the Agent SDK (``_ask_llm``) — one structured call returns the answer *and*
+   the model's own verdict (``store``) on whether it is a reusable fact about
+   the applicant; only then is it written back here.
 
 Profile-rule answers are *also* recorded (``source='profile'``) so the table is
 a complete picture of the questions seen, but they are never served from the
 table: the rules re-resolve from ``user_profile.json`` every time, so editing
 the profile can't leave a stale copy behind.
 
-Answers to job-specific questions ("Why do you want to work at Acme?") are
-saved for audit but flagged ``job_specific=1`` and never served for a different
-job.
+Answers the model declines to store (company/role-specific prose, guesses) are
+not kept at all. ``is_job_specific`` is a keyword backstop that vetoes storing a
+question that names the employer even if the model said to keep it. The
+``job_specific`` column is retained for schema stability and is always 0 for
+rows the flow writes.
 
 Precedence when writing: ``manual`` > ``llm`` > ``profile`` — a lower-ranked
 writer never overwrites a higher-ranked row.
