@@ -1,7 +1,6 @@
 """Phase 1 — Discovery. Thin wrapper over ``scripts.retrieval.run_search``.
 
-The retrieval loop itself lives in ``scripts/retrieval.py`` and is shared with
-the Dagster ``search_jobs_op``. This script just parses args, opens the DB and
+The retrieval loop itself lives in ``scripts/retrieval.py``. This script just parses args, opens the DB and
 calls it once — no ``while True``.
 
     python search_retriever.py                 # stop at 100 new jobs (default)

@@ -8,10 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 # One-time setup: the scraper login and the apply agent both drive Chromium
 playwright install chromium
 
-# Dagster (recommended — runs all pipelines via UI at http://localhost:3000)
-DAGSTER_HOME=./.dagster_home dagster dev
-
-# Standalone scripts (thin wrappers over scripts/retrieval.py — same loop the Dagster ops run)
+# Scraper scripts (thin wrappers over scripts/retrieval.py)
 python search_retriever.py                 # Discover new job IDs (stop at 100 new)
 python search_retriever.py --target 250    # ...or a different new-job target (0 = no cap)
 python search_retriever.py --max-rounds 5  # cap rounds (1 round = 1 page per search config)
@@ -70,12 +67,6 @@ before the ticket is closed. One feature branch + PR per ticket.
 
 **Phase 2 — Enrichment** (`details_retriever.py`, `scripts/fetch.py:JobDetailRetriever`): Fetches full job attributes for every `scraped=0` row and sets `scraped=1`. This is rate-limit-sensitive and is designed to run with multiple accounts/proxies.
 
-### Dagster orchestration layer (`scripts/`)
-
-All pipeline logic is wrapped as Dagster ops/jobs/schedules in `scripts/dagster_retrievers.py`. The entrypoint for `dagster dev` is `scripts/definitions.py` (declared in `pyproject.toml` under `[tool.dagster]`). Schedules run search every ~4 hours and details enrichment every ~6 hours. An `unscraped_jobs_sensor` triggers detail fetching whenever new unenriched jobs appear.
-
-`scripts/definitions.py` wires 4 jobs (`search_jobs_only`, `fetch_details_only`, `search_and_fetch_jobs`, `apply_jobs_job`), 3 schedules, and `unscraped_jobs_sensor`. The `no_persist_io_manager` resource discards op outputs so Dagster doesn't pickle them to `$DAGSTER_HOME/storage` on every run.
-
 ### Autonomous apply agent (`apply_jobs.py`, `linkedin_apply.py`)
 
 Reads jobs where `scraped=1 AND applied IS NULL` (filtered to remote/Utah). For each job:
@@ -96,7 +87,7 @@ Single database file. Key `jobs` columns:
 - `remote_allowed`, `location`: used to filter apply candidates (remote or Utah)
 
 **Schema is self-updating (T19).** Every process that opens the DB —
-`search_retriever.py`, `details_retriever.py`, the scraper Dagster ops, and
+`search_retriever.py`, `details_retriever.py`, and
 `apply_jobs.py` — calls `scripts.create_db.ensure_db_ready(conn, cursor)` at
 startup: it runs the fresh-DB DDL + `ensure_schema_current()` (idempotent schema
 modernization) and then `scripts.migrations.runner.run_pending_migrations()`,

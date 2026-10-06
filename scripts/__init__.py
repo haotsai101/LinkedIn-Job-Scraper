@@ -1,1 +1,1 @@
-"""Initialize Dagster project for LinkedIn Job Scraper."""
+"""Scraper and shared helpers for the LinkedIn Job Scraper."""

@@ -19,9 +19,9 @@ The migration id is the file stem (``001_indexes``, ``002_schema``).
 Concurrency
 -----------
 The discover → backup → apply → record critical section is serialised with an
-advisory file lock (``<db>.migrate.lock``, ``fcntl.flock``). Dagster's
-multiprocess executor can start ``search_jobs_op`` and ``fetch_job_details_op``
-concurrently, and both call this on a not-yet-migrated DB. Without the lock the
+advisory file lock (``<db>.migrate.lock``, ``fcntl.flock``). Running
+``search_retriever.py`` and ``details_retriever.py`` concurrently is possible,
+and both call this on a not-yet-migrated DB. Without the lock the
 two racing ``002_schema`` runs hit ``duplicate column name: listed_epoch`` (its
 check-then-``ALTER`` is not atomic). With the lock the loser blocks, then
 re-reads ``schema_migrations`` inside the lock, finds nothing pending, and
@@ -54,7 +54,7 @@ except ImportError:  # pragma: no cover - non-POSIX (Windows); this project is m
     fcntl = None
 
 # In-process serialisation. ``fcntl.flock`` guards *cross-process* races
-# (Dagster's multiprocess executor runs search + details ops in separate
+# (search + details scripts can run in separate
 # processes); flock's semantics for multiple threads of one process sharing a
 # path are murky, so this lock covers that case unambiguously.
 _INPROC_LOCK = threading.Lock()
