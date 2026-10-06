@@ -876,8 +876,11 @@ _PROFILE_VALUE_RULES: list[_ProfileRule] = [
     _ProfileRule("street_address",
                  _kw("address line 1", "street address", "address 1", "street"),
                  _pv("street_address")),
+    # "apt"/"suite" as whole words only: as substrings they matched "CapTech",
+    # "adapt", "aptitude", … and blanked e.g. CapTech's required privacy box.
     _ProfileRule("address_line_2",
-                 _kw("address line 2", "address 2", "apt", "suite"),
+                 lambda lbl, kind, p: ("address line 2" in lbl or "address 2" in lbl
+                                       or bool(re.search(r"\b(apt|suite)\b", lbl))),
                  _const("")),
     # State of residence. MUST precede the identity/country rules; the broad
     # `"state" in lbl` arm excludes work-authorization phrasings.
@@ -1108,7 +1111,12 @@ _PROFILE_VALUE_RULES: list[_ProfileRule] = [
     _ProfileRule("agree_consent",
                  _kw_kind(("select", "select-one", "checkbox"), "agree to", "i agree", "acknowledge",
                           "i understand", "consent to", "terms of service", "privacy policy",
-                          "terms and conditions"),
+                          "terms and conditions",
+                          # CapTech: "You declare that you have read and understand the
+                          # privacy notice…" matched nothing; the LLM returned blank
+                          # and the required box stayed unticked.
+                          "privacy notice", "read and understand", "you have read",
+                          "i have read"),
                  _resolve_agree),
     _ProfileRule("comfortable_remote_commute_shift",
                  _kw("comfortable working", "comfortable with remote", "comfortable in a remote",
