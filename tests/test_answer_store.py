@@ -62,6 +62,14 @@ def test_kind_group_and_options_key():
     assert options_key(None) == "" and options_key([]) == ""
 
 
+def test_follow_up_to_previous_answer_is_never_stored():
+    assert is_job_specific('If "Other" was selected above, please provide more specific details.')
+    assert is_job_specific("If you answered yes to the above question, please explain below.")
+    assert is_job_specific("If yes to the question above, explain.")
+    assert not is_job_specific("Are you legally authorized to work in the United States?")
+    assert not is_job_specific("What is the highest level of education you have obtained?")
+
+
 def test_is_job_specific():
     assert is_job_specific("Why do you want to work here?")
     assert is_job_specific("What excites you about this role?")
