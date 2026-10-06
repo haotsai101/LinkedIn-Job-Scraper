@@ -28,29 +28,19 @@ python apply_jobs.py --setup
 
 ## Scraping Pipeline
 
-Two-phase pipeline, orchestrated by [Dagster](https://dagster.io/) or run standalone.
+Two-phase pipeline, run as standalone scripts.
 
 **Phase 1 — Discovery** (`search_retriever.py`): Queries LinkedIn's Voyager API for new job IDs and inserts them with `scraped=0`.
 
 > The search query string lives in exactly one place: `SEARCH_KEYWORDS` in
-> [`scripts/search_config.py`](scripts/search_config.py). Both the standalone
-> `search_retriever.py` and the Dagster `search_jobs_op` read it from there.
+> [`scripts/search_config.py`](scripts/search_config.py). `search_retriever.py` reads it from there.
 > It is passed verbatim as the Voyager `keywords:` field, so quoted phrases and
 > the boolean `OR` operator work, but the string must not contain commas,
 > parentheses, or colons.
 
 **Phase 2 — Enrichment** (`details_retriever.py`): Fetches full attributes for every `scraped=0` job and sets `scraped=1`. Rate-limit-sensitive — use multiple accounts/proxies.
 
-### Dagster (recommended)
-
-```bash
-DAGSTER_HOME=./.dagster_home dagster dev
-# Then visit: http://localhost:3000
-```
-
-Schedules discovery every ~4 hours and enrichment every ~6 hours. A sensor triggers enrichment whenever new unenriched jobs appear.
-
-### Standalone
+### Running
 
 ```bash
 python search_retriever.py   # Discover new job IDs

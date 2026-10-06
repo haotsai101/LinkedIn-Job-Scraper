@@ -166,7 +166,7 @@ def test_discover_migrations_sorted_and_filtered():
 
 
 def test_concurrent_runners_apply_exactly_once(tmp_path):
-    """Dagster's multiprocess executor starts search + details ops together;
+    """The search + details scripts can start together;
     both call the runner on a not-yet-migrated DB. The advisory file lock must
     make exactly one of N racing runners do the work — no
     ``duplicate column name`` from two ``002_schema`` ALTERs."""
@@ -344,7 +344,7 @@ def test_ensure_schema_current_survives_concurrent_applied_at_add(tmp_path):
     """SHOULD-FIX regression: unlike ``run_pending_migrations`` (serialised by
     ``fcntl.flock``, see runner.py's docstring), this check-then-ALTER runs
     unlocked straight out of create_tables() on every process startup — two
-    Dagster ops racing a not-yet-migrated DB can both see applied_at missing
+    processes racing a not-yet-migrated DB can both see applied_at missing
     and both ALTER. This is the exact bug class T23 fixed for listed_epoch's
     ``duplicate column name`` on the migration path; here the loser must
     swallow its own "duplicate column name: applied_at" instead of raising."""

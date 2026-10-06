@@ -281,3 +281,13 @@ def test_no_container_when_form_is_gone():
         return await flow._get_modal_text(), await flow._is_modal_open()
 
     assert asyncio.run(_with_flow(html, run)) == ("", False)
+
+
+def test_never_opened_modal_is_not_reported_applied():
+    """No Next/Review/Submit ever appeared: 'modal closed' must not count as applied."""
+    html = "<html><body><main><h2>Some job</h2><input placeholder=\"I'm looking for…\"></main></body></html>"
+
+    async def run(flow):
+        return await flow._process_all_steps()
+
+    assert asyncio.run(_with_flow(html, run)) == "failed"

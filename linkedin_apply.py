@@ -2495,6 +2495,7 @@ class EasyApplyFlow:
     async def _process_all_steps(self) -> str:
         click_failures = 0
         filled_labels: set[str] = set()  # track labels filled this session to avoid re-filling tag inputs
+        nav_seen = False  # a Submit/Review/Next button was ever clicked or found
 
         for step_num in range(25):
             await asyncio.sleep(1.5)
@@ -2506,6 +2507,7 @@ class EasyApplyFlow:
             submit = self.page.locator(self._SUBMIT_SELECTOR).first
             if await submit.count() > 0:
                 print(f"  [EasyApply] Step {step_num + 1}: Submit button found")
+                nav_seen = True
                 return await self._handle_submit()
 
             # Newer UI labels this button just "Review" (no aria-label). _tag_modal()
@@ -2515,6 +2517,7 @@ class EasyApplyFlow:
                 '[data-easyapply-nav="review"]'
             ).first
             if await review.count() > 0:
+                nav_seen = True
                 before = await self._get_modal_text()
                 print(f"  [EasyApply] Step {step_num + 1}: Review button — clicking")
                 await review.click()
@@ -2543,6 +2546,7 @@ class EasyApplyFlow:
                 '[aria-label*="Continue to next step"], button:has-text("Next")'
             ).first
             if await next_btn.count() > 0:
+                nav_seen = True
                 before = await self._get_modal_text()
                 print(f"  [EasyApply] Step {step_num + 1}: Next button — clicking")
                 await next_btn.click()
@@ -2603,6 +2607,12 @@ class EasyApplyFlow:
 
             # No recognized button found
             if not await self._is_modal_open():
+                if not nav_seen:
+                    # The form never opened (no Next/Review/Submit was ever seen), so
+                    # nothing was submitted — "modal closed" would be a false positive.
+                    await self._verbose_screenshot(f"modal_never_opened_step{step_num + 1}")
+                    print("  [EasyApply] Modal never opened — treating as failed")
+                    return "failed"
                 # Modal closed — check if application was submitted
                 confirmed, msg = await self._check_submission_result()
                 if confirmed:
