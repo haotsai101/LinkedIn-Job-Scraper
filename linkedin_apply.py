@@ -2254,10 +2254,19 @@ class EasyApplyFlow:
     )
     _TAG_MODAL_JS = """attr => {
         document.querySelectorAll('[' + attr + ']').forEach(e => e.removeAttribute(attr));
+        document.querySelectorAll('[data-easyapply-nav]')
+            .forEach(e => e.removeAttribute('data-easyapply-nav'));
         const NAV = /^(next|review|review your application|submit application)$/i;
         const visible = el => !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
         const btns = [...document.querySelectorAll('button')]
             .filter(b => NAV.test((b.innerText || '').trim()) && visible(b));
+        // Tag each nav button by its rendered label so the step loop can click it
+        // directly. A container-scoped CSS selector for the newer UI's bare
+        // "Review" button ('[container] footer button:text-is("Review")')
+        // matched nothing on a live form; this is the same detection that
+        // already locates the container, so it works wherever that does.
+        btns.forEach(b => b.setAttribute('data-easyapply-nav',
+            b.innerText.trim().toLowerCase().split(' ')[0]));
         const btn = btns.find(b => b.closest('footer')) || btns[0];
         if (!btn) return false;
         const hasControls = n => !!n.querySelector(
@@ -2434,17 +2443,17 @@ class EasyApplyFlow:
             await asyncio.sleep(0.5)
 
             # Check all navigation buttons — prefer Submit > Review > Next
+            await self._tag_modal()  # refresh data-easyapply-nav on this step's buttons
             submit = self.page.locator(self._SUBMIT_SELECTOR).first
             if await submit.count() > 0:
                 print(f"  [EasyApply] Step {step_num + 1}: Submit button found")
                 return await self._handle_submit()
 
-            # Newer UI labels this button just "Review" (no aria-label); match that
-            # exactly and only inside the tagged container so no other page button
-            # reading "Review" can be picked up.
+            # Newer UI labels this button just "Review" (no aria-label). _tag_modal()
+            # marks it data-easyapply-nav="review" from its rendered innerText.
             review = self.page.locator(
                 '[aria-label*="Review your application"], button:has-text("Review your application"), '
-                f'[{self._MODAL_TAG}] footer button:text-is("Review")'
+                '[data-easyapply-nav="review"]'
             ).first
             if await review.count() > 0:
                 before = await self._get_modal_text()
