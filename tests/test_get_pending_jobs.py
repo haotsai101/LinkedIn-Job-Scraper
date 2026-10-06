@@ -236,7 +236,7 @@ def test_create_tables_is_migration_safe_on_pre_002_db(tmp_path):
     ``CREATE TABLE IF NOT EXISTS jobs`` is a no-op on an existing table, so
     ``listed_epoch`` never got added before ``create_indexes()`` ran ->
     ``OperationalError: no such column: listed_epoch`` on every
-    ``search_retriever`` / ``details_retriever`` / Dagster op import.
+    ``search_retriever`` / ``details_retriever`` import.
     """
     db = tmp_path / "pre002.db"
     conn = sqlite3.connect(str(db))

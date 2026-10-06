@@ -1,7 +1,6 @@
 """Single source of truth for Phase 1 (discovery) search configuration.
 
-Both the standalone ``search_retriever.py`` and the Dagster ``search_jobs_op``
-(in ``scripts/dagster_retrievers.py``) import ``SEARCH_KEYWORDS`` from here, so
+``search_retriever.py`` imports ``SEARCH_KEYWORDS`` from here, so
 the query string is defined in exactly one place.
 
 ``SEARCH_KEYWORDS`` is passed verbatim as the LinkedIn Voyager ``keywords:``

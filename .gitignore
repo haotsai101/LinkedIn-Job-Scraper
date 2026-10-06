@@ -39,7 +39,6 @@ R-project/
 analysis/
 .vscode/
 .tmp_*
-.dagster_home/
 
 # Generated / runtime output
 logs/

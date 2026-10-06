@@ -306,7 +306,7 @@ def ensure_schema_current(conn, cursor):
     """Bring an existing database up to the current schema baseline.
 
     This is the **one** home for schema-modernization logic. It is invoked by
-    ``create_tables()`` (every retriever / Dagster op entry point) and, via a thin
+    ``create_tables()`` (every retriever entry point) and, via a thin
     wrapper, by ``apply_jobs._ensure_apply_schema`` (the apply path). The
     standalone migrations in ``scripts/migrations/`` predate this consolidation
     and keep their own copies for detailed logging / offline use.
@@ -331,7 +331,7 @@ def ensure_schema_current(conn, cursor):
          ``apply_jobs.py``'s ``applications`` list.)
 
          This check-then-``ALTER`` is exposed to the same
-         "two Dagster ops race a not-yet-migrated DB" scenario documented in
+         "two processes race a not-yet-migrated DB" scenario documented in
          ``scripts/migrations/runner.py`` for ``002_schema``'s ``listed_epoch``
          ALTER — except *that* one is reached only through
          ``run_pending_migrations``, which serialises callers with
@@ -367,7 +367,7 @@ def ensure_schema_current(conn, cursor):
     # The backfill (``UPDATE ... WHERE listed_epoch IS NULL``) must NOT run
     # unconditionally: rows whose timestamps are permanently unparseable stay
     # NULL and keep matching that predicate, so an unguarded call would take a
-    # write lock and full-scan on every retriever / Dagster startup. Run it only
+    # write lock and full-scan on every retriever startup. Run it only
     # when the column was just added, or when a cheap ``LIMIT 1`` probe shows
     # there is still work to do.
     #
@@ -540,7 +540,7 @@ def ensure_db_ready(conn, cursor, *, db_path=None, run_migrations=True):
     """The single "bring linkedin_jobs.db fully up to date" entry point.
 
     Every process that opens the database — ``search_retriever``,
-    ``details_retriever``, the Dagster ops, and ``apply_jobs`` — calls this once
+    ``details_retriever``, and ``apply_jobs`` — calls this once
     at startup instead of wiring up schema setup piecemeal (T19). It does two
     things, in order:
 

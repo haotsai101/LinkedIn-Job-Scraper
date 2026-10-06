@@ -1,7 +1,6 @@
 """Phase 2 — Enrichment. Thin wrapper over ``scripts.retrieval.run_detail_enrichment``.
 
-The batch loop itself lives in ``scripts/retrieval.py`` and is shared with the
-Dagster ``fetch_job_details_op``. This script just parses args, opens the DB and
+The batch loop itself lives in ``scripts/retrieval.py``. This script just parses args, opens the DB and
 calls it once — no ``while True``.
 
     python details_retriever.py                    # enrich all scraped=0 jobs

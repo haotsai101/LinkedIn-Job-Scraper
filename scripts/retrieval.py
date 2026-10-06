@@ -1,8 +1,7 @@
 """Shared retrieval loops for Phase 1 (discovery) and Phase 2 (enrichment).
 
-Single source of truth for the core scrape loop. Both the standalone scripts
-(``search_retriever.py`` / ``details_retriever.py``) and the Dagster ops
-(``scripts/dagster_retrievers.py``) call these functions — the scripts are thin
+Single source of truth for the core scrape loop. The standalone scripts
+(``search_retriever.py`` / ``details_retriever.py``) call these functions — the scripts are thin
 wrappers that build a config, call one function, and exit (no ``while True``).
 
 Neither function opens the database or refreshes sessions; the caller passes a

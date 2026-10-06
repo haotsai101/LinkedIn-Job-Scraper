@@ -130,7 +130,7 @@ def _playwright_login(email: str, password: str, *, headless: bool) -> dict:
     except PWError as exc:
         # Most common on a fresh box: the Chromium binary isn't installed, so
         # p.chromium.launch() raises a bare playwright Error. Don't let that
-        # traceback escape a Dagster op / _reauth — surface the fix.
+        # traceback escape _reauth — surface the fix.
         raise LinkedInLoginError(
             f"Playwright could not run the LinkedIn login for {email!r}: {exc} "
             "(if the browser binary is missing, run `playwright install chromium`)"
