@@ -481,8 +481,11 @@ def _years_label_names_a_foreign_role_or_skill(l: str, profile: dict) -> bool:
 # into `.matches`: a data-less / foreign-qualifier profile fails the matcher and
 # iteration continues to the next rule — identical to the old `if` being False.
 
-_SELECTISH_KINDS = ("select", "select-one", "select-multiple", "radio", "checkbox")
-_CHOICE_KINDS = ("select", "select-one", "radio")
+# "checkbox-group": several checkboxes under one question (newer Easy Apply UI)
+# treated as pick-one-option, like a radio group.
+_SELECTISH_KINDS = ("select", "select-one", "select-multiple", "radio", "checkbox",
+                    "checkbox-group")
+_CHOICE_KINDS = ("select", "select-one", "radio", "checkbox-group")
 
 # Residency-exclusion question building blocks (combinatorial verb × region).
 _RESIDE_VERBS = ("reside in", "based in", "located in", "live in")
@@ -873,8 +876,11 @@ _PROFILE_VALUE_RULES: list[_ProfileRule] = [
     _ProfileRule("street_address",
                  _kw("address line 1", "street address", "address 1", "street"),
                  _pv("street_address")),
+    # "apt"/"suite" as whole words only: as substrings they matched "CapTech",
+    # "adapt", "aptitude", … and blanked e.g. CapTech's required privacy box.
     _ProfileRule("address_line_2",
-                 _kw("address line 2", "address 2", "apt", "suite"),
+                 lambda lbl, kind, p: ("address line 2" in lbl or "address 2" in lbl
+                                       or bool(re.search(r"\b(apt|suite)\b", lbl))),
                  _const("")),
     # State of residence. MUST precede the identity/country rules; the broad
     # `"state" in lbl` arm excludes work-authorization phrasings.
@@ -1105,7 +1111,12 @@ _PROFILE_VALUE_RULES: list[_ProfileRule] = [
     _ProfileRule("agree_consent",
                  _kw_kind(("select", "select-one", "checkbox"), "agree to", "i agree", "acknowledge",
                           "i understand", "consent to", "terms of service", "privacy policy",
-                          "terms and conditions"),
+                          "terms and conditions",
+                          # CapTech: "You declare that you have read and understand the
+                          # privacy notice…" matched nothing; the LLM returned blank
+                          # and the required box stayed unticked.
+                          "privacy notice", "read and understand", "you have read",
+                          "i have read"),
                  _resolve_agree),
     _ProfileRule("comfortable_remote_commute_shift",
                  _kw("comfortable working", "comfortable with remote", "comfortable in a remote",
@@ -1190,11 +1201,16 @@ _PROFILE_VALUE_RULES: list[_ProfileRule] = [
     # "referral source" / "how were you referred" are handled by how_did_you_hear
     # above (→ LinkedIn). Anything else mentioning a referral is a name-soliciting
     # field and must stay blank — never the applicant's own name.
+    # "Did someone from our company suggest you apply? If so, please provide
+    # their name – if not type N/A." (M3, 2026-10-05) matched none of these and
+    # got the applicant's own name; "their name" always means someone else's.
+    # When the label asks for N/A, give it — a blank may fail validation.
     _ProfileRule("referral_name",
                  _kw("referred by", "referred you", "who referred", "person who referred",
                      "employee who referred", "referrer", "refer you to",
-                     "name of the referrer", "referring employee", "referral"),
-                 _const("")),
+                     "name of the referrer", "referring employee", "referral",
+                     "suggest you apply", "their name"),
+                 lambda lbl, kind, p: "N/A" if "n/a" in lbl else ""),
     # "name" is a broad substring — MUST be near the end (after first/last/
     # preferred/middle name, company name, etc.).
     _ProfileRule("full_name", _kw("name", "full name"), _pv("full_name")),
@@ -1276,7 +1292,7 @@ def _label_is_numeric(label: str, kind: str = "text") -> bool:
     never misclassified as numeric. ``email``/``tel``/``url`` are excluded too —
     a phone or URL field is never a 1-N scale even if its label says "number".
     """
-    if kind in ("select", "select-one", "select-multiple", "radio", "checkbox",
+    if kind in ("select", "select-one", "select-multiple", "radio", "checkbox", "checkbox-group",
                 "textarea", "contenteditable", "email", "tel", "url"):
         return False
     lab = re.sub(r"\s+", " ", (label or "").lower()).strip()
@@ -1816,6 +1832,25 @@ async def _ask_llm(model: str, profile: dict, field: dict) -> FieldAnswer:
         return _NO_ANSWER
 
 
+_DECLINE_OPTION_KEYS = ("not wish", "prefer not", "decline", "choose not", "do not wish",
+                        "don't wish", "no answer")
+
+
+def _radio_option_index(value, options: list) -> int | None:
+    """Index of the radio option ``value`` selects, or None if none would be clicked.
+
+    ``"decline"`` picks a decline-style option; otherwise an exact or substring
+    match. Shared by ``_fill_field`` (what gets clicked) and
+    ``_resolve_field_value`` (which discards answers that would click nothing).
+    """
+    v = str(value).lower()
+    if v == "decline":
+        return next((i for i, o in enumerate(options)
+                     if any(k in str(o).lower() for k in _DECLINE_OPTION_KEYS)), None)
+    return next((i for i, o in enumerate(options)
+                 if v == str(o).lower() or v in str(o).lower()), None)
+
+
 async def _resolve_field_value(
     store: AnswerStore | None, profile: dict, field: dict, model: str, company: str = "",
 ) -> tuple[str | None, str | None]:
@@ -1843,6 +1878,12 @@ async def _resolve_field_value(
     if value is not None and kind in ("select", "select-one", "select-multiple") and options:
         if value.lower() not in [o.lower() for o in options]:
             value = None
+    # Same for radios, using the exact match _fill_field clicks with: a keyword
+    # rule answering a Yes/No radio with "Utah" / "United States" / "120000"
+    # clicked nothing, so the step never advanced (5 auto-fails, 2026-10-05).
+    if value is not None and kind in ("radio", "checkbox-group") and options:
+        if _radio_option_index(value, options) is None:
+            value = None
     if value is not None:
         if store is not None and label:
             store.record(label, kind, options, value, "profile")
@@ -1858,6 +1899,24 @@ async def _resolve_field_value(
             store.record(label, kind, options, result.answer, "llm")
         return result.answer, "llm"
     return None, None
+
+
+async def _click_checkbox_wrapper(box) -> bool:
+    """Tick a newer-UI checkbox via its ``<div role="checkbox">`` wrapper.
+
+    No-op when ``aria-checked`` already reads true (a second click would untick
+    it). Selection is not re-verified: like radios the group may re-render with
+    new ids, and an unticked box reads empty on the next scan, so the
+    stuck-step re-fill retries it.
+    """
+    wrapper = box.locator('xpath=ancestor::*[@role="checkbox"][1]')
+    if await wrapper.count() == 0:
+        return False
+    if (await wrapper.get_attribute("aria-checked", timeout=3000)) == "true":
+        return True
+    await wrapper.click(timeout=5000)
+    await asyncio.sleep(0.35)  # wait for React reconciliation
+    return True
 
 
 async def _fill_field(page: Page, field: dict, value: str):
@@ -2008,20 +2067,7 @@ async def _fill_field(page: Page, field: dict, value: str):
         elif kind == "radio":
             options = field.get("options", [])
             option_ids = field.get("option_ids", [])
-            _dk = ("not wish", "prefer not", "decline", "choose not", "do not wish", "don't wish", "no answer")
-            if str(value).lower() == "decline":
-                matched = next(
-                    (i for i, o in enumerate(options)
-                     if any(k in str(o).lower() for k in _dk)),
-                    None,
-                )
-            else:
-                matched = next(
-                    (i for i, o in enumerate(options)
-                     if str(value).lower() == str(o).lower()
-                     or str(value).lower() in str(o).lower()),
-                    None,
-                )
+            matched = _radio_option_index(value, options)
             if matched is not None:
                 # Resolve the matched radio to a single-element locator, matching the
                 # selector style already used in this function.
@@ -2045,19 +2091,35 @@ async def _fill_field(page: Page, field: dict, value: str):
                 except Exception:
                     use_wrapper = False
 
-                async def _radio_selected() -> bool:
-                    if use_wrapper:
-                        if (await wrapper.get_attribute("aria-checked")) == "true":
-                            return True
-                    return await radio_loc.is_checked()
-
                 if use_wrapper:
+                    # Selecting re-renders the group and the native input's id
+                    # vanishes, so anything chained off radio_loc then waits out
+                    # the 30s default timeout. Every wrapper carries the question
+                    # as its aria-label: re-resolve by role + name instead.
+                    question = field.get("label", "")
+                    by_role = page.get_by_role("radio", name=question, exact=True)
+                    if not (question and await by_role.count() == len(options)):
+                        by_role = None
+
+                    def _target():
+                        return by_role.nth(matched) if by_role is not None else wrapper
+
+                    async def _wrapper_selected() -> bool:
+                        try:
+                            return (await _target().get_attribute(
+                                "aria-checked", timeout=3000)) == "true"
+                        except Exception:
+                            return False
+
                     await wrapper.click()
                     await asyncio.sleep(0.35)  # wait for React reconciliation
-                    if not await _radio_selected():
-                        await wrapper.click(force=True)
+                    if not await _wrapper_selected():
+                        try:
+                            await _target().click(force=True, timeout=3000)
+                        except Exception:
+                            return False
                         await asyncio.sleep(0.35)
-                    return await _radio_selected()
+                    return await _wrapper_selected()
                 await radio_loc.click()
                 # Playwright's native .click() fires a DOM event that LinkedIn's React
                 # controlled components ignore (onChange never fires), so the selection
@@ -2130,12 +2192,25 @@ async def _fill_field(page: Page, field: dict, value: str):
                 sel = f'#{_css_id(el_id)}' if el_id else (f'[name="{name}"]' if name else 'input[type="checkbox"]')
                 el = page.locator(sel).first
                 if await el.count() > 0:
+                    if not await el.is_visible():
+                        # Newer UI: hidden input, clickable role=checkbox wrapper.
+                        return await _click_checkbox_wrapper(el)
                     if not await el.is_checked():
                         await el.click()
                     # Report whether the box ended up checked so callers can retry on failure.
                     return await el.is_checked()
             # Opt-in/marketing checkbox intentionally left unchecked — treat as done.
             return True
+
+        elif kind == "checkbox-group":
+            # Pick-one: tick only the option the answer names, never the others.
+            options = field.get("options", [])
+            option_ids = field.get("option_ids", [])
+            matched = _radio_option_index(value, options)
+            if matched is None or matched >= len(option_ids) or not option_ids[matched]:
+                return False
+            return await _click_checkbox_wrapper(
+                page.locator(f'#{_css_id(option_ids[matched])}').first)
 
     except Exception:
         pass
@@ -2218,12 +2293,64 @@ class EasyApplyFlow:
         except Exception:
             pass
 
+    # LinkedIn's newer Easy Apply UI renders the form in a plain <div> tree with
+    # hashed class names and NO role="dialog", so none of the legacy selectors
+    # match. _tag_modal() finds that container from its Next/Review/Submit footer
+    # and marks it with this attribute; it is tried first. Without it the field
+    # scan fell back to the whole page (picking up LinkedIn's search box) and
+    # _get_modal_text() returned "", which disabled the stuck-step detection.
+    _MODAL_TAG = "data-easyapply-modal"
     _MODAL_SELECTORS = (
+        f"[{_MODAL_TAG}]",
         ".jobs-easy-apply-modal",
         "[data-test-modal-container]",
         ".artdeco-modal[role='dialog']",
         "[role='dialog']",
     )
+    _SUBMIT_SELECTOR = (
+        '[aria-label*="Submit application"], button:has-text("Submit application"), '
+        'button:has-text("Submit Application")'
+    )
+    _TAG_MODAL_JS = """attr => {
+        document.querySelectorAll('[' + attr + ']').forEach(e => e.removeAttribute(attr));
+        document.querySelectorAll('[data-easyapply-nav]')
+            .forEach(e => e.removeAttribute('data-easyapply-nav'));
+        const NAV = /^(next|review|review your application|submit application)$/i;
+        const visible = el => !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+        const btns = [...document.querySelectorAll('button')]
+            .filter(b => NAV.test((b.innerText || '').trim()) && visible(b));
+        // Tag each nav button by its rendered label so the step loop can click it
+        // directly. A container-scoped CSS selector for the newer UI's bare
+        // "Review" button ('[container] footer button:text-is("Review")')
+        // matched nothing on a live form; this is the same detection that
+        // already locates the container, so it works wherever that does.
+        btns.forEach(b => b.setAttribute('data-easyapply-nav',
+            b.innerText.trim().toLowerCase().split(' ')[0]));
+        const btn = btns.find(b => b.closest('footer')) || btns[0];
+        if (!btn) return false;
+        const hasControls = n => !!n.querySelector(
+            'input:not([type=hidden]), textarea, select, [role=radio], [contenteditable=true]');
+        // The container is the nearest ancestor headed "Apply to <Company>";
+        // failing that, the nearest ancestor of the footer holding form controls.
+        let fallback = null;
+        for (let n = (btn.closest('footer') || btn).parentElement;
+             n && n !== document.body; n = n.parentElement) {
+            if (/^\\s*apply to /i.test(n.innerText || '')) {
+                n.setAttribute(attr, '1');
+                return true;
+            }
+            if (!fallback && hasControls(n)) fallback = n;
+        }
+        if (fallback) { fallback.setAttribute(attr, '1'); return true; }
+        return false;
+    }"""
+
+    async def _tag_modal(self) -> bool:
+        """Mark the open Easy Apply container with ``_MODAL_TAG``; True if found."""
+        try:
+            return bool(await self.page.evaluate(self._TAG_MODAL_JS, self._MODAL_TAG))
+        except Exception:
+            return False
 
     async def _detect_job_status(self) -> str:
         try:
@@ -2306,8 +2433,15 @@ class EasyApplyFlow:
 
             await btn.click()
 
+            # Newer UI: no dialog element — poll for the tagged container first so
+            # we don't burn 5s per legacy selector below.
+            for _ in range(10):
+                if await self._tag_modal():
+                    return "easy"
+                await asyncio.sleep(0.5)
+
             # Wait for any modal to appear
-            for modal_sel in self._MODAL_SELECTORS:
+            for modal_sel in self._MODAL_SELECTORS[1:]:
                 try:
                     await self.page.wait_for_selector(modal_sel, timeout=5000)
                     return "easy"
@@ -2338,6 +2472,7 @@ class EasyApplyFlow:
 
     async def _get_modal_text(self) -> str:
         """Return a fingerprint of the current modal content."""
+        await self._tag_modal()
         for sel in self._MODAL_SELECTORS:
             try:
                 el = self.page.locator(sel).first
@@ -2348,6 +2483,7 @@ class EasyApplyFlow:
         return ""
 
     async def _is_modal_open(self) -> bool:
+        await self._tag_modal()
         for sel in self._MODAL_SELECTORS:
             try:
                 if await self.page.locator(sel).count() > 0:
@@ -2366,16 +2502,17 @@ class EasyApplyFlow:
             await asyncio.sleep(0.5)
 
             # Check all navigation buttons — prefer Submit > Review > Next
-            submit = self.page.locator(
-                '[aria-label*="Submit application"], button:has-text("Submit application"), '
-                'button:has-text("Submit Application")'
-            ).first
+            await self._tag_modal()  # refresh data-easyapply-nav on this step's buttons
+            submit = self.page.locator(self._SUBMIT_SELECTOR).first
             if await submit.count() > 0:
                 print(f"  [EasyApply] Step {step_num + 1}: Submit button found")
                 return await self._handle_submit()
 
+            # Newer UI labels this button just "Review" (no aria-label). _tag_modal()
+            # marks it data-easyapply-nav="review" from its rendered innerText.
             review = self.page.locator(
-                '[aria-label*="Review your application"], button:has-text("Review your application")'
+                '[aria-label*="Review your application"], button:has-text("Review your application"), '
+                '[data-easyapply-nav="review"]'
             ).first
             if await review.count() > 0:
                 before = await self._get_modal_text()
@@ -2514,8 +2651,16 @@ class EasyApplyFlow:
         if fields:
             print(f"  [EasyApply] Step fields: {[(f.get('label','?'), f.get('kind','?'), f.get('current_value','')) for f in fields]}")
 
+        seen_on_step: dict[str, int] = {}
         for field in fields:
             label = field.get("label", "")
+            # Two fields can share a label on one step (M3 had two identical
+            # 'If "Other" was selected above…' textareas). Keying the done-set by
+            # label alone marked the second as filled once the first was, so it
+            # stayed empty and the step stuck. Key repeats by their occurrence on
+            # the step; ids are no good here — the newer UI regenerates them.
+            n = seen_on_step[label] = seen_on_step.get(label, 0) + 1
+            fill_key = label if n == 1 else f"{label}#{n}"
             current_val = field.get("current_value", "")
             kind = field.get("kind", "text")
             # Skip already-filled fields, but not if current_value looks like a placeholder
@@ -2536,13 +2681,14 @@ class EasyApplyFlow:
             # Skip fields that were already filled in a previous step of this session.
             # Prevents infinite loops on tag-input fields (e.g. "I'm looking for…") whose
             # text input clears itself after Enter, making current_value stay '' forever.
-            if label and label in filled_labels:
+            if label and fill_key in filled_labels:
                 # Radios/checkboxes are safe to retry — re-clicking a correctly-checked
                 # control is a no-op. If is_checked() returned a false positive (React
                 # reconciliation race) the label got added despite the fill failing, which
                 # would permanently deadlock the stuck-Review re-fill loop. Allow a re-attempt
                 # whenever the value still reads empty.
-                if (kind == "radio" and not current_val) or is_unchecked_checkbox:
+                if ((kind in ("radio", "checkbox-group") and not current_val)
+                        or is_unchecked_checkbox):
                     pass  # fall through to re-fill
                 else:
                     continue
@@ -2557,8 +2703,9 @@ class EasyApplyFlow:
                 # a click). Only mark the field done when it took, so the stuck-step retry
                 # loop can re-attempt it. _fill_field returns None for other kinds, which
                 # we treat as done since no confirmation signal is available.
-                if label and not (kind in ("radio", "checkbox") and confirmed is False):
-                    filled_labels.add(label)
+                if label and not (kind in ("radio", "checkbox", "checkbox-group")
+                                  and confirmed is False):
+                    filled_labels.add(fill_key)
             elif label and label not in self.unanswered_fields:
                 self.unanswered_fields.append(label)
 
@@ -2570,6 +2717,7 @@ class EasyApplyFlow:
         """
         # Find the modal container via Playwright (shadow-DOM aware)
         modal = self.page  # fallback: search entire page
+        await self._tag_modal()
         for sel in self._MODAL_SELECTORS:
             loc = self.page.locator(sel).first
             try:
@@ -2777,6 +2925,58 @@ class EasyApplyFlow:
             except Exception:
                 pass
 
+        # Newer-UI checkboxes: like its radios, the native <input> is hidden (0x0,
+        # opacity 0, no name, empty <label for>) inside a clickable
+        # <div role="checkbox" aria-checked>, with the option text in a <p>; the
+        # question is the text just before the <fieldset>. The visible-input scan
+        # above never sees them, so a required "Confirmed" box or a "How did you
+        # hear about us?" group stayed empty and the step stuck (CapTech, Samsara,
+        # M3 — 2026-10-06). One box -> kind "checkbox"; several -> "checkbox-group",
+        # a pick-one choice whose options are the box texts.
+        _CHECKBOX_FIELDSET_META = """fs => {
+            const boxes = [...fs.querySelectorAll('input[type="checkbox"]')];
+            const wraps = boxes.map(b => b.closest('[role="checkbox"]'));
+            const labelId = fs.getAttribute('aria-labelledby');
+            const labelEl = labelId ? document.getElementById(labelId) : null;
+            const legend = fs.querySelector('legend');
+            const prev = fs.previousElementSibling;
+            const question = (labelEl && labelEl.innerText.trim())
+                || (legend && legend.innerText.trim())
+                || (prev && prev.innerText.trim()) || '';
+            return {
+                question: question,
+                options: wraps.map(w => (w ? w.innerText : '').trim()),
+                ids: boxes.map(b => b.id || ''),
+                checked: boxes.map((b, i) => b.checked
+                    || (wraps[i] && wraps[i].getAttribute('aria-checked') === 'true')),
+            };
+        }"""
+        cb_loc = modal.locator('fieldset:has([role="checkbox"] input[type="checkbox"])')
+        ncb = await cb_loc.count()
+        for i in range(ncb):
+            fs = cb_loc.nth(i)
+            try:
+                if not await fs.is_visible():
+                    continue
+                meta = await fs.evaluate(_CHECKBOX_FIELDSET_META)
+                opts = [_norm_label(o) for o in meta["options"]]
+                question = _norm_label(meta["question"])[:500]
+                if len(opts) == 1:
+                    fields.append({
+                        "kind": "checkbox", "label": question or opts[0],
+                        "id": meta["ids"][0], "name": "", "options": [],
+                        "current_value": "true" if meta["checked"][0] else "",
+                    })
+                elif opts:
+                    fields.append({
+                        "kind": "checkbox-group", "label": question, "name": "",
+                        "options": opts, "option_ids": meta["ids"],
+                        "current_value": ", ".join(
+                            o for o, c in zip(opts, meta["checked"], strict=True) if c),
+                    })
+            except Exception:
+                pass
+
         return fields
 
     async def _handle_submit(self) -> str:
@@ -2791,7 +2991,10 @@ class EasyApplyFlow:
 
         if result == "applied":
             try:
-                btn = self.page.locator('[aria-label*="Submit application"]').first
+                # Same selector the step loop detected Submit with: the newer UI's
+                # button has text but no aria-label, so an aria-only locator
+                # matched nothing and the submit was silently never clicked.
+                btn = self.page.locator(self._SUBMIT_SELECTOR).first
                 if await btn.count() > 0:
                     await btn.click()
                     # Wait for LinkedIn to process and show the confirmation screen

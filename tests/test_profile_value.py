@@ -94,6 +94,28 @@ def test_identity_fields():
     assert _gpv(PROFILE, "Middle name") == ""
 
 
+def test_someone_elses_name_is_never_the_applicants():
+    # M3, 2026-10-05: this matched only the broad "name" rule -> applicant's own name.
+    m3 = ("Did someone from our company suggest you apply? If so, please provide "
+          "their name – if not type N/A.")
+    assert _gpv(PROFILE, m3) == "N/A"
+    # No N/A instruction -> stays blank, as before.
+    assert _gpv(PROFILE, "If you were referred by a Kobie employee, please list their "
+                         "name. Leave blank if not referred.") == ""
+    assert _gpv(PROFILE, "Who referred you?") == ""
+    assert _gpv(PROFILE, "Full name") == "Jane Alexandra Doe"
+
+
+def test_privacy_notice_declaration_checkbox_is_ticked():
+    lbl = ("You declare that you have read and understand the privacy notice of "
+           "CapTech Consulting.*")
+    assert _gpv(PROFILE, lbl, "checkbox") == "on"
+    assert _gpv(PROFILE, lbl, "select-one") == "Yes"
+    # "apt" inside "CapTech" used to hit the address-line-2 rule (-> blank).
+    assert _gpv(PROFILE, "Apt / Suite") == ""
+    assert _gpv(PROFILE, "Address line 2") == ""
+
+
 def test_preferred_name_vs_first_name():
     p = {"full_name": "Jane Alexandra Doe", "preferred_name": "Janie"}
     # "preferred name" / "nickname" use the preferred_name value...

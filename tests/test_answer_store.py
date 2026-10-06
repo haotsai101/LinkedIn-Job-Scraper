@@ -62,6 +62,14 @@ def test_kind_group_and_options_key():
     assert options_key(None) == "" and options_key([]) == ""
 
 
+def test_follow_up_to_previous_answer_is_never_stored():
+    assert is_job_specific('If "Other" was selected above, please provide more specific details.')
+    assert is_job_specific("If you answered yes to the above question, please explain below.")
+    assert is_job_specific("If yes to the question above, explain.")
+    assert not is_job_specific("Are you legally authorized to work in the United States?")
+    assert not is_job_specific("What is the highest level of education you have obtained?")
+
+
 def test_is_job_specific():
     assert is_job_specific("Why do you want to work here?")
     assert is_job_specific("What excites you about this role?")
@@ -187,6 +195,44 @@ def test_manual_db_answer_overrides_profile_rule(store, fake_llm):
     field = {"label": "Email address", "kind": "email", "options": []}
     resolve = linkedin_apply._resolve_field_value
     assert _run(resolve(store, PROFILE, field, "m")) == ("override@example.com", "db")
+
+
+@pytest.mark.parametrize("rule_value", ["Utah", "United States", "120000", "Software Engineer"])
+def test_radio_profile_value_matching_no_option_falls_to_llm(store, fake_llm, monkeypatch,
+                                                            rule_value):
+    # Live 2026-10-05: keyword rules answered Yes/No radios ("Are you a State of
+    # California resident?" -> "Utah", ...); nothing was clicked and the step
+    # never advanced. Such a value must be dropped so the LLM picks an option.
+    monkeypatch.setattr(linkedin_apply, "_get_profile_value", lambda *a: rule_value)
+    field = {"label": "Are you a State of California resident?", "kind": "radio",
+             "options": ["Yes", "No"]}
+    assert _run(linkedin_apply._resolve_field_value(store, PROFILE, field, "m")) == ("Blue", "llm")
+    assert fake_llm == ["Are you a State of California resident?"]
+
+
+def test_checkbox_group_yes_no_rule_value_falls_to_llm(store, fake_llm, monkeypatch):
+    # The ai_coding_tools rule answers "Yes" for CHOICE kinds; for M3's "Which AI
+    # coding agents have you used?" checkbox group that names no option.
+    field = {"label": "Which AI coding agents have you used?", "kind": "checkbox-group",
+             "options": ["Claude Code", "Cursor", "None - haven't used any"]}
+    assert _run(linkedin_apply._resolve_field_value(store, PROFILE, field, "m")) == ("Blue", "llm")
+
+
+def test_radio_profile_value_matching_an_option_is_kept(store, fake_llm, monkeypatch):
+    monkeypatch.setattr(linkedin_apply, "_get_profile_value", lambda *a: "Yes")
+    field = {"label": "Are you authorized to work in the US?", "kind": "radio",
+             "options": ["Yes", "No"]}
+    resolve = linkedin_apply._resolve_field_value
+    assert _run(resolve(store, PROFILE, field, "m")) == ("Yes", "profile")
+    assert fake_llm == []
+
+
+def test_radio_option_index_matching():
+    idx = linkedin_apply._radio_option_index
+    assert idx("Yes", ["Yes", "No"]) == 0
+    assert idx("no", ["Yes", "No"]) == 1
+    assert idx("decline", ["Male", "Female", "I don't wish to answer"]) == 2
+    assert idx("Utah", ["Yes", "No"]) is None
 
 
 def test_job_specific_question_is_vetoed_even_if_model_says_store(store, fake_llm):

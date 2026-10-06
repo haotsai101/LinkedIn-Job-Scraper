@@ -40,7 +40,7 @@ SOURCES = ("profile", "llm", "manual")
 # Only these sources are served from the table (see module docstring).
 SERVED_SOURCES = ("manual", "llm")
 
-_CHOICE_KINDS = {"select", "select-one", "select-multiple", "radio"}
+_CHOICE_KINDS = {"select", "select-one", "select-multiple", "radio", "checkbox-group"}
 _LONG_KINDS = {"textarea", "contenteditable"}
 
 # A question that names the employer / role can't be reused for another job.
@@ -48,7 +48,13 @@ _JOB_SPECIFIC_RE = re.compile(
     r"\b(this (company|role|position|job|team|opportunity|organization)"
     r"|our (company|team|mission|values|culture|product)"
     r"|why (do you want|are you interested|would you like)"
-    r"|interested in (working|joining|this))\b"
+    r"|interested in (working|joining|this)"
+    # A follow-up that depends on the previous answer ("If 'Other' was selected
+    # above…", "If you answered yes to the above question…") means something
+    # different on every form; storing one served a work-auth sentence as the
+    # "Other" details on M3 (2026-10-06).
+    r"|(selected|answered|chose|checked) (\w+ )?above"
+    r"|(the|question) above|above question)\b"
 )
 
 
