@@ -189,6 +189,36 @@ def test_manual_db_answer_overrides_profile_rule(store, fake_llm):
     assert _run(resolve(store, PROFILE, field, "m")) == ("override@example.com", "db")
 
 
+@pytest.mark.parametrize("rule_value", ["Utah", "United States", "120000", "Software Engineer"])
+def test_radio_profile_value_matching_no_option_falls_to_llm(store, fake_llm, monkeypatch,
+                                                            rule_value):
+    # Live 2026-10-05: keyword rules answered Yes/No radios ("Are you a State of
+    # California resident?" -> "Utah", ...); nothing was clicked and the step
+    # never advanced. Such a value must be dropped so the LLM picks an option.
+    monkeypatch.setattr(linkedin_apply, "_get_profile_value", lambda *a: rule_value)
+    field = {"label": "Are you a State of California resident?", "kind": "radio",
+             "options": ["Yes", "No"]}
+    assert _run(linkedin_apply._resolve_field_value(store, PROFILE, field, "m")) == ("Blue", "llm")
+    assert fake_llm == ["Are you a State of California resident?"]
+
+
+def test_radio_profile_value_matching_an_option_is_kept(store, fake_llm, monkeypatch):
+    monkeypatch.setattr(linkedin_apply, "_get_profile_value", lambda *a: "Yes")
+    field = {"label": "Are you authorized to work in the US?", "kind": "radio",
+             "options": ["Yes", "No"]}
+    resolve = linkedin_apply._resolve_field_value
+    assert _run(resolve(store, PROFILE, field, "m")) == ("Yes", "profile")
+    assert fake_llm == []
+
+
+def test_radio_option_index_matching():
+    idx = linkedin_apply._radio_option_index
+    assert idx("Yes", ["Yes", "No"]) == 0
+    assert idx("no", ["Yes", "No"]) == 1
+    assert idx("decline", ["Male", "Female", "I don't wish to answer"]) == 2
+    assert idx("Utah", ["Yes", "No"]) is None
+
+
 def test_job_specific_question_is_vetoed_even_if_model_says_store(store, fake_llm):
     # fake_llm answers store=True; the company-name backstop must still refuse.
     field = {"label": "Why do you want to work at Acme?", "kind": "textarea", "options": []}

@@ -194,6 +194,32 @@ def test_full_flow_through_bare_review_and_unlabelled_submit():
     assert asyncio.run(_with_flow(_FLOW_HTML, run)) == ("applied", True)
 
 
+_DUP_LABEL = 'If "Other" was selected above, please provide more specific details.'
+_DUP_HTML = f"""
+<html><body><main><div>
+  <h2>Apply to M3 USA</h2>
+  <label for="t1">{_DUP_LABEL}</label><textarea id="t1">Not applicable.</textarea>
+  <label for="t2">{_DUP_LABEL}</label><textarea id="t2"></textarea>
+  <footer><button>Back</button><button>Review</button></footer>
+</div></main></body></html>
+"""
+
+
+def test_second_field_with_same_label_still_filled(monkeypatch):
+    """M3: once the first same-label textarea was filled, the second was skipped forever."""
+
+    async def resolve(*_a, **_k):
+        return "N/A", "llm"
+
+    monkeypatch.setattr(linkedin_apply, "_resolve_field_value", resolve)
+
+    async def run(flow):
+        await flow._fill_current_step({_DUP_LABEL})  # first one filled on an earlier pass
+        return (await flow.page.locator("#t2").input_value()).strip()
+
+    assert asyncio.run(_with_flow(_DUP_HTML, run)) == "N/A"
+
+
 def test_no_container_when_form_is_gone():
     """After submit the footer disappears: the modal must read as closed."""
     html = "<html><body><main><h2>Application submitted</h2></main></body></html>"

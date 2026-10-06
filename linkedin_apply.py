@@ -1816,6 +1816,25 @@ async def _ask_llm(model: str, profile: dict, field: dict) -> FieldAnswer:
         return _NO_ANSWER
 
 
+_DECLINE_OPTION_KEYS = ("not wish", "prefer not", "decline", "choose not", "do not wish",
+                        "don't wish", "no answer")
+
+
+def _radio_option_index(value, options: list) -> int | None:
+    """Index of the radio option ``value`` selects, or None if none would be clicked.
+
+    ``"decline"`` picks a decline-style option; otherwise an exact or substring
+    match. Shared by ``_fill_field`` (what gets clicked) and
+    ``_resolve_field_value`` (which discards answers that would click nothing).
+    """
+    v = str(value).lower()
+    if v == "decline":
+        return next((i for i, o in enumerate(options)
+                     if any(k in str(o).lower() for k in _DECLINE_OPTION_KEYS)), None)
+    return next((i for i, o in enumerate(options)
+                 if v == str(o).lower() or v in str(o).lower()), None)
+
+
 async def _resolve_field_value(
     store: AnswerStore | None, profile: dict, field: dict, model: str, company: str = "",
 ) -> tuple[str | None, str | None]:
@@ -1842,6 +1861,12 @@ async def _resolve_field_value(
     # LLM can decide — prevents numeric years ("4") being used for Yes/No selects.
     if value is not None and kind in ("select", "select-one", "select-multiple") and options:
         if value.lower() not in [o.lower() for o in options]:
+            value = None
+    # Same for radios, using the exact match _fill_field clicks with: a keyword
+    # rule answering a Yes/No radio with "Utah" / "United States" / "120000"
+    # clicked nothing, so the step never advanced (5 auto-fails, 2026-10-05).
+    if value is not None and kind == "radio" and options:
+        if _radio_option_index(value, options) is None:
             value = None
     if value is not None:
         if store is not None and label:
@@ -2008,20 +2033,7 @@ async def _fill_field(page: Page, field: dict, value: str):
         elif kind == "radio":
             options = field.get("options", [])
             option_ids = field.get("option_ids", [])
-            _dk = ("not wish", "prefer not", "decline", "choose not", "do not wish", "don't wish", "no answer")
-            if str(value).lower() == "decline":
-                matched = next(
-                    (i for i, o in enumerate(options)
-                     if any(k in str(o).lower() for k in _dk)),
-                    None,
-                )
-            else:
-                matched = next(
-                    (i for i, o in enumerate(options)
-                     if str(value).lower() == str(o).lower()
-                     or str(value).lower() in str(o).lower()),
-                    None,
-                )
+            matched = _radio_option_index(value, options)
             if matched is not None:
                 # Resolve the matched radio to a single-element locator, matching the
                 # selector style already used in this function.
@@ -2592,8 +2604,16 @@ class EasyApplyFlow:
         if fields:
             print(f"  [EasyApply] Step fields: {[(f.get('label','?'), f.get('kind','?'), f.get('current_value','')) for f in fields]}")
 
+        seen_on_step: dict[str, int] = {}
         for field in fields:
             label = field.get("label", "")
+            # Two fields can share a label on one step (M3 had two identical
+            # 'If "Other" was selected above…' textareas). Keying the done-set by
+            # label alone marked the second as filled once the first was, so it
+            # stayed empty and the step stuck. Key repeats by their occurrence on
+            # the step; ids are no good here — the newer UI regenerates them.
+            n = seen_on_step[label] = seen_on_step.get(label, 0) + 1
+            fill_key = label if n == 1 else f"{label}#{n}"
             current_val = field.get("current_value", "")
             kind = field.get("kind", "text")
             # Skip already-filled fields, but not if current_value looks like a placeholder
@@ -2614,7 +2634,7 @@ class EasyApplyFlow:
             # Skip fields that were already filled in a previous step of this session.
             # Prevents infinite loops on tag-input fields (e.g. "I'm looking for…") whose
             # text input clears itself after Enter, making current_value stay '' forever.
-            if label and label in filled_labels:
+            if label and fill_key in filled_labels:
                 # Radios/checkboxes are safe to retry — re-clicking a correctly-checked
                 # control is a no-op. If is_checked() returned a false positive (React
                 # reconciliation race) the label got added despite the fill failing, which
@@ -2636,7 +2656,7 @@ class EasyApplyFlow:
                 # loop can re-attempt it. _fill_field returns None for other kinds, which
                 # we treat as done since no confirmation signal is available.
                 if label and not (kind in ("radio", "checkbox") and confirmed is False):
-                    filled_labels.add(label)
+                    filled_labels.add(fill_key)
             elif label and label not in self.unanswered_fields:
                 self.unanswered_fields.append(label)
 
