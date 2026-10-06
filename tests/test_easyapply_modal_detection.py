@@ -220,6 +220,59 @@ def test_second_field_with_same_label_still_filled(monkeypatch):
     assert asyncio.run(_with_flow(_DUP_HTML, run)) == "N/A"
 
 
+def _cb(box_id: str, text: str) -> str:
+    # Markup captured from CapTech's live form (2026-10-06).
+    return (f'<div role="checkbox" tabindex="0" aria-checked="false"><div><div>'
+            f'<input id="{box_id}" tabindex="-1" type="checkbox"'
+            f' style="position:absolute;opacity:0;width:0;height:0">'
+            f'<label for="{box_id}"></label></div><p>{text}</p></div></div>')
+
+
+_CHECKBOX_HTML = f"""
+<html><body><main><div>
+  <h2>Apply to CapTech</h2>
+  <p>I certify that answers given herein are true and complete.*</p>
+  <fieldset aria-describedby="error-message-a"><div>{_cb("c1", "Confirmed")}</div></fieldset>
+  <p>How did you hear about this opportunity?*</p>
+  <fieldset aria-describedby="error-message-b"><div>
+    {_cb("h1", "LinkedIn")}{_cb("h2", "Glassdoor or Blind")}{_cb("h3", "Other")}
+  </div></fieldset>
+  <footer><button>Back</button><button>Next</button></footer>
+</div></main>
+<script>
+document.addEventListener('click', e => {{
+  const w = e.target.closest('[role=checkbox]');
+  if (w) w.setAttribute('aria-checked',
+                        w.getAttribute('aria-checked') === 'true' ? 'false' : 'true');
+}});
+</script></body></html>
+"""
+
+
+def test_hidden_checkboxes_scanned_and_only_chosen_option_ticked():
+    async def run(flow):
+        fields = await flow._collect_fields_playwright()
+        single = next(f for f in fields if f["kind"] == "checkbox")
+        group = next(f for f in fields if f["kind"] == "checkbox-group")
+        ok1 = await linkedin_apply._fill_field(flow.page, single, "Yes")
+        ok2 = await linkedin_apply._fill_field(flow.page, group, "LinkedIn")
+        state = await flow.page.locator("[role=checkbox]").evaluate_all(
+            "ws => ws.map(w => w.getAttribute('aria-checked'))")
+        again = await flow._collect_fields_playwright()
+        return single, group, ok1, ok2, state, again
+
+    single, group, ok1, ok2, state, again = asyncio.run(_with_flow(_CHECKBOX_HTML, run))
+    assert single["label"] == "I certify that answers given herein are true and complete.*"
+    assert single["current_value"] == ""
+    assert group["label"] == "How did you hear about this opportunity?*"
+    assert group["options"] == ["LinkedIn", "Glassdoor or Blind", "Other"]
+    assert (ok1, ok2) == (True, True)
+    assert state == ["true", "true", "false", "false"]  # Confirmed + LinkedIn only
+    # Next scan reads them as answered, so the step loop leaves them alone.
+    assert [f["current_value"] for f in again if f["kind"].startswith("checkbox")] == [
+        "true", "LinkedIn"]
+
+
 def test_no_container_when_form_is_gone():
     """After submit the footer disappears: the modal must read as closed."""
     html = "<html><body><main><h2>Application submitted</h2></main></body></html>"

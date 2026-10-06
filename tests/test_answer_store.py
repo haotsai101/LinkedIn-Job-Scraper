@@ -202,6 +202,14 @@ def test_radio_profile_value_matching_no_option_falls_to_llm(store, fake_llm, mo
     assert fake_llm == ["Are you a State of California resident?"]
 
 
+def test_checkbox_group_yes_no_rule_value_falls_to_llm(store, fake_llm, monkeypatch):
+    # The ai_coding_tools rule answers "Yes" for CHOICE kinds; for M3's "Which AI
+    # coding agents have you used?" checkbox group that names no option.
+    field = {"label": "Which AI coding agents have you used?", "kind": "checkbox-group",
+             "options": ["Claude Code", "Cursor", "None - haven't used any"]}
+    assert _run(linkedin_apply._resolve_field_value(store, PROFILE, field, "m")) == ("Blue", "llm")
+
+
 def test_radio_profile_value_matching_an_option_is_kept(store, fake_llm, monkeypatch):
     monkeypatch.setattr(linkedin_apply, "_get_profile_value", lambda *a: "Yes")
     field = {"label": "Are you authorized to work in the US?", "kind": "radio",

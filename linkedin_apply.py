@@ -481,8 +481,11 @@ def _years_label_names_a_foreign_role_or_skill(l: str, profile: dict) -> bool:
 # into `.matches`: a data-less / foreign-qualifier profile fails the matcher and
 # iteration continues to the next rule — identical to the old `if` being False.
 
-_SELECTISH_KINDS = ("select", "select-one", "select-multiple", "radio", "checkbox")
-_CHOICE_KINDS = ("select", "select-one", "radio")
+# "checkbox-group": several checkboxes under one question (newer Easy Apply UI)
+# treated as pick-one-option, like a radio group.
+_SELECTISH_KINDS = ("select", "select-one", "select-multiple", "radio", "checkbox",
+                    "checkbox-group")
+_CHOICE_KINDS = ("select", "select-one", "radio", "checkbox-group")
 
 # Residency-exclusion question building blocks (combinatorial verb × region).
 _RESIDE_VERBS = ("reside in", "based in", "located in", "live in")
@@ -1281,7 +1284,7 @@ def _label_is_numeric(label: str, kind: str = "text") -> bool:
     never misclassified as numeric. ``email``/``tel``/``url`` are excluded too —
     a phone or URL field is never a 1-N scale even if its label says "number".
     """
-    if kind in ("select", "select-one", "select-multiple", "radio", "checkbox",
+    if kind in ("select", "select-one", "select-multiple", "radio", "checkbox", "checkbox-group",
                 "textarea", "contenteditable", "email", "tel", "url"):
         return False
     lab = re.sub(r"\s+", " ", (label or "").lower()).strip()
@@ -1870,7 +1873,7 @@ async def _resolve_field_value(
     # Same for radios, using the exact match _fill_field clicks with: a keyword
     # rule answering a Yes/No radio with "Utah" / "United States" / "120000"
     # clicked nothing, so the step never advanced (5 auto-fails, 2026-10-05).
-    if value is not None and kind == "radio" and options:
+    if value is not None and kind in ("radio", "checkbox-group") and options:
         if _radio_option_index(value, options) is None:
             value = None
     if value is not None:
@@ -1888,6 +1891,24 @@ async def _resolve_field_value(
             store.record(label, kind, options, result.answer, "llm")
         return result.answer, "llm"
     return None, None
+
+
+async def _click_checkbox_wrapper(box) -> bool:
+    """Tick a newer-UI checkbox via its ``<div role="checkbox">`` wrapper.
+
+    No-op when ``aria-checked`` already reads true (a second click would untick
+    it). Selection is not re-verified: like radios the group may re-render with
+    new ids, and an unticked box reads empty on the next scan, so the
+    stuck-step re-fill retries it.
+    """
+    wrapper = box.locator('xpath=ancestor::*[@role="checkbox"][1]')
+    if await wrapper.count() == 0:
+        return False
+    if (await wrapper.get_attribute("aria-checked", timeout=3000)) == "true":
+        return True
+    await wrapper.click(timeout=5000)
+    await asyncio.sleep(0.35)  # wait for React reconciliation
+    return True
 
 
 async def _fill_field(page: Page, field: dict, value: str):
@@ -2163,12 +2184,25 @@ async def _fill_field(page: Page, field: dict, value: str):
                 sel = f'#{_css_id(el_id)}' if el_id else (f'[name="{name}"]' if name else 'input[type="checkbox"]')
                 el = page.locator(sel).first
                 if await el.count() > 0:
+                    if not await el.is_visible():
+                        # Newer UI: hidden input, clickable role=checkbox wrapper.
+                        return await _click_checkbox_wrapper(el)
                     if not await el.is_checked():
                         await el.click()
                     # Report whether the box ended up checked so callers can retry on failure.
                     return await el.is_checked()
             # Opt-in/marketing checkbox intentionally left unchecked — treat as done.
             return True
+
+        elif kind == "checkbox-group":
+            # Pick-one: tick only the option the answer names, never the others.
+            options = field.get("options", [])
+            option_ids = field.get("option_ids", [])
+            matched = _radio_option_index(value, options)
+            if matched is None or matched >= len(option_ids) or not option_ids[matched]:
+                return False
+            return await _click_checkbox_wrapper(
+                page.locator(f'#{_css_id(option_ids[matched])}').first)
 
     except Exception:
         pass
@@ -2645,7 +2679,8 @@ class EasyApplyFlow:
                 # reconciliation race) the label got added despite the fill failing, which
                 # would permanently deadlock the stuck-Review re-fill loop. Allow a re-attempt
                 # whenever the value still reads empty.
-                if (kind == "radio" and not current_val) or is_unchecked_checkbox:
+                if ((kind in ("radio", "checkbox-group") and not current_val)
+                        or is_unchecked_checkbox):
                     pass  # fall through to re-fill
                 else:
                     continue
@@ -2660,7 +2695,8 @@ class EasyApplyFlow:
                 # a click). Only mark the field done when it took, so the stuck-step retry
                 # loop can re-attempt it. _fill_field returns None for other kinds, which
                 # we treat as done since no confirmation signal is available.
-                if label and not (kind in ("radio", "checkbox") and confirmed is False):
+                if label and not (kind in ("radio", "checkbox", "checkbox-group")
+                                  and confirmed is False):
                     filled_labels.add(fill_key)
             elif label and label not in self.unanswered_fields:
                 self.unanswered_fields.append(label)
@@ -2878,6 +2914,58 @@ class EasyApplyFlow:
                     continue
                 seen_names.add(grp_name)
                 fields.append(props)
+            except Exception:
+                pass
+
+        # Newer-UI checkboxes: like its radios, the native <input> is hidden (0x0,
+        # opacity 0, no name, empty <label for>) inside a clickable
+        # <div role="checkbox" aria-checked>, with the option text in a <p>; the
+        # question is the text just before the <fieldset>. The visible-input scan
+        # above never sees them, so a required "Confirmed" box or a "How did you
+        # hear about us?" group stayed empty and the step stuck (CapTech, Samsara,
+        # M3 — 2026-10-06). One box -> kind "checkbox"; several -> "checkbox-group",
+        # a pick-one choice whose options are the box texts.
+        _CHECKBOX_FIELDSET_META = """fs => {
+            const boxes = [...fs.querySelectorAll('input[type="checkbox"]')];
+            const wraps = boxes.map(b => b.closest('[role="checkbox"]'));
+            const labelId = fs.getAttribute('aria-labelledby');
+            const labelEl = labelId ? document.getElementById(labelId) : null;
+            const legend = fs.querySelector('legend');
+            const prev = fs.previousElementSibling;
+            const question = (labelEl && labelEl.innerText.trim())
+                || (legend && legend.innerText.trim())
+                || (prev && prev.innerText.trim()) || '';
+            return {
+                question: question,
+                options: wraps.map(w => (w ? w.innerText : '').trim()),
+                ids: boxes.map(b => b.id || ''),
+                checked: boxes.map((b, i) => b.checked
+                    || (wraps[i] && wraps[i].getAttribute('aria-checked') === 'true')),
+            };
+        }"""
+        cb_loc = modal.locator('fieldset:has([role="checkbox"] input[type="checkbox"])')
+        ncb = await cb_loc.count()
+        for i in range(ncb):
+            fs = cb_loc.nth(i)
+            try:
+                if not await fs.is_visible():
+                    continue
+                meta = await fs.evaluate(_CHECKBOX_FIELDSET_META)
+                opts = [_norm_label(o) for o in meta["options"]]
+                question = _norm_label(meta["question"])[:500]
+                if len(opts) == 1:
+                    fields.append({
+                        "kind": "checkbox", "label": question or opts[0],
+                        "id": meta["ids"][0], "name": "", "options": [],
+                        "current_value": "true" if meta["checked"][0] else "",
+                    })
+                elif opts:
+                    fields.append({
+                        "kind": "checkbox-group", "label": question, "name": "",
+                        "options": opts, "option_ids": meta["ids"],
+                        "current_value": ", ".join(
+                            o for o, c in zip(opts, meta["checked"], strict=True) if c),
+                    })
             except Exception:
                 pass
 

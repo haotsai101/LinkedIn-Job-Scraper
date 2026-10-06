@@ -40,7 +40,7 @@ SOURCES = ("profile", "llm", "manual")
 # Only these sources are served from the table (see module docstring).
 SERVED_SOURCES = ("manual", "llm")
 
-_CHOICE_KINDS = {"select", "select-one", "select-multiple", "radio"}
+_CHOICE_KINDS = {"select", "select-one", "select-multiple", "radio", "checkbox-group"}
 _LONG_KINDS = {"textarea", "contenteditable"}
 
 # A question that names the employer / role can't be reused for another job.
