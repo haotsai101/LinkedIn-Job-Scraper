@@ -144,6 +144,56 @@ def test_radio_fill_confirms_after_group_rerender():
     assert elapsed < 10  # stale-id lookups used to wait out the 30s default timeout
 
 
+_FLOW_HTML = """
+<html><body>
+  <header><input type="text" aria-label="I'm looking for…"></header>
+  <main><div id="app"></div></main>
+<script>
+// Dialog-less 3-page form as seen live 2026-10-05: the last-page button reads
+// just "Review", and "Submit application" has text but NO aria-label.
+window.submitted = false;
+const pages = [
+  {body: '<label for="ph">Mobile phone number*</label>'
+       + '<input id="ph" type="tel" value="2085550100">', btns: ['Next']},
+  {body: '<label for="py">How many years of work experience do you have with Python?</label>'
+       + '<input id="py" type="text" value="4">', btns: ['Back', 'Review']},
+  {body: '<h3>Review your application</h3><p>Contact info</p>',
+   btns: ['Back', 'Submit application']},
+];
+function render(i) {
+  const p = pages[i];
+  document.getElementById('app').innerHTML =
+    '<div><h2>Apply to Acme Corp</h2><p>' + (i + 1) + '/3 pages</p>' + p.body
+    + '<footer>' + p.btns.map(b => '<button>' + b + '</button>').join('') + '</footer></div>';
+  document.querySelectorAll('footer button').forEach(b => b.onclick = () => {
+    const t = b.innerText;
+    if (t === 'Back') render(i - 1);
+    else if (t === 'Submit application') {
+      window.submitted = true;
+      document.getElementById('app').innerHTML = '<p>Your application was sent to Acme Corp!</p>';
+    } else render(i + 1);
+  });
+}
+render(0);
+</script>
+</body></html>
+"""
+
+
+def test_full_flow_through_bare_review_and_unlabelled_submit():
+    """Bare "Review" must be clicked and the aria-label-less Submit really clicked."""
+
+    async def ready(_summary):
+        return "applied"
+
+    async def run(flow):
+        flow.callbacks = {"ready_to_submit": ready}
+        result = await flow._process_all_steps()
+        return result, await flow.page.evaluate("window.submitted")
+
+    assert asyncio.run(_with_flow(_FLOW_HTML, run)) == ("applied", True)
+
+
 def test_no_container_when_form_is_gone():
     """After submit the footer disappears: the modal must read as closed."""
     html = "<html><body><main><h2>Application submitted</h2></main></body></html>"

@@ -2248,6 +2248,10 @@ class EasyApplyFlow:
         ".artdeco-modal[role='dialog']",
         "[role='dialog']",
     )
+    _SUBMIT_SELECTOR = (
+        '[aria-label*="Submit application"], button:has-text("Submit application"), '
+        'button:has-text("Submit Application")'
+    )
     _TAG_MODAL_JS = """attr => {
         document.querySelectorAll('[' + attr + ']').forEach(e => e.removeAttribute(attr));
         const NAV = /^(next|review|review your application|submit application)$/i;
@@ -2430,16 +2434,17 @@ class EasyApplyFlow:
             await asyncio.sleep(0.5)
 
             # Check all navigation buttons — prefer Submit > Review > Next
-            submit = self.page.locator(
-                '[aria-label*="Submit application"], button:has-text("Submit application"), '
-                'button:has-text("Submit Application")'
-            ).first
+            submit = self.page.locator(self._SUBMIT_SELECTOR).first
             if await submit.count() > 0:
                 print(f"  [EasyApply] Step {step_num + 1}: Submit button found")
                 return await self._handle_submit()
 
+            # Newer UI labels this button just "Review" (no aria-label); match that
+            # exactly and only inside the tagged container so no other page button
+            # reading "Review" can be picked up.
             review = self.page.locator(
-                '[aria-label*="Review your application"], button:has-text("Review your application")'
+                '[aria-label*="Review your application"], button:has-text("Review your application"), '
+                f'[{self._MODAL_TAG}] footer button:text-is("Review")'
             ).first
             if await review.count() > 0:
                 before = await self._get_modal_text()
@@ -2856,7 +2861,10 @@ class EasyApplyFlow:
 
         if result == "applied":
             try:
-                btn = self.page.locator('[aria-label*="Submit application"]').first
+                # Same selector the step loop detected Submit with: the newer UI's
+                # button has text but no aria-label, so an aria-only locator
+                # matched nothing and the submit was silently never clicked.
+                btn = self.page.locator(self._SUBMIT_SELECTOR).first
                 if await btn.count() > 0:
                     await btn.click()
                     # Wait for LinkedIn to process and show the confirmation screen
