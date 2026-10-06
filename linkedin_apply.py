@@ -2045,19 +2045,35 @@ async def _fill_field(page: Page, field: dict, value: str):
                 except Exception:
                     use_wrapper = False
 
-                async def _radio_selected() -> bool:
-                    if use_wrapper:
-                        if (await wrapper.get_attribute("aria-checked")) == "true":
-                            return True
-                    return await radio_loc.is_checked()
-
                 if use_wrapper:
+                    # Selecting re-renders the group and the native input's id
+                    # vanishes, so anything chained off radio_loc then waits out
+                    # the 30s default timeout. Every wrapper carries the question
+                    # as its aria-label: re-resolve by role + name instead.
+                    question = field.get("label", "")
+                    by_role = page.get_by_role("radio", name=question, exact=True)
+                    if not (question and await by_role.count() == len(options)):
+                        by_role = None
+
+                    def _target():
+                        return by_role.nth(matched) if by_role is not None else wrapper
+
+                    async def _wrapper_selected() -> bool:
+                        try:
+                            return (await _target().get_attribute(
+                                "aria-checked", timeout=3000)) == "true"
+                        except Exception:
+                            return False
+
                     await wrapper.click()
                     await asyncio.sleep(0.35)  # wait for React reconciliation
-                    if not await _radio_selected():
-                        await wrapper.click(force=True)
+                    if not await _wrapper_selected():
+                        try:
+                            await _target().click(force=True, timeout=3000)
+                        except Exception:
+                            return False
                         await asyncio.sleep(0.35)
-                    return await _radio_selected()
+                    return await _wrapper_selected()
                 await radio_loc.click()
                 # Playwright's native .click() fires a DOM event that LinkedIn's React
                 # controlled components ignore (onChange never fires), so the selection
@@ -2218,12 +2234,51 @@ class EasyApplyFlow:
         except Exception:
             pass
 
+    # LinkedIn's newer Easy Apply UI renders the form in a plain <div> tree with
+    # hashed class names and NO role="dialog", so none of the legacy selectors
+    # match. _tag_modal() finds that container from its Next/Review/Submit footer
+    # and marks it with this attribute; it is tried first. Without it the field
+    # scan fell back to the whole page (picking up LinkedIn's search box) and
+    # _get_modal_text() returned "", which disabled the stuck-step detection.
+    _MODAL_TAG = "data-easyapply-modal"
     _MODAL_SELECTORS = (
+        f"[{_MODAL_TAG}]",
         ".jobs-easy-apply-modal",
         "[data-test-modal-container]",
         ".artdeco-modal[role='dialog']",
         "[role='dialog']",
     )
+    _TAG_MODAL_JS = """attr => {
+        document.querySelectorAll('[' + attr + ']').forEach(e => e.removeAttribute(attr));
+        const NAV = /^(next|review|review your application|submit application)$/i;
+        const visible = el => !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+        const btns = [...document.querySelectorAll('button')]
+            .filter(b => NAV.test((b.innerText || '').trim()) && visible(b));
+        const btn = btns.find(b => b.closest('footer')) || btns[0];
+        if (!btn) return false;
+        const hasControls = n => !!n.querySelector(
+            'input:not([type=hidden]), textarea, select, [role=radio], [contenteditable=true]');
+        // The container is the nearest ancestor headed "Apply to <Company>";
+        // failing that, the nearest ancestor of the footer holding form controls.
+        let fallback = null;
+        for (let n = (btn.closest('footer') || btn).parentElement;
+             n && n !== document.body; n = n.parentElement) {
+            if (/^\\s*apply to /i.test(n.innerText || '')) {
+                n.setAttribute(attr, '1');
+                return true;
+            }
+            if (!fallback && hasControls(n)) fallback = n;
+        }
+        if (fallback) { fallback.setAttribute(attr, '1'); return true; }
+        return false;
+    }"""
+
+    async def _tag_modal(self) -> bool:
+        """Mark the open Easy Apply container with ``_MODAL_TAG``; True if found."""
+        try:
+            return bool(await self.page.evaluate(self._TAG_MODAL_JS, self._MODAL_TAG))
+        except Exception:
+            return False
 
     async def _detect_job_status(self) -> str:
         try:
@@ -2306,8 +2361,15 @@ class EasyApplyFlow:
 
             await btn.click()
 
+            # Newer UI: no dialog element — poll for the tagged container first so
+            # we don't burn 5s per legacy selector below.
+            for _ in range(10):
+                if await self._tag_modal():
+                    return "easy"
+                await asyncio.sleep(0.5)
+
             # Wait for any modal to appear
-            for modal_sel in self._MODAL_SELECTORS:
+            for modal_sel in self._MODAL_SELECTORS[1:]:
                 try:
                     await self.page.wait_for_selector(modal_sel, timeout=5000)
                     return "easy"
@@ -2338,6 +2400,7 @@ class EasyApplyFlow:
 
     async def _get_modal_text(self) -> str:
         """Return a fingerprint of the current modal content."""
+        await self._tag_modal()
         for sel in self._MODAL_SELECTORS:
             try:
                 el = self.page.locator(sel).first
@@ -2348,6 +2411,7 @@ class EasyApplyFlow:
         return ""
 
     async def _is_modal_open(self) -> bool:
+        await self._tag_modal()
         for sel in self._MODAL_SELECTORS:
             try:
                 if await self.page.locator(sel).count() > 0:
@@ -2570,6 +2634,7 @@ class EasyApplyFlow:
         """
         # Find the modal container via Playwright (shadow-DOM aware)
         modal = self.page  # fallback: search entire page
+        await self._tag_modal()
         for sel in self._MODAL_SELECTORS:
             loc = self.page.locator(sel).first
             try:
