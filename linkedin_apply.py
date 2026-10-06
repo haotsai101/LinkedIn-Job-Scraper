@@ -1190,11 +1190,16 @@ _PROFILE_VALUE_RULES: list[_ProfileRule] = [
     # "referral source" / "how were you referred" are handled by how_did_you_hear
     # above (→ LinkedIn). Anything else mentioning a referral is a name-soliciting
     # field and must stay blank — never the applicant's own name.
+    # "Did someone from our company suggest you apply? If so, please provide
+    # their name – if not type N/A." (M3, 2026-10-05) matched none of these and
+    # got the applicant's own name; "their name" always means someone else's.
+    # When the label asks for N/A, give it — a blank may fail validation.
     _ProfileRule("referral_name",
                  _kw("referred by", "referred you", "who referred", "person who referred",
                      "employee who referred", "referrer", "refer you to",
-                     "name of the referrer", "referring employee", "referral"),
-                 _const("")),
+                     "name of the referrer", "referring employee", "referral",
+                     "suggest you apply", "their name"),
+                 lambda lbl, kind, p: "N/A" if "n/a" in lbl else ""),
     # "name" is a broad substring — MUST be near the end (after first/last/
     # preferred/middle name, company name, etc.).
     _ProfileRule("full_name", _kw("name", "full name"), _pv("full_name")),
