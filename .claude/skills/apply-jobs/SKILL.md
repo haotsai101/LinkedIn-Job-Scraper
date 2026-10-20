@@ -5,7 +5,7 @@ description: "Run the autonomous LinkedIn job application agent. Supports all ap
 
 # /apply-jobs
 
-Runs `apply_jobs.py` — the AI-powered job application agent. Reads enriched jobs (`scraped=1, applied IS NULL`), classifies relevance via LLM, and automates form-filling via Playwright for LinkedIn EasyApply. Offsite (external career-site) applications are not automated — those jobs are left pending. All output is logged to `logs/apply_jobs.log`.
+Runs `apply_jobs.py` — the AI-powered job application agent. Reads enriched jobs (`scraped=1, applied IS NULL`), classifies relevance via LLM, and automates form-filling via Playwright for LinkedIn EasyApply. Offsite (external career-site) applications run only with `--type OffsiteApply`: an agent (NIM → Claude, through the submit-blocking guard-mcp) fills the form in a visible browser and **the human reviews and submits it** — it pauses for logins/CAPTCHAs and skips jobs that don't offer sponsorship. Without that flag, offsite jobs are left pending. All output is logged to `logs/apply_jobs.log`.
 
 ## Usage
 
@@ -18,6 +18,7 @@ Runs `apply_jobs.py` — the AI-powered job application agent. Reads enriched jo
 /apply-jobs --reset-failed           # Reset applied=-2 jobs back to pending and exit
 /apply-jobs --setup                  # Re-run the user profile interview
 /apply-jobs --type SimpleOnsiteApply,ComplexOnsiteApply  # EasyApply only
+/apply-jobs --type OffsiteApply --limit 5                 # supervised offsite agent (needs the user at the keyboard)
 /apply-jobs --verbose                # Save debug screenshots + full LLM logs
 ```
 
@@ -31,7 +32,7 @@ Runs `apply_jobs.py` — the AI-powered job application agent. Reads enriched jo
 | `--stats` | Print counts and exit immediately |
 | `--reset-failed` | Mark all applied=-2 jobs back to NULL (pending) and exit |
 | `--setup` | Re-run the interactive profile questionnaire |
-| `--type TYPE` | Comma-separated filter: SimpleOnsiteApply, ComplexOnsiteApply |
+| `--type TYPE` | Comma-separated filter: SimpleOnsiteApply, ComplexOnsiteApply, OffsiteApply. Including `OffsiteApply` turns on the supervised offsite agent — **interactive**: the user answers `[s/e/r/b/l]` per job, so don't run it unattended |
 | `--verbose` | Print full LLM prompts/responses; save per-step screenshots |
 
 ---

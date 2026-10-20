@@ -543,26 +543,39 @@ python -m offsite.session --model claude --url http://127.0.0.1:8811/greenhouse.
 **Depends on** OA11.
 
 **Build.**
-- In `run_session` (`apply_jobs.py`, the `"[Offsite apply not yet implemented — skipping]"`
-  branch): when the session was started with `--type` containing
-  `OffsiteApply`, classify with `JobAgent` as for other types, apply the
-  `blocked_entities` check (→ `-3`), then call `offsite.session.run_offsite_job`.
-  Otherwise keep skipping (unchanged message, `applied` stays `NULL`).
-- One `OffsiteBrowser` + `GuardMCP` per session, reused across jobs; crash
-  handling follows the existing `_recover_browser_if_crashed` pattern.
-- `--stats` shows `offsite_applications` counts by status.
-- Update `CLAUDE.md` (Architecture section) and `.claude/skills/apply-jobs`.
+- `run_session(..., offsite=True)` when `--type` contains `OffsiteApply`
+  (case-insensitive). OffsiteApply jobs then go through the usual staff /
+  principal title rule, `JobAgent` classifier and `blocked_entities` check
+  (→ `-1` / `-3` as for other types), a missing `application_url` → `-3`, and
+  then `offsite.batch.OffsiteBatch.run_job` → OA11 session. Session counters /
+  `application_log.json` / email report include offsite outcomes
+  (`s` applied, `skip`/`r` skipped, `b` blocked, `l` deferred, crash error).
+- Without the flag, offsite jobs are passed over exactly as before.
+- `offsite/batch.py`: one offsite stack (browser + guard-mcp + RunControl +
+  SubmitGuard) per session, started lazily on the first offsite job and reused;
+  a closed tab / window is recovered by reopening / restarting the stack.
+- An all-offsite batch opens **no LinkedIn browser** (no LinkedIn login).
+- `--auto` never auto-submits offsite jobs (printed at start).
+- `--stats` adds `Offsite attempts — <status>: n` (latest attempt per job).
+- `CLAUDE.md` architecture + `.claude/skills/apply-jobs` updated.
 
 **Acceptance.**
 - `python apply_jobs.py --auto --limit 3` behaves exactly as before (offsite
   still skipped).
 - `--type OffsiteApply --limit 1` runs one job end to end.
 
+**Result (2026-09-30, on a DB copy, job 4463107277 pointed at the fixture).**
+`apply_jobs.py --type OffsiteApply --limit 1`: classifier ✓ relevant → no
+LinkedIn browser → filled by `nim→claude` (14 calls) → review → `l` →
+`jobs.applied` NULL, attempt DEFERRED, `--stats` shows `Offsite attempts —
+Deferred: 1`, 0 submissions. (The session email / application_log entry
+are real side effects of any `apply_jobs` session.)
+
 **How to test.**
 ```bash
-pytest tests/test_classifier_routing.py tests/offsite/
+pytest tests/offsite/test_apply_jobs_routing.py tests/test_browser_crash_recovery.py
 python apply_jobs.py --auto --limit 3                  # no offsite work, no pauses
-python apply_jobs.py --type OffsiteApply --limit 1     # one supervised job
+python apply_jobs.py --type OffsiteApply --limit 1     # one supervised REAL job (OA13 territory)
 python apply_jobs.py --stats
 ```
 
