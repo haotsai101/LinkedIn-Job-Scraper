@@ -18,11 +18,14 @@ from scripts.fetch import JobDetailRetriever, JobSearchRetriever
 from scripts.helpers import clean_job_postings
 from scripts.search_config import SEARCH_KEYWORDS
 
-# Remote (workplaceType:2) and Utah (geoId:102095887). One "round" fetches one
-# page from each config, alternating — matches the standalone script's behaviour.
+# Utah (geoId:104102239) and Seattle (geoId:104116203). A location search
+# returns on-site/hybrid jobs there *and* remote jobs open to that location, so
+# no separate remote search is needed (LinkedIn ignores the workplaceType filter
+# anyway; the old "remote" search was effectively all-US, and 102095887 was
+# California, not Utah). One "round" fetches one page from each config.
 DEFAULT_SEARCH_CONFIGS = [
-    ("remote", dict(filters="sortBy:List(DD),workplaceType:List(2)")),
-    ("utah", dict(filters="sortBy:List(DD)", geo_id="102095887")),
+    ("utah", dict(filters="sortBy:List(DD)", geo_id="104102239")),
+    ("seattle", dict(filters="sortBy:List(DD)", geo_id="104116203")),
 ]
 
 # Defaults promoted from the module-level constants that used to live in the
@@ -55,7 +58,7 @@ def run_search(
             exhaustion).
         count: results requested per page.
         search_configs: list of ``(label, kwargs)`` passed to
-            ``JobSearchRetriever``; defaults to remote + Utah.
+            ``JobSearchRetriever``; defaults to Utah + Seattle.
         max_rounds: hard cap on the number of rounds (one page per config each).
             ``None`` = run until ``target`` is hit or the query is exhausted
             (two consecutive rounds with zero new jobs).
