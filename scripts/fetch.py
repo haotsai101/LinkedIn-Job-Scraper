@@ -120,11 +120,15 @@ class JobSearchRetriever(_ReauthMixin):
 
         keywords: search keywords
         count: number of results per page (used to compute start offset)
-        filters: LinkedIn selectedFilters string, e.g. "sortBy:List(DD),workplaceType:List(2)"
-        geo_id: LinkedIn geoId for location (e.g. "102095887" for Utah); placed at top-level query
+        filters: LinkedIn selectedFilters string, e.g. "sortBy:List(DD)". Note: as of
+            2026-11 this endpoint ignores selectedFilters (workplaceType included).
+        geo_id: LinkedIn geoId for location (e.g. "104102239" for Utah). Sent as
+            ``locationUnion:(geoId:…)`` — a bare top-level ``geoId:`` is silently
+            ignored and the search falls back to the whole US. Location results
+            already include remote jobs open to that location.
         """
         self.count = count
-        geo_part = f",geoId:{geo_id}" if geo_id else ""
+        geo_part = f",locationUnion:(geoId:{geo_id})" if geo_id else ""
         query = f"keywords:{keywords}{geo_part},origin:JOB_SEARCH_PAGE_OTHER_ENTRY,selectedFilters:({filters}),spellCorrectionEnabled:true"
         # template with a {start} placeholder; get_jobs will replace start based on page
         self.job_search_link_template = f'https://www.linkedin.com/voyager/api/voyagerJobsDashJobCards?decorationId=com.linkedin.voyager.dash.deco.jobs.search.JobSearchCardsCollection-187&count={self.count}&q=jobSearch&query=({query})&start={{start}}'

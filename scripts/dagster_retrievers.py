@@ -56,7 +56,7 @@ logger = get_dagster_logger()
         "pages_to_fetch": Field(
             Int, default_value=5,
             description="Max rounds to fetch. One round = one result page from "
-            "each search config (remote + Utah).",
+            "each search config (Utah + Seattle).",
         ),
     },
     retry_policy=_VOYAGER_RETRY_POLICY,

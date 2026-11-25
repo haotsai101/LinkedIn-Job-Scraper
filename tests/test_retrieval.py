@@ -253,3 +253,19 @@ def test_run_search_backoff_is_capped_at_60(db, monkeypatch):
 
     assert naps[1] == 60
     assert all(n <= 60 for n in naps)
+
+
+def test_default_searches_are_utah_and_seattle():
+    assert [(label, kw["geo_id"]) for label, kw in retrieval.DEFAULT_SEARCH_CONFIGS] == [
+        ("utah", "104102239"), ("seattle", "104116203")]
+
+
+def test_search_url_sends_geo_as_location_union(monkeypatch):
+    """A bare top-level ``geoId:`` is ignored by Voyager (falls back to all-US);
+    it must be sent as ``locationUnion:(geoId:…)``."""
+    from scripts import fetch
+    monkeypatch.setattr(fetch.JobSearchRetriever, "_init_accounts", lambda self, m: setattr(self, "sessions", []))
+    r = fetch.JobSearchRetriever(keywords="swe", count=25, geo_id="104102239")
+    url = r.job_search_link_template
+    assert "locationUnion:(geoId:104102239)" in url
+    assert ",geoId:104102239" not in url
